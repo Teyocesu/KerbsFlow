@@ -190,7 +190,64 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX reviews_run_created_idx ON reviews(run_id, created_at);
     `,
   },
+  {
+    version: 2,
+    name: "phase2-real-execution",
+    sql: `
+      CREATE TABLE worktrees (
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        repository_path TEXT NOT NULL,
+        git_common_directory TEXT NOT NULL,
+        worktree_git_directory TEXT NOT NULL,
+        base_oid TEXT NOT NULL,
+        branch TEXT NOT NULL,
+        worktree_path TEXT NOT NULL UNIQUE,
+        marker_path TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE cancellation_intents (
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        reason TEXT NOT NULL,
+        status TEXT NOT NULL,
+        request_command_id TEXT NOT NULL,
+        adapter_outcome_json TEXT,
+        reconciliation_json TEXT,
+        requested_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        terminal_at TEXT
+      ) STRICT;
+
+      CREATE INDEX cancellation_intents_run_idx ON cancellation_intents(run_id, status);
+    `,
+  },
 ];
+
+export interface StoredWorktree {
+  runId: RunId;
+  repositoryPath: string;
+  gitCommonDirectory: string;
+  worktreeGitDirectory: string;
+  baseOid: string;
+  branch: string;
+  worktreePath: string;
+  markerPath: string;
+  createdAt: string;
+}
+
+export interface StoredCancellationIntent {
+  attemptId: AttemptId;
+  runId: RunId;
+  reason: string;
+  status: "REQUESTED" | "SIGNAL_PENDING" | "SIGNALLED" | "CANCELLED" | "UNCERTAIN";
+  requestCommandId: string;
+  adapterOutcomeJson: string | null;
+  reconciliationJson: string | null;
+  requestedAt: string;
+  updatedAt: string;
+  terminalAt: string | null;
+}
 
 export interface StoredRun {
   runId: RunId;
@@ -406,6 +463,48 @@ export class StateStore {
     return this.readGate(this.db.prepare("SELECT * FROM human_gates WHERE gate_id = ?").get(gateId) as Row | undefined);
   }
 
+  getWorktree(runId: RunId): StoredWorktree | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM worktrees WHERE run_id = ?").get(runId) as Row | undefined;
+    return row === undefined ? undefined : parseWorktreeRow(row);
+  }
+
+  recordWorktree(record: StoredWorktree): StoredWorktree {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      if (tx.get("SELECT run_id FROM runs WHERE run_id = ?", record.runId) === undefined) {
+        throw new NotFoundError("run", record.runId);
+      }
+      const existingRow = tx.get("SELECT * FROM worktrees WHERE run_id = ?", record.runId) as Row | undefined;
+      if (existingRow !== undefined) {
+        const existing = parseWorktreeRow(existingRow);
+        if (canonicalJson(existing) !== canonicalJson(record)) {
+          throw new KerbsFlowError("WORKTREE_RECORD_CONFLICT", `run ${record.runId} already has a different worktree`);
+        }
+        return existing;
+      }
+      tx.run(
+        "INSERT INTO worktrees (run_id, repository_path, git_common_directory, worktree_git_directory, base_oid, branch, worktree_path, marker_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        record.runId,
+        record.repositoryPath,
+        record.gitCommonDirectory,
+        record.worktreeGitDirectory,
+        record.baseOid,
+        record.branch,
+        record.worktreePath,
+        record.markerPath,
+        record.createdAt,
+      );
+      return record;
+    });
+  }
+
+  getCancellationIntent(attemptId: AttemptId): StoredCancellationIntent | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM cancellation_intents WHERE attempt_id = ?").get(attemptId) as Row | undefined;
+    return row === undefined ? undefined : parseCancellationIntentRow(row);
+  }
+
   readModel(runId: RunId): ReadModel | undefined {
     const run = this.getRun(runId);
     if (run === undefined) {
@@ -580,7 +679,7 @@ export class StateStore {
           continue;
         }
         const reason = activeAttemptNeedsRecovery
-          ? `nonterminal fake attempt ${activeAttempt?.attemptId ?? "unknown"} requires conservative recovery`
+          ? `nonterminal attempt ${activeAttempt?.attemptId ?? "unknown"} requires conservative recovery`
           : `run reopened at ${run.state} before a durable workflow boundary`;
         if (run.state !== "PAUSED" && run.state !== "RECOVERY" && (run.state === "EXECUTE" || run.state === "VERIFY_FOCUSED")) {
           const commandId = asCommandId(this.ids.next("command"));
@@ -1010,6 +1109,39 @@ function parseGateRow(row: Row): StoredGate {
     gate: parseHumanGate(JSON.parse(stringValue(row.gate_json, "human_gates.gate_json")), "human_gates.gate_json"),
     createdAt: stringValue(row.created_at, "human_gates.created_at"),
     resolvedAt: nullableString(row.resolved_at, "human_gates.resolved_at"),
+  };
+}
+
+function parseWorktreeRow(row: Row): StoredWorktree {
+  return {
+    runId: asRunId(stringValue(row.run_id, "worktrees.run_id")),
+    repositoryPath: stringValue(row.repository_path, "worktrees.repository_path"),
+    gitCommonDirectory: stringValue(row.git_common_directory, "worktrees.git_common_directory"),
+    worktreeGitDirectory: stringValue(row.worktree_git_directory, "worktrees.worktree_git_directory"),
+    baseOid: stringValue(row.base_oid, "worktrees.base_oid"),
+    branch: stringValue(row.branch, "worktrees.branch"),
+    worktreePath: stringValue(row.worktree_path, "worktrees.worktree_path"),
+    markerPath: stringValue(row.marker_path, "worktrees.marker_path"),
+    createdAt: stringValue(row.created_at, "worktrees.created_at"),
+  };
+}
+
+function parseCancellationIntentRow(row: Row): StoredCancellationIntent {
+  const status = stringValue(row.status, "cancellation_intents.status");
+  if (status !== "REQUESTED" && status !== "SIGNAL_PENDING" && status !== "SIGNALLED" && status !== "CANCELLED" && status !== "UNCERTAIN") {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", `unknown cancellation status ${status}`);
+  }
+  return {
+    attemptId: asAttemptId(stringValue(row.attempt_id, "cancellation_intents.attempt_id")),
+    runId: asRunId(stringValue(row.run_id, "cancellation_intents.run_id")),
+    reason: stringValue(row.reason, "cancellation_intents.reason"),
+    status,
+    requestCommandId: stringValue(row.request_command_id, "cancellation_intents.request_command_id"),
+    adapterOutcomeJson: nullableString(row.adapter_outcome_json, "cancellation_intents.adapter_outcome_json"),
+    reconciliationJson: nullableString(row.reconciliation_json, "cancellation_intents.reconciliation_json"),
+    requestedAt: stringValue(row.requested_at, "cancellation_intents.requested_at"),
+    updatedAt: stringValue(row.updated_at, "cancellation_intents.updated_at"),
+    terminalAt: nullableString(row.terminal_at, "cancellation_intents.terminal_at"),
   };
 }
 

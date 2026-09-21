@@ -30,7 +30,8 @@ import {
   parseValidationBundle,
   parseCommand,
 } from "./contracts.js";
-import { FakeAdapter, FakeArtifactStore } from "./fake.js";
+import type { ExecutorAdapter } from "./adapter.js";
+import type { ArtifactStore } from "./artifacts.js";
 import { KerbsFlowError, NotFoundError } from "./errors.js";
 import {
   CommandMutation,
@@ -55,8 +56,8 @@ import {
 
 export interface CoreOptions {
   store: StateStore;
-  adapter: FakeAdapter;
-  artifacts: FakeArtifactStore;
+  adapter: ExecutorAdapter;
+  artifacts: ArtifactStore;
   clock?: Clock;
   ids?: IdSource;
   configuration?: ConfigLayers;
@@ -75,8 +76,8 @@ export class KerbsFlowCore {
 
   constructor(
     private readonly store: StateStore,
-    private readonly adapter: FakeAdapter,
-    private readonly artifacts: FakeArtifactStore,
+    private readonly adapter: ExecutorAdapter,
+    private readonly artifacts: ArtifactStore,
     options: Omit<CoreOptions, "store" | "adapter" | "artifacts"> = {},
   ) {
     this.ids = options.ids ?? new RandomIdSource();
@@ -184,7 +185,7 @@ export class KerbsFlowCore {
         transition: {
           to: "EXECUTE",
           actor: "core",
-          reasonCode: "fake_attempt_prepared",
+          reasonCode: "attempt_prepared",
           taskId: task.taskId,
           attemptId,
           payload: { attemptId },
@@ -196,15 +197,25 @@ export class KerbsFlowCore {
   }
 
   async beginFakeAttempt(runId: RunId, expectedStateVersion: number, idempotencyKey: string): Promise<CommandResult> {
+    return this.beginAttempt(runId, expectedStateVersion, idempotencyKey, "<headless-fake-worktree>");
+  }
+
+  async beginAttempt(
+    runId: RunId,
+    expectedStateVersion: number,
+    idempotencyKey: string,
+    workingDirectory: string,
+    options: { prompt?: string; timeoutMs?: number } = {},
+  ): Promise<CommandResult> {
     const model = this.requiredModel(runId);
     const attempt = this.requiredAttempt(model.run.activeAttemptId);
     if (attempt.lifecycle !== "PREPARED" && attempt.lifecycle !== "RUNNING") {
       throw new KerbsFlowError("ATTEMPT_NOT_PREPARED", `attempt ${attempt.attemptId} is ${attempt.lifecycle}`);
     }
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "begin_attempt", { attemptId: attempt.attemptId });
-    const result = this.store.executeCommand(command, ({ tx, run, now }) => {
+    const result = this.store.executeCommand(command, ({ tx, run }) => {
       if (run.state !== "EXECUTE") {
-        throw new KerbsFlowError("INVALID_COMMAND_STATE", `fake execution requires EXECUTE, found ${run.state}`);
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", `execution requires EXECUTE, found ${run.state}`);
       }
       const current = this.attemptInTransaction(tx, attempt.attemptId);
       if (current.lifecycle === "RUNNING") {
@@ -213,23 +224,24 @@ export class KerbsFlowCore {
       if (current.lifecycle !== "PREPARED") {
         throw new KerbsFlowError("ATTEMPT_NOT_PREPARED", `attempt ${current.attemptId} is ${current.lifecycle}`);
       }
-      tx.run("UPDATE attempts SET lifecycle = ?, started_at = ?, updated_at = ? WHERE attempt_id = ?", "RUNNING", now, now, current.attemptId);
-      return { details: { attemptId: current.attemptId } } satisfies CommandMutation;
+      return { details: { attemptId: current.attemptId, dispatchClaimed: true } } satisfies CommandMutation;
     });
     if (!result.replayed && !this.liveHandles.has(attempt.attemptId)) {
       const task = this.requiredTask(model.run.currentTaskId);
+      const basePrompt = options.prompt ?? task.decision.action.summary;
+      const promptSummary = `${basePrompt}\nExpected result identity:\n- runId: ${runId}\n- taskId: ${task.taskId}\n- attemptId: ${attempt.attemptId}`;
       const request = {
         schemaVersion: CONTRACT_VERSIONS.executionRequest,
         runId,
         taskId: task.taskId,
         attemptId: attempt.attemptId,
         role: "implementation" as const,
-        workingDirectory: "<headless-fake-worktree>",
-        promptSummary: task.decision.action.summary,
+        workingDirectory,
+        promptSummary,
         model: task.decision.route.model,
         ...(task.decision.route.reasoning === undefined ? {} : { reasoning: task.decision.route.reasoning }),
         permissionPolicy: { filesystem: "worktree_only" as const, network: "denied" as const },
-        timeoutMs: 1000,
+        timeoutMs: options.timeoutMs ?? 1000,
         expectedResultSchema: CONTRACT_VERSIONS.executorResult,
       };
       const handle = this.adapter.start(parseExecutionRequest(request));
@@ -240,17 +252,22 @@ export class KerbsFlowCore {
   }
 
   async completeFakeAttempt(runId: RunId, expectedStateVersion: number, idempotencyKey: string, suppliedResult?: unknown): Promise<CommandResult> {
+    return this.completeAttempt(runId, expectedStateVersion, idempotencyKey, suppliedResult);
+  }
+
+  async completeAttempt(runId: RunId, expectedStateVersion: number, idempotencyKey: string, suppliedResult?: unknown): Promise<CommandResult> {
     const model = this.requiredModel(runId);
     const attempt = this.requiredAttempt(model.run.activeAttemptId);
     let rawResult = suppliedResult;
     if (rawResult === undefined) {
       const handle = this.liveHandles.get(attempt.attemptId);
       if (handle === undefined) {
-        throw new KerbsFlowError("ATTEMPT_HANDLE_MISSING", `no live fake handle exists for ${attempt.attemptId}; recovery must decide without replay`);
+        throw new KerbsFlowError("ATTEMPT_HANDLE_MISSING", `no live executor handle exists for ${attempt.attemptId}; recovery must decide without replay`);
       }
       for await (const event of this.adapter.events(handle)) {
         parseNormalizedEvent(event);
       }
+      this.persistAttemptHandle(runId, expectedStateVersion, `${idempotencyKey}:session-identity`, attempt.attemptId, handle);
       rawResult = await this.adapter.wait(handle);
     }
     let rawJson: JsonValue;
@@ -281,13 +298,13 @@ export class KerbsFlowCore {
     });
     const result = this.store.executeCommand(command, ({ tx, run, now }) => {
       if (run.state !== "EXECUTE") {
-        throw new KerbsFlowError("INVALID_COMMAND_STATE", `fake completion requires EXECUTE, found ${run.state}`);
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", `attempt completion requires EXECUTE, found ${run.state}`);
       }
       const current = this.attemptInTransaction(tx, attempt.attemptId);
       if (current.lifecycle !== "RUNNING" && current.lifecycle !== "PREPARED") {
         throw new KerbsFlowError("ATTEMPT_NOT_ACTIVE", `attempt ${current.attemptId} is ${current.lifecycle}`);
       }
-      const artifact = this.artifacts.put(runId, "fake-result", JSON.stringify(rawJson), attempt.attemptId);
+      const artifact = this.artifacts.put(runId, "executor-result", JSON.stringify(rawJson), attempt.attemptId);
       const persistedResult = parsed === undefined ? undefined : { ...parsed, artifacts: [...parsed.artifacts, artifact.artifactId] };
       this.insertArtifact(tx, artifact, now);
       if (persistedResult === undefined) {
@@ -350,7 +367,7 @@ export class KerbsFlowCore {
         transition: {
           to: "VERIFY_FOCUSED",
           actor: "adapter",
-          reasonCode: "fake_attempt_terminal",
+          reasonCode: "attempt_terminal",
           taskId: current.taskId,
           attemptId: current.attemptId,
           payload: { outcome: persistedResult.outcome, failureClass: persistedResult.failureClass },
@@ -634,6 +651,13 @@ export class KerbsFlowCore {
     });
     const current = this.store.getRun(runId);
     if (current?.stateVersion === expectedStateVersion && current.activeAttemptId !== null) {
+      const activeAttempt = this.store.getAttempt(current.activeAttemptId);
+      if (activeAttempt?.adapterDescriptorJson !== null && activeAttempt?.adapterDescriptorJson !== undefined) {
+        const descriptor = parseAdapterDescriptor(JSON.parse(activeAttempt.adapterDescriptorJson));
+        if (descriptor.adapter !== "fake") {
+          throw new KerbsFlowError("REAL_CANCEL_REQUIRES_DURABLE_INTENT", "real adapter cancellation must use requestRealCancellation before any external signal");
+        }
+      }
       const handle = this.liveHandles.get(current.activeAttemptId);
       if (handle !== undefined) {
         this.adapter.cancel(handle, reason);
@@ -672,6 +696,157 @@ export class KerbsFlowCore {
         },
         runPatch: { pauseContract: null, currentGateId: null, recoveryRequired: false, recoveryReason: null },
         details: { reason },
+      } satisfies CommandMutation;
+    });
+  }
+
+  requestRealCancellation(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reason: string): CommandResult {
+    const command = parseCommand({
+      schemaVersion: CONTRACT_VERSIONS.command,
+      commandId: this.nextCommandId(),
+      idempotencyKey,
+      runId,
+      expectedStateVersion,
+      kind: "cancel",
+      reason,
+    });
+    return this.store.executeCommand(command, ({ tx, run, now }) => {
+      if (run.state !== "EXECUTE" && run.state !== "RECOVERY" && run.state !== "PAUSED") {
+        throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `real attempt cancellation is not allowed from ${run.state}`);
+      }
+      if (run.activeAttemptId === null) {
+        throw new KerbsFlowError("ATTEMPT_REQUIRED", "real cancellation requires an active attempt");
+      }
+      const attempt = this.attemptInTransaction(tx, run.activeAttemptId);
+      if (isTerminalAttempt(attempt.lifecycle)) {
+        throw new KerbsFlowError("ATTEMPT_NOT_ACTIVE", `attempt ${attempt.attemptId} is already ${attempt.lifecycle}`);
+      }
+      const existing = tx.get("SELECT reason FROM cancellation_intents WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
+      if (existing !== undefined) {
+        if (existing.reason !== reason) {
+          throw new KerbsFlowError("CANCELLATION_INTENT_CONFLICT", "active attempt already has a different durable cancellation intent");
+        }
+        return { details: { attemptId: attempt.attemptId, cancellationIntent: "already_persisted" } } satisfies CommandMutation;
+      }
+      tx.run(
+        "INSERT INTO cancellation_intents (attempt_id, run_id, reason, status, request_command_id, requested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        attempt.attemptId,
+        runId,
+        reason,
+        "REQUESTED",
+        command.commandId,
+        now,
+        now,
+      );
+      return { details: { attemptId: attempt.attemptId, cancellationIntent: "persisted" } } satisfies CommandMutation;
+    });
+  }
+
+  signalRealCancellation(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+    const model = this.requiredModel(runId);
+    const attempt = this.requiredAttempt(model.run.activeAttemptId);
+    const intent = this.store.getCancellationIntent(attempt.attemptId);
+    if (intent === undefined) {
+      throw new KerbsFlowError("CANCELLATION_INTENT_REQUIRED", "durable cancellation intent must be committed before signalling the adapter");
+    }
+    const pendingCommand = this.specializedCommand(runId, expectedStateVersion, `${idempotencyKey}:pending`, "complete_attempt", {
+      attemptId: attempt.attemptId,
+      phase: "cancel_signal_pending",
+    });
+    const pending = this.store.executeCommand(pendingCommand, ({ tx, run, now }) => {
+      if (run.activeAttemptId !== attempt.attemptId) {
+        throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "cancellation intent no longer matches the active attempt");
+      }
+      const current = tx.get("SELECT status FROM cancellation_intents WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
+      if (current?.status !== "REQUESTED") {
+        throw new KerbsFlowError("CANCELLATION_SIGNAL_AMBIGUOUS", `cancellation signal boundary is ${String(current?.status ?? "missing")}; reconcile without replaying the signal`);
+      }
+      tx.run("UPDATE cancellation_intents SET status = ?, updated_at = ? WHERE attempt_id = ?", "SIGNAL_PENDING", now, attempt.attemptId);
+      return { details: { attemptId: attempt.attemptId, cancellationSignal: "pending" } } satisfies CommandMutation;
+    });
+    if (pending.replayed) {
+      throw new KerbsFlowError("CANCELLATION_SIGNAL_AMBIGUOUS", "cancellation signal command was already committed; reconcile without replaying the side effect");
+    }
+    const handle = this.liveHandles.get(attempt.attemptId);
+    const adapterOutcome = handle === undefined
+      ? { outcome: "unknown" as const, summary: "live process handle is absent; no cancellation side effect was attempted" }
+      : this.adapter.cancel(handle, intent.reason);
+    const command = this.specializedCommand(runId, expectedStateVersion, `${idempotencyKey}:evidence`, "complete_attempt", {
+      attemptId: attempt.attemptId,
+      phase: "cancel_signal",
+      adapterOutcome: parseJsonValue(adapterOutcome, "adapterCancellationOutcome"),
+    });
+    return this.store.executeCommand(command, ({ tx, run, now }) => {
+      if (run.activeAttemptId !== attempt.attemptId) {
+        throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "cancellation intent no longer matches the active attempt");
+      }
+      const current = tx.get("SELECT status FROM cancellation_intents WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
+      if (current?.status !== "SIGNAL_PENDING") {
+        throw new KerbsFlowError("CANCELLATION_SIGNAL_AMBIGUOUS", `expected SIGNAL_PENDING before evidence persistence, found ${String(current?.status ?? "missing")}`);
+      }
+      tx.run(
+        "UPDATE cancellation_intents SET status = ?, adapter_outcome_json = ?, updated_at = ? WHERE attempt_id = ?",
+        handle === undefined ? "UNCERTAIN" : "SIGNALLED",
+        JSON.stringify(adapterOutcome),
+        now,
+        attempt.attemptId,
+      );
+      return { details: { attemptId: attempt.attemptId, adapterOutcome: parseJsonValue(adapterOutcome, "adapterCancellationOutcome") } } satisfies CommandMutation;
+    });
+  }
+
+  async reconcileRealCancellation(runId: RunId, expectedStateVersion: number, idempotencyKey: string): Promise<CommandResult> {
+    const model = this.requiredModel(runId);
+    const attempt = this.requiredAttempt(model.run.activeAttemptId);
+    const intent = this.store.getCancellationIntent(attempt.attemptId);
+    if (intent === undefined) {
+      throw new KerbsFlowError("CANCELLATION_INTENT_REQUIRED", "cannot reconcile cancellation without a durable intent");
+    }
+    const reconciliation = await this.adapter.reconcile({ runId, taskId: attempt.taskId, attemptId: attempt.attemptId });
+    const certainCancellation = reconciliation.outcome === "terminal" && reconciliation.result?.outcome === "cancelled";
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "recovery", {
+      attemptId: attempt.attemptId,
+      phase: "cancel_reconcile",
+      reconciliation: parseJsonValue(reconciliation, "cancellationReconciliation"),
+    });
+    return this.store.executeCommand(command, ({ tx, run, now }) => {
+      if (run.activeAttemptId !== attempt.attemptId) {
+        throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "cancellation reconciliation no longer matches the active attempt");
+      }
+      const target: Extract<RunState, "CANCELLED" | "RECOVERY"> = certainCancellation ? "CANCELLED" : "RECOVERY";
+      tx.run(
+        "UPDATE cancellation_intents SET status = ?, reconciliation_json = ?, updated_at = ?, terminal_at = ? WHERE attempt_id = ?",
+        certainCancellation ? "CANCELLED" : "UNCERTAIN",
+        JSON.stringify(reconciliation),
+        now,
+        certainCancellation ? now : null,
+        attempt.attemptId,
+      );
+      tx.run(
+        "UPDATE attempts SET lifecycle = ?, failure_class = ?, ended_at = ?, updated_at = ? WHERE attempt_id = ?",
+        certainCancellation ? "CANCELLED" : "UNKNOWN",
+        certainCancellation ? "cancelled" : "unknown",
+        certainCancellation ? now : null,
+        now,
+        attempt.attemptId,
+      );
+      const transition = target === "RECOVERY" && run.state === "RECOVERY"
+        ? undefined
+        : {
+          to: target,
+          actor: "recovery" as const,
+          reasonCode: certainCancellation ? "cancellation_reconciled" : "cancellation_uncertain",
+          taskId: attempt.taskId,
+          attemptId: attempt.attemptId,
+          payload: { reconciliation: parseJsonValue(reconciliation, "cancellationReconciliation") },
+        };
+      return {
+        ...(transition === undefined ? {} : { transition }),
+        runPatch: {
+          recoveryRequired: !certainCancellation,
+          recoveryReason: certainCancellation ? null : "cancellation outcome is not certain; automatic replay is prohibited",
+        },
+        details: { attemptId: attempt.attemptId, certainCancellation },
       } satisfies CommandMutation;
     });
   }
@@ -767,7 +942,18 @@ export class KerbsFlowCore {
       if (run.activeAttemptId !== attemptId) {
         throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "attempt handle does not match the active attempt");
       }
-      tx.run("UPDATE attempts SET provider_identity_json = ?, updated_at = ? WHERE attempt_id = ?", JSON.stringify(handle), now, attemptId);
+      const current = this.attemptInTransaction(tx, attemptId);
+      if (current.lifecycle !== "PREPARED" && current.lifecycle !== "RUNNING") {
+        throw new KerbsFlowError("ATTEMPT_NOT_ACTIVE", `attempt ${attemptId} is ${current.lifecycle}`);
+      }
+      tx.run(
+        "UPDATE attempts SET lifecycle = ?, provider_identity_json = ?, started_at = COALESCE(started_at, ?), updated_at = ? WHERE attempt_id = ?",
+        "RUNNING",
+        JSON.stringify(handle),
+        now,
+        now,
+        attemptId,
+      );
       return { details: { attemptId, handlePersisted: true } } satisfies CommandMutation;
     });
   }
@@ -832,7 +1018,7 @@ export class KerbsFlowCore {
 
   private requiredAttempt(attemptId: ReturnType<typeof asAttemptId> | null): StoredAttempt {
     if (attemptId === null) {
-      throw new KerbsFlowError("ATTEMPT_REQUIRED", "a current fake attempt is required");
+      throw new KerbsFlowError("ATTEMPT_REQUIRED", "a current attempt is required");
     }
     const attempt = this.store.getAttempt(attemptId);
     if (attempt === undefined) {
@@ -910,7 +1096,7 @@ export class KerbsFlowCore {
     };
   }
 
-  private insertArtifact(tx: SqlTransaction, artifact: ReturnType<FakeArtifactStore["put"]>, now: string): void {
+  private insertArtifact(tx: SqlTransaction, artifact: ReturnType<ArtifactStore["put"]>, now: string): void {
     tx.run(
       "INSERT INTO artifacts (artifact_id, run_id, attempt_id, kind, relative_path, content_hash, size_bytes, redaction_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
       artifact.artifactId,

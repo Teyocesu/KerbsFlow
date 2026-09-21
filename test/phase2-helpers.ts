@@ -1,0 +1,135 @@
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+export function createGitRepository(): { root: string; head: string } {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-git-"));
+  git(root, ["init", "--quiet"]);
+  git(root, ["config", "user.name", "KerbsFlow Test"]);
+  git(root, ["config", "user.email", "kerbsflow@example.invalid"]);
+  writeFileSync(join(root, "README.md"), "synthetic repository\n", "utf8");
+  writeFileSync(join(root, "check.mjs"), "import { readFileSync } from 'node:fs';\nif (readFileSync('result.txt', 'utf8') !== 'done\\n') process.exit(1);\n", "utf8");
+  git(root, ["add", "README.md", "check.mjs"]);
+  git(root, ["commit", "--quiet", "-m", "initial"]);
+  return { root, head: git(root, ["rev-parse", "HEAD"]) };
+}
+
+export function createFakeCodex(root: string): string {
+  const path = join(root, "fake-codex.mjs");
+  writeFileSync(path, `#!/usr/bin/env node
+import { writeFileSync } from "node:fs";
+
+const args = process.argv.slice(2);
+if (args[0] === "--version") {
+  console.log("codex-cli 0.155.0-fixture");
+  process.exit(0);
+}
+if (args[0] === "login" && args[1] === "status") {
+  console.log("Logged in using synthetic provider-owned auth");
+  process.exit(0);
+}
+if (args[0] === "exec" && args.includes("--help")) {
+  console.log("--json --output-schema --output-last-message --model --sandbox --cd --config --ignore-user-config --strict-config resume");
+  process.exit(0);
+}
+if (args[0] === "exec" && args[1] === "resume" && args.includes("--help")) {
+  console.log("resume a session");
+  process.exit(0);
+}
+
+const valueAfter = (name) => args[args.indexOf(name) + 1];
+const resultPath = valueAfter("--output-last-message");
+const model = valueAfter("--model");
+const prompt = args.at(-1) ?? "";
+const match = (name) => prompt.match(new RegExp("- " + name + ": ([^\\n]+)"))?.[1] ?? "missing_" + name;
+const runId = match("runId");
+const taskId = match("taskId");
+const attemptId = match("attemptId");
+const scenario = prompt.match(/SCENARIO=([a-z0-9-]+)/)?.[1] ?? "success";
+const base = {
+  schemaVersion: "kerbsflow.executor-result/v1",
+  runId,
+  taskId,
+  attemptId,
+  executor: { adapter: "codex", adapterVersion: "fixture", provider: "openai", model },
+  outcome: "succeeded",
+  failureClass: null,
+  scopeClaim: "within_scope",
+  summary: "synthetic Codex fixture completed",
+  filesChanged: scenario === "success" ? [{ path: "result.txt", change: "added" }] : [],
+  checks: [],
+  evidence: [],
+  invariantViolations: [],
+  risks: [],
+  warnings: [],
+  artifacts: [],
+  humanGate: null,
+  recommendedNext: "verify_focused",
+  exit: { kind: "normal", code: 0 },
+};
+console.log(JSON.stringify({ type: "thread.started", thread_id: "fixture-thread" }));
+if (scenario === "unknown-event") console.log(JSON.stringify({ type: "future.event" }));
+if (scenario === "malformed-jsonl") console.log("{not-json");
+if (scenario === "timeout" || scenario === "cancel-output") {
+  if (scenario === "cancel-output") writeFileSync("partial.txt", "retain me\\n");
+  const timer = setInterval(() => console.log(JSON.stringify({ type: "item.started", item: { type: "command_execution" } })), 20);
+  process.on("SIGTERM", () => { clearInterval(timer); process.exit(143); });
+  setTimeout(() => { clearInterval(timer); process.exit(0); }, 60_000);
+} else if (scenario === "missing-result") {
+  process.exit(0);
+} else if (scenario === "malformed-result") {
+  writeFileSync(resultPath, "not json");
+  process.exit(0);
+} else if (scenario === "wrong-schema") {
+  writeFileSync(resultPath, JSON.stringify({ ...base, schemaVersion: "kerbsflow.executor-result/v0" }));
+  process.exit(0);
+} else if (scenario === "id-mismatch") {
+  writeFileSync(resultPath, JSON.stringify({ ...base, attemptId: "attempt_wrong" }));
+  process.exit(0);
+} else if (scenario === "nonzero") {
+  writeFileSync(resultPath, JSON.stringify(base));
+  process.exit(7);
+} else if (scenario === "failure") {
+  writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "implementation_failure", recommendedNext: "rework" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "gate") {
+  writeFileSync(resultPath, JSON.stringify({
+    ...base,
+    outcome: "blocked",
+    failureClass: "security_or_privilege_gate",
+    recommendedNext: "human_gate",
+    humanGate: {
+      schemaVersion: "kerbsflow.human-gate/v1",
+      gateId: "gate_fixture",
+      runId,
+      taskId,
+      attemptId,
+      reasonCode: "security_or_privilege_gate",
+      summary: "synthetic privilege gate",
+      evidenceRefs: [],
+      options: [
+        { id: "rework", label: "Rework", consequence: "Return to bounded rework", target: "REWORK" },
+        { id: "cancel", label: "Cancel", consequence: "Stop and retain evidence", target: "CANCELLED" },
+      ],
+      status: "open",
+    },
+  }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else {
+  writeFileSync("result.txt", "done\\n");
+  writeFileSync(resultPath, JSON.stringify(base));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+}
+`, { encoding: "utf8", mode: 0o700 });
+  chmodSync(path, 0o700);
+  return path;
+}
+
+export function git(cwd: string, args: string[]): string {
+  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+}
+
+export function file(path: string): string {
+  return readFileSync(path, "utf8");
+}
