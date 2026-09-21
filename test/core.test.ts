@@ -4,7 +4,11 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   CONTRACT_VERSIONS,
+  ExecutorResult,
+  HumanGate,
+  asAttemptId,
   asCommandId,
+  asGateId,
   asRunId,
   parseCommand,
 } from "../src/contracts.js";
@@ -12,12 +16,50 @@ import { IdempotencyConflictError, StateVersionConflictError } from "../src/erro
 import { KerbsFlowCore } from "../src/core.js";
 import { StateStore } from "../src/persistence.js";
 import { allLegalTransitions, StateMachineError } from "../src/state-machine.js";
-import { createFixture, primeExecute, primeReady, reviewFor, validationFor, TestFixture } from "./helpers.js";
+import { createFixture, executorResultFor, primeExecute, primeReady, reviewFor, validationFor, TestFixture } from "./helpers.js";
 
 function reopen(fixture: TestFixture): void {
   fixture.store.close();
   fixture.store = StateStore.open(fixture.dbPath, { clock: fixture.clock, ids: fixture.ids });
   fixture.core = new KerbsFlowCore(fixture.store, fixture.adapter, fixture.artifacts, { clock: fixture.clock, ids: fixture.ids });
+}
+
+function blockedResult(fixture: TestFixture, options: HumanGate["options"]): ExecutorResult {
+  const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+  assert.ok(attemptId);
+  return executorResultFor(fixture, {
+    outcome: "blocked",
+    failureClass: "security_or_privilege_gate",
+    humanGate: {
+      schemaVersion: CONTRACT_VERSIONS.humanGate,
+      gateId: asGateId("gate_supplied"),
+      runId: fixture.runId,
+      taskId: fixture.taskId,
+      attemptId,
+      reasonCode: "security_or_privilege_gate",
+      summary: "synthetic executor gate",
+      evidenceRefs: [],
+      options,
+      status: "open",
+    },
+    recommendedNext: "human_gate",
+  });
+}
+
+async function completeFirstAttemptForRework(fixture: TestFixture): Promise<ReturnType<typeof asAttemptId>> {
+  const firstAttemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+  assert.ok(firstAttemptId);
+  fixture.adapter.script(fixture.taskId, "implementation_failure");
+  await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin-first");
+  await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete-first");
+  fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-first", validationFor(fixture, "passed"));
+  fixture.core.review(fixture.runId, 6, "review-first", { ...reviewFor(fixture, "rework", "first"), failureClass: "implementation_failure" });
+  fixture.core.reworkToReady(fixture.runId, 7, "ready-second");
+  fixture.core.prepareExecution(fixture.runId, 8, "prepare-second");
+  fixture.adapter.script(fixture.taskId, "success");
+  await fixture.core.beginFakeAttempt(fixture.runId, 9, "begin-second");
+  await fixture.core.completeFakeAttempt(fixture.runId, 9, "complete-second");
+  return firstAttemptId;
 }
 
 test("fake vertical loop persists through close and reopen", async () => {
@@ -213,6 +255,53 @@ test("fake implementation failure reaches bounded REWORK", async () => {
   }
 });
 
+test("focused validation rejects a missing attemptId without changing state", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    fixture.adapter.script(fixture.taskId, "success");
+    await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin");
+    await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete");
+    const { attemptId: _attemptId, ...missingAttempt } = validationFor(fixture, "passed");
+    assert.throws(() => fixture.core.recordFocusedValidation(fixture.runId, 5, "missing-attempt", missingAttempt), /attempt/i);
+    assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "VERIFY_FOCUSED");
+    assert.equal(fixture.core.readModel(fixture.runId)?.run.stateVersion, 5);
+    assert.equal(fixture.core.readModel(fixture.runId)?.latestValidation, undefined);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("focused validation rejects previous and unrelated attempt IDs after rework", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const firstAttemptId = await completeFirstAttemptForRework(fixture);
+    const currentValidation = validationFor(fixture, "passed");
+    assert.throws(() => fixture.core.recordFocusedValidation(fixture.runId, 10, "previous-attempt", { ...currentValidation, validationId: "validation_previous", attemptId: firstAttemptId }), /attempt/i);
+    assert.throws(() => fixture.core.recordFocusedValidation(fixture.runId, 10, "unrelated-attempt", { ...currentValidation, validationId: "validation_unrelated", attemptId: asAttemptId("attempt_unrelated") }), /attempt/i);
+    assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "VERIFY_FOCUSED");
+    assert.equal(fixture.core.readModel(fixture.runId)?.run.stateVersion, 10);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("focused validation accepts only the current active attempt", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    fixture.adapter.script(fixture.taskId, "success");
+    await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin");
+    await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete");
+    const accepted = fixture.core.recordFocusedValidation(fixture.runId, 5, "current-attempt", validationFor(fixture, "passed"));
+    assert.equal(accepted.to, "REVIEW");
+    assert.equal(fixture.core.readModel(fixture.runId)?.latestValidation?.attemptId, fixture.core.readModel(fixture.runId)?.run.activeAttemptId);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("fake blocked result creates a durable human gate", async () => {
   const fixture = createFixture();
   try {
@@ -227,6 +316,67 @@ test("fake blocked result creates a durable human gate", async () => {
     assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "HUMAN_GATE");
     const resolved = fixture.core.resolveGate(fixture.runId, 5, "resolve-gate", "rework", "keep scope bounded");
     assert.equal(resolved.to, "REWORK");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("executor gates reject duplicate option IDs", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const result = blockedResult(fixture, [
+      { id: "same", label: "Rework", consequence: "Rework safely.", target: "REWORK" },
+      { id: "same", label: "Cancel", consequence: "Cancel safely.", target: "CANCELLED" },
+    ]);
+    await assert.rejects(() => fixture.core.completeFakeAttempt(fixture.runId, 4, "duplicate-options", result), /option/i);
+    assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "EXECUTE");
+  } finally {
+    fixture.close();
+  }
+});
+
+for (const illegalTarget of ["DONE", "EXECUTE"] as const) {
+  test(`executor gates reject illegal HUMAN_GATE target ${illegalTarget}`, async () => {
+    const fixture = createFixture();
+    try {
+      primeExecute(fixture);
+      const result = blockedResult(fixture, [
+        { id: "illegal", label: "Illegal", consequence: "Must be rejected.", target: illegalTarget },
+        { id: "cancel", label: "Cancel", consequence: "Cancel safely.", target: "CANCELLED" },
+      ]);
+      await assert.rejects(() => fixture.core.completeFakeAttempt(fixture.runId, 4, `illegal-${illegalTarget}`, result), /transition|target/i);
+      const model = fixture.core.readModel(fixture.runId);
+      assert.equal(model?.run.state, "EXECUTE");
+      assert.equal(model?.run.stateVersion, 4);
+      assert.equal(model?.activeAttempt?.lifecycle, "PREPARED");
+      assert.equal(model?.activeAttempt?.outcomeJson, null);
+      assert.equal(model?.currentGate, undefined);
+      const db = new DatabaseSync(fixture.dbPath);
+      try {
+        assert.equal((db.prepare("SELECT COUNT(*) AS count FROM human_gates").get() as { count: number }).count, 0);
+        assert.equal((db.prepare("SELECT COUNT(*) AS count FROM artifacts").get() as { count: number }).count, 0);
+        assert.equal((db.prepare("SELECT COUNT(*) AS count FROM transitions WHERE run_id = ?").get(fixture.runId) as { count: number }).count, 4);
+      } finally {
+        db.close();
+      }
+    } finally {
+      fixture.close();
+    }
+  });
+}
+
+test("executor gates accept unique REWORK and CANCELLED options", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const result = blockedResult(fixture, [
+      { id: "rework", label: "Rework", consequence: "Return to bounded rework.", target: "REWORK" },
+      { id: "cancel", label: "Cancel", consequence: "Cancel and preserve evidence.", target: "CANCELLED" },
+    ]);
+    const accepted = await fixture.core.completeFakeAttempt(fixture.runId, 4, "valid-options", result);
+    assert.equal(accepted.to, "HUMAN_GATE");
+    assert.deepEqual(fixture.core.readModel(fixture.runId)?.currentGate?.gate.options.map((option) => option.target), ["REWORK", "CANCELLED"]);
   } finally {
     fixture.close();
   }

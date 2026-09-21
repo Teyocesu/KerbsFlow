@@ -4,6 +4,7 @@ import { join } from "node:path";
 
 import {
   CONTRACT_VERSIONS,
+  ExecutorResult,
   PlanningDecision,
   ReviewDecision,
   RunId,
@@ -129,5 +130,34 @@ export function reviewFor(fixture: TestFixture, outcome: ReviewDecision["outcome
     summary: `synthetic ${outcome} review`,
     evidenceRefs: [],
     reasonCode: `synthetic_${outcome}`,
+  };
+}
+
+export function executorResultFor(fixture: TestFixture, overrides: Partial<ExecutorResult> = {}): ExecutorResult {
+  const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+  if (attemptId === null || attemptId === undefined) {
+    throw new Error("executor result fixture requires an active attempt");
+  }
+  return {
+    schemaVersion: CONTRACT_VERSIONS.executorResult,
+    runId: fixture.runId,
+    taskId: fixture.taskId,
+    attemptId,
+    executor: { adapter: "fake", adapterVersion: "phase1", provider: "synthetic", model: "fake" },
+    outcome: "succeeded",
+    failureClass: null,
+    scopeClaim: "within_scope",
+    summary: "synthetic executor result",
+    filesChanged: [],
+    checks: [{ name: "synthetic check", outcome: "passed", evidenceClass: "simulated", evidenceRefs: [] }],
+    evidence: [],
+    invariantViolations: [],
+    risks: [],
+    warnings: [],
+    artifacts: [],
+    humanGate: null,
+    recommendedNext: "verify_focused",
+    exit: { kind: "normal", code: 0 },
+    ...overrides,
   };
 }

@@ -1,5 +1,6 @@
 import {
   AttemptHandle,
+  AttemptId,
   AttemptLifecycle,
   Command,
   CommandResult,
@@ -11,6 +12,7 @@ import {
   RunId,
   RunState,
   TaskId,
+  ValidationBundle,
   asAttemptId,
   asCommandId,
   asGateId,
@@ -40,7 +42,7 @@ import {
   StoredTask,
 } from "./persistence.js";
 import { Clock, IdSource, RandomIdSource } from "./runtime.js";
-import { assertLegalTransition, assertResumeTarget, choosePauseContract } from "./state-machine.js";
+import { assertLegalTransition, assertResumeTarget, choosePauseContract, isLegalTransition } from "./state-machine.js";
 import {
   ConfigLayers,
   DEFAULT_HARD_INVARIANTS,
@@ -267,6 +269,12 @@ export class KerbsFlowCore {
     } catch (error) {
       malformedReason = error instanceof Error ? error.message : "malformed executor result";
     }
+    if (parsed?.outcome === "blocked") {
+      if (parsed.humanGate === null) {
+        throw new KerbsFlowError("HUMAN_GATE_REQUIRED", "blocked executor result must contain a human gate");
+      }
+      this.assertExecutorGate(parsed.humanGate, runId, attempt.taskId, attempt.attemptId);
+    }
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "complete_attempt", {
       attemptId: attempt.attemptId,
       result: rawJson,
@@ -305,7 +313,7 @@ export class KerbsFlowCore {
         if (persistedResult.humanGate === null) {
           throw new KerbsFlowError("HUMAN_GATE_REQUIRED", "blocked executor result must contain a human gate");
         }
-        const gate = this.assertGateScope(persistedResult.humanGate, runId, current.taskId, current.attemptId);
+        const gate = this.assertExecutorGate(persistedResult.humanGate, runId, current.taskId, current.attemptId);
         this.insertGate(tx, gate, now);
         tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", "blocked", now, current.taskId);
         return {
@@ -371,6 +379,13 @@ export class KerbsFlowCore {
       if (run.currentTaskId === null || bundle.taskId !== run.currentTaskId) {
         throw new KerbsFlowError("TASK_SCOPE_MISMATCH", "validation task is not the current task");
       }
+      if (run.activeAttemptId === null || bundle.attemptId === undefined || bundle.attemptId !== run.activeAttemptId) {
+        throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "focused validation must identify the current active attempt");
+      }
+      const attempt = this.attemptInTransaction(tx, run.activeAttemptId);
+      if (attempt.runId !== runId || attempt.taskId !== run.currentTaskId) {
+        throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "active attempt does not belong to the current run and task");
+      }
       tx.run(
         "INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         bundle.validationId,
@@ -411,12 +426,18 @@ export class KerbsFlowCore {
       if (run.currentTaskId === null || decision.taskId !== run.currentTaskId) {
         throw new KerbsFlowError("TASK_SCOPE_MISMATCH", "review task is not the current task");
       }
-      const validationRow = tx.get("SELECT outcome FROM validations WHERE run_id = ? AND task_id = ? ORDER BY rowid DESC LIMIT 1", runId, decision.taskId) as Record<string, unknown> | undefined;
-      if (validationRow === undefined) {
+      if (run.activeAttemptId === null) {
+        throw new KerbsFlowError("ATTEMPT_REQUIRED", "review requires a current active implementation attempt");
+      }
+      const attempt = this.attemptInTransaction(tx, run.activeAttemptId);
+      if (attempt.runId !== runId || attempt.taskId !== decision.taskId) {
+        throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "review attempt does not belong to the current run and task");
+      }
+      const validation = this.focusedValidationInTransaction(tx, runId, decision.taskId, run.activeAttemptId);
+      if (validation === undefined) {
         throw new KerbsFlowError("VALIDATION_REQUIRED", "review requires persisted independent validation evidence");
       }
-      const validationOutcome = String(validationRow.outcome);
-      if ((decision.outcome === "next_phase" || decision.outcome === "final_verify" || decision.outcome === "verify_phase") && validationOutcome !== "passed") {
+      if ((decision.outcome === "next_phase" || decision.outcome === "final_verify" || decision.outcome === "verify_phase") && validation.outcome !== "passed") {
         throw new KerbsFlowError("VALIDATION_NOT_PASSED", `review outcome ${decision.outcome} requires passed validation evidence`);
       }
       const attemptCount = numberFromCount(tx.get("SELECT COUNT(*) AS count FROM attempts WHERE task_id = ? AND lifecycle != 'CANCELLED'", decision.taskId));
@@ -669,11 +690,17 @@ export class KerbsFlowCore {
       if (decision.target === "EXECUTE") {
         throw new KerbsFlowError("AMBIGUOUS_REPLAY", "Phase 1 never re-dispatches an uncertain fake attempt directly");
       }
-      if (decision.target === "VERIFY_FOCUSED" && (attempt === undefined || !isTerminalAttempt(attempt.lifecycle) || attempt.outcomeJson === null)) {
-        throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "VERIFY_FOCUSED recovery requires a persisted terminal attempt result");
+      if (decision.target === "VERIFY_FOCUSED") {
+        if (attempt === undefined || !isTerminalAttempt(attempt.lifecycle) || attempt.outcomeJson === null) {
+          throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "VERIFY_FOCUSED recovery requires a persisted terminal attempt result");
+        }
+        this.validatePersistedExecutorResultForRecovery(runId, run.currentTaskId, run.activeAttemptId, attempt);
       }
       if (decision.target === "REVIEW") {
-        const validation = tx.get("SELECT validation_id FROM validations WHERE run_id = ? ORDER BY rowid DESC LIMIT 1", runId);
+        if (run.currentTaskId === null || run.activeAttemptId === null || attempt === undefined || attempt.taskId !== run.currentTaskId || attempt.runId !== runId) {
+          throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "REVIEW recovery requires the current task and active attempt");
+        }
+        const validation = this.focusedValidationInTransaction(tx, runId, run.currentTaskId, run.activeAttemptId);
         if (validation === undefined) {
           throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "REVIEW recovery requires persisted validation evidence");
         }
@@ -908,11 +935,90 @@ export class KerbsFlowCore {
     );
   }
 
-  private assertGateScope(gate: HumanGate, runId: RunId, taskId: TaskId, attemptId: ReturnType<typeof asAttemptId>): HumanGate {
+  private assertExecutorGate(gate: HumanGate, runId: RunId, taskId: TaskId, attemptId: AttemptId): HumanGate {
     if (gate.runId !== runId || gate.taskId !== taskId || gate.attemptId !== attemptId || gate.status !== "open") {
       throw new KerbsFlowError("GATE_SCOPE_MISMATCH", "executor human gate does not match the active run/task/attempt");
     }
+    const optionIds = new Set<string>();
+    for (const option of gate.options) {
+      if (optionIds.has(option.id)) {
+        throw new KerbsFlowError("GATE_OPTION_DUPLICATE", `executor human gate repeats option ID ${option.id}`);
+      }
+      optionIds.add(option.id);
+      if (!isLegalTransition("HUMAN_GATE", option.target)) {
+        throw new KerbsFlowError("GATE_TARGET_ILLEGAL", `executor human gate option ${option.id} targets illegal transition HUMAN_GATE -> ${option.target}`);
+      }
+    }
     return gate;
+  }
+
+  private validatePersistedExecutorResultForRecovery(
+    runId: RunId,
+    currentTaskId: TaskId | null,
+    activeAttemptId: AttemptId | null,
+    attempt: StoredAttempt,
+  ): void {
+    let raw: unknown;
+    try {
+      raw = JSON.parse(attempt.outcomeJson ?? "");
+    } catch (error) {
+      throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", `persisted executor result is not valid JSON: ${error instanceof Error ? error.message : "parse failed"}`);
+    }
+    let result: ExecutorResult;
+    try {
+      result = parseExecutorResult(raw, "attempts.outcome_json");
+    } catch (error) {
+      throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", error instanceof Error ? error.message : "persisted executor result is invalid");
+    }
+    if (
+      currentTaskId === null
+      || activeAttemptId === null
+      || attempt.runId !== runId
+      || attempt.taskId !== currentTaskId
+      || attempt.attemptId !== activeAttemptId
+      || result.runId !== runId
+      || result.taskId !== currentTaskId
+      || result.attemptId !== activeAttemptId
+    ) {
+      throw new KerbsFlowError("RECOVERY_RESULT_SCOPE_MISMATCH", "persisted executor result does not match the current run, task, and active attempt");
+    }
+    if (outcomeToAttemptLifecycle(result.outcome) !== attempt.lifecycle) {
+      throw new KerbsFlowError("RECOVERY_RESULT_LIFECYCLE_MISMATCH", `persisted executor outcome ${result.outcome} contradicts attempt lifecycle ${attempt.lifecycle}`);
+    }
+  }
+
+  private focusedValidationInTransaction(
+    tx: SqlTransaction,
+    runId: RunId,
+    taskId: TaskId,
+    attemptId: AttemptId,
+  ): ValidationBundle | undefined {
+    const row = tx.get(
+      "SELECT validation_id, outcome, bundle_json FROM validations WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND level = 'focused' ORDER BY rowid DESC LIMIT 1",
+      runId,
+      taskId,
+      attemptId,
+    ) as Record<string, unknown> | undefined;
+    if (row === undefined) {
+      return undefined;
+    }
+    let validation: ValidationBundle;
+    try {
+      validation = parseValidationBundle(JSON.parse(String(row.bundle_json)), "validations.bundle_json");
+    } catch (error) {
+      throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", error instanceof Error ? error.message : "persisted validation is invalid");
+    }
+    if (
+      validation.validationId !== String(row.validation_id)
+      || validation.runId !== runId
+      || validation.taskId !== taskId
+      || validation.attemptId !== attemptId
+      || validation.level !== "focused"
+      || validation.outcome !== String(row.outcome)
+    ) {
+      throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "persisted focused validation columns and contract do not agree");
+    }
+    return validation;
   }
 }
 

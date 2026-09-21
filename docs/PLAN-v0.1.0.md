@@ -37,7 +37,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 1 — Headless contract and persistence foundation
 
-**Status:** complete.
+**Status:** complete with the targeted independent-audit correctness fixes applied.
 
 **Objective:** Produce a deterministic, restartable headless core that can run the lifecycle against a fake executor without touching a real repository.
 
@@ -78,6 +78,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 - Implement project registration/intake, canonical-path/hash validation, exact base OID capture, and dirty/untracked original-checkout gate.
 - Implement minimum KerbsFlow-owned worktree create/lock/diff/retain lifecycle and runtime artifact layout.
 - Implement safe subprocess supervision: argv spawn, worktree cwd, minimal environment, redacted/bounded stdout/stderr/JSONL, process identity, timeout, and graceful/forced cancellation.
+- Before connecting any real adapter, persist durable `cancel_requested` intent atomically before invoking adapter/supervisor cancellation; the Phase 1 fake adapter ordering is not a safe contract for real process cancellation.
 - Implement Codex capability/version/auth-readiness probe and `codex exec` adapter with JSONL, output schema, explicit model/reasoning/sandbox policy, result ingestion, and session identity.
 - Implement a minimum Planning Master action selection and policy validator sufficient for one approved PLAN phase/task.
 - Implement focused verifier facts: Git status/base/head/diff/changed paths, selected check execution, executor-claim comparison, and basic anti-greenwashing scan.
@@ -255,4 +256,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- U-02 and U-03 are resolved. The next required action is an independent remote audit of Phase 1 before Phase 2 starts.
+- The Phase 1 independent remote audit is complete and its targeted correctness findings are addressed. Phase 2 may start only after this fix is reviewed/committed and must satisfy the durable cancellation-intent prerequisite above before connecting a real adapter.
