@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 1 independently confirmed; Phase 2 in progress**
+Status: **Phase 2 complete; independent review pending**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -71,7 +71,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 2 — First real vertical loop with Codex
 
-**Status:** in progress on `phase2/codex-vertical-loop`.
+**Status:** complete on `phase2/codex-vertical-loop`; independent review pending.
 
 **Objective:** Deliver the earliest useful real end-to-end loop in an isolated worktree using one executor.
 
@@ -99,7 +99,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Temporary Git repository tests for base/dirty/untracked/branch/lock/diff; subprocess fixtures for malformed JSONL, exit/signal/timeout/cancel; fake Codex executable contract tests; one opt-in live Codex smoke run with synthetic content.
 
-**Exit condition:** A user can execute and independently verify one real bounded change via Codex, with restart/cancel evidence and no manual prompt/result copying.
+**Exit condition:** Satisfied. The deterministic suite exercises the real process/Git/adapter boundary, cancellation ordering, and conservative restart paths; an opt-in live Codex run completed and independently verified a bounded change in a disposable worktree without prompt/result copying.
 
 **Expected route:** Codex/Luna Max for normal implementation, Sol Medium for process/CLI integration debugging, Sol High for security/recovery review.
 

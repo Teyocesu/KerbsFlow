@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- **Current state:** Phase 1 implementation and independent-audit fixes are independently confirmed complete. Phase 2 implementation is in progress on `phase2/codex-vertical-loop`.
-- **Deferred:** Phase 2 must persist durable `cancel_requested` intent before real adapter/supervisor cancellation. Windows remains deferred pending its platform-specific gates.
-- **Next action:** Complete and independently verify the bounded Codex vertical loop; do not begin Phase 3 or alter the frozen SPEC.
+- **Current state:** Phase 2 is complete on `phase2/codex-vertical-loop`; deterministic gates and the disposable live Codex smoke pass, and independent review is pending.
+- **Unresolved:** Linux process-group behavior was not executed in this macOS session; workspace-write does not provide universal host read isolation. Windows and deeper isolation hardening remain deferred by the PLAN.
+- **Next action:** Independently audit the pushed Phase 2 HEAD; do not begin Phase 3 or alter the frozen SPEC before that gate passes.
