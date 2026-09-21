@@ -694,7 +694,10 @@ export class KerbsFlowCore {
         if (attempt === undefined || !isTerminalAttempt(attempt.lifecycle) || attempt.outcomeJson === null) {
           throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "VERIFY_FOCUSED recovery requires a persisted terminal attempt result");
         }
-        this.validatePersistedExecutorResultForRecovery(runId, run.currentTaskId, run.activeAttemptId, attempt);
+        const persistedResult = this.validatePersistedExecutorResultForRecovery(runId, run.currentTaskId, run.activeAttemptId, attempt);
+        if (persistedResult.outcome !== "succeeded" && persistedResult.outcome !== "failed" && persistedResult.outcome !== "partial") {
+          throw new KerbsFlowError("RECOVERY_OUTCOME_NOT_VERIFIABLE", `executor outcome ${persistedResult.outcome} cannot recover to VERIFY_FOCUSED`);
+        }
       }
       if (decision.target === "REVIEW") {
         if (run.currentTaskId === null || run.activeAttemptId === null || attempt === undefined || attempt.taskId !== run.currentTaskId || attempt.runId !== runId) {
@@ -957,7 +960,7 @@ export class KerbsFlowCore {
     currentTaskId: TaskId | null,
     activeAttemptId: AttemptId | null,
     attempt: StoredAttempt,
-  ): void {
+  ): ExecutorResult {
     let raw: unknown;
     try {
       raw = JSON.parse(attempt.outcomeJson ?? "");
@@ -985,6 +988,7 @@ export class KerbsFlowCore {
     if (outcomeToAttemptLifecycle(result.outcome) !== attempt.lifecycle) {
       throw new KerbsFlowError("RECOVERY_RESULT_LIFECYCLE_MISMATCH", `persisted executor outcome ${result.outcome} contradicts attempt lifecycle ${attempt.lifecycle}`);
     }
+    return result;
   }
 
   private focusedValidationInTransaction(

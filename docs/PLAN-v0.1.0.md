@@ -256,4 +256,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- The Phase 1 independent remote audit is complete and its targeted correctness findings are addressed. Phase 2 may start only after this fix is reviewed/committed and must satisfy the durable cancellation-intent prerequisite above before connecting a real adapter.
+- Phase 1 implementation and the targeted independent-audit corrections are complete. Final independent audit confirmation is pending at the updated remote HEAD; Phase 2 remains gated and must satisfy the durable cancellation-intent prerequisite above before connecting a real adapter.

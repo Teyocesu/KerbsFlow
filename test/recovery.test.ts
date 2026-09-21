@@ -1,11 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { DatabaseSync } from "node:sqlite";
 
 import {
   CONTRACT_VERSIONS,
   AttemptLifecycle,
+  ExecutorResult,
   asAttemptId,
   asCommandId,
+  asGateId,
   asRunId,
   asTaskId,
   parseCommand,
@@ -20,7 +23,7 @@ function reopen(fixture: TestFixture): void {
   fixture.core = new KerbsFlowCore(fixture.store, fixture.adapter, fixture.artifacts, { clock: fixture.clock, ids: fixture.ids });
 }
 
-function recoveryDecision(runId: string, target: "HUMAN_GATE" | "FAILED" | "VERIFY_FOCUSED" | "REVIEW") {
+function recoveryDecision(runId: string, target: "HUMAN_GATE" | "FAILED" | "VERIFY_FOCUSED" | "REVIEW" | "CANCELLED") {
   return {
     schemaVersion: CONTRACT_VERSIONS.recoveryDecision,
     runId,
@@ -28,6 +31,70 @@ function recoveryDecision(runId: string, target: "HUMAN_GATE" | "FAILED" | "VERI
     summary: `recover to ${target}`,
     evidenceRefs: [],
   };
+}
+
+function executorResultForOutcome(fixture: TestFixture, outcome: ExecutorResult["outcome"]): ExecutorResult {
+  switch (outcome) {
+    case "succeeded":
+      return executorResultFor(fixture);
+    case "failed":
+    case "partial":
+      return executorResultFor(fixture, {
+        outcome,
+        failureClass: "implementation_failure",
+        recommendedNext: "rework",
+        checks: [{ name: "synthetic check", outcome: "failed", evidenceClass: "simulated", evidenceRefs: [] }],
+      });
+    case "cancelled":
+      return executorResultFor(fixture, {
+        outcome,
+        failureClass: "cancelled",
+        recommendedNext: "fail",
+        checks: [{ name: "synthetic check", outcome: "failed", evidenceClass: "simulated", evidenceRefs: [] }],
+        exit: { kind: "signal" },
+      });
+    case "blocked": {
+      const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+      assert.ok(attemptId);
+      return executorResultFor(fixture, {
+        outcome,
+        failureClass: "security_or_privilege_gate",
+        recommendedNext: "human_gate",
+        humanGate: {
+          schemaVersion: CONTRACT_VERSIONS.humanGate,
+          gateId: asGateId("gate_recovery"),
+          runId: fixture.runId,
+          taskId: fixture.taskId,
+          attemptId,
+          reasonCode: "security_or_privilege_gate",
+          summary: "synthetic blocked recovery result",
+          evidenceRefs: [],
+          options: [
+            { id: "rework", label: "Rework", consequence: "Return to bounded rework.", target: "REWORK" },
+            { id: "cancel", label: "Cancel", consequence: "Cancel and preserve evidence.", target: "CANCELLED" },
+          ],
+          status: "open",
+        },
+      });
+    }
+  }
+}
+
+function persistenceCounts(fixture: TestFixture): Record<string, number> {
+  const db = new DatabaseSync(fixture.dbPath);
+  try {
+    const count = (table: "commands" | "transitions" | "validations" | "reviews" | "human_gates"): number =>
+      (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
+    return {
+      commands: count("commands"),
+      transitions: count("transitions"),
+      validations: count("validations"),
+      reviews: count("reviews"),
+      gates: count("human_gates"),
+    };
+  } finally {
+    db.close();
+  }
 }
 
 function stageTerminalRecovery(fixture: TestFixture, lifecycle: AttemptLifecycle, outcomeJson: string): void {
@@ -84,13 +151,72 @@ test("startup detects RUNNING attempts without replaying them", async () => {
   }
 });
 
-test("a valid persisted ExecutorResult may recover to VERIFY_FOCUSED", () => {
+const focusedRecoveryOutcomes: Array<{ outcome: "succeeded" | "failed" | "partial"; lifecycle: AttemptLifecycle }> = [
+  { outcome: "succeeded", lifecycle: "SUCCEEDED" },
+  { outcome: "failed", lifecycle: "FAILED" },
+  { outcome: "partial", lifecycle: "PARTIAL" },
+];
+
+for (const recoverable of focusedRecoveryOutcomes) {
+  test(`a valid persisted ${recoverable.outcome} result may recover to VERIFY_FOCUSED`, () => {
+    const fixture = createFixture();
+    try {
+      primeExecute(fixture);
+      stageTerminalRecovery(fixture, recoverable.lifecycle, JSON.stringify(executorResultForOutcome(fixture, recoverable.outcome)));
+      const focused = fixture.core.recover(fixture.runId, 5, `recover-${recoverable.outcome}`, recoveryDecision(fixture.runId, "VERIFY_FOCUSED"));
+      assert.equal(focused.to, "VERIFY_FOCUSED");
+    } finally {
+      fixture.close();
+    }
+  });
+}
+
+const nonVerifiableRecoveryOutcomes: Array<{ outcome: "blocked" | "cancelled"; lifecycle: AttemptLifecycle }> = [
+  { outcome: "blocked", lifecycle: "BLOCKED" },
+  { outcome: "cancelled", lifecycle: "CANCELLED" },
+];
+
+for (const nonVerifiable of nonVerifiableRecoveryOutcomes) {
+  test(`a valid persisted ${nonVerifiable.outcome} result cannot recover to VERIFY_FOCUSED`, () => {
+    const fixture = createFixture();
+    try {
+      primeExecute(fixture);
+      const outcomeJson = JSON.stringify(executorResultForOutcome(fixture, nonVerifiable.outcome));
+      stageTerminalRecovery(fixture, nonVerifiable.lifecycle, outcomeJson);
+      const before = persistenceCounts(fixture);
+
+      assert.throws(
+        () => fixture.core.recover(fixture.runId, 5, `reject-${nonVerifiable.outcome}`, recoveryDecision(fixture.runId, "VERIFY_FOCUSED")),
+        /outcome|VERIFY_FOCUSED|recovery/i,
+      );
+
+      const model = fixture.core.readModel(fixture.runId);
+      assert.equal(model?.run.state, "RECOVERY");
+      assert.equal(model?.run.stateVersion, 5);
+      assert.equal(model?.activeAttempt?.lifecycle, nonVerifiable.lifecycle);
+      assert.equal(model?.activeAttempt?.outcomeJson, outcomeJson);
+      assert.equal(model?.latestValidation, undefined);
+      assert.equal(model?.latestReview, undefined);
+      assert.deepEqual(persistenceCounts(fixture), before);
+    } finally {
+      fixture.close();
+    }
+  });
+}
+
+test("a valid persisted cancelled result may recover to terminal CANCELLED", () => {
   const fixture = createFixture();
   try {
     primeExecute(fixture);
-    stageTerminalRecovery(fixture, "SUCCEEDED", JSON.stringify(executorResultFor(fixture)));
-    const focused = fixture.core.recover(fixture.runId, 5, "recover-terminal", recoveryDecision(fixture.runId, "VERIFY_FOCUSED"));
-    assert.equal(focused.to, "VERIFY_FOCUSED");
+    stageTerminalRecovery(fixture, "CANCELLED", JSON.stringify(executorResultForOutcome(fixture, "cancelled")));
+    const cancelled = fixture.core.recover(fixture.runId, 5, "recover-cancelled", recoveryDecision(fixture.runId, "CANCELLED"));
+    assert.equal(cancelled.to, "CANCELLED");
+    const model = fixture.core.readModel(fixture.runId);
+    assert.equal(model?.run.state, "CANCELLED");
+    assert.equal(model?.run.stateVersion, 6);
+    assert.equal(model?.activeAttempt?.lifecycle, "CANCELLED");
+    assert.equal(model?.latestValidation, undefined);
+    assert.equal(model?.latestReview, undefined);
   } finally {
     fixture.close();
   }
