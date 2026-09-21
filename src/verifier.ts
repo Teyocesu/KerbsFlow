@@ -1,6 +1,6 @@
 import type { ExecutorResult, PlanningDecision, ValidationBundle, ValidationCheck, ValidationEvidence } from "./contracts.js";
 import { CONTRACT_VERSIONS, asValidationId } from "./contracts.js";
-import { GitWorktreeManager, type RepositoryIntake, type WorktreeRecord } from "./git.js";
+import { GitWorktreeManager, type RepositoryIntake, type RepositorySnapshot, type WorktreeInspection, type WorktreeRecord } from "./git.js";
 import { ProcessSupervisor, codexEnvironment, type ProcessResult } from "./process.js";
 import type { IdSource } from "./runtime.js";
 
@@ -13,11 +13,13 @@ export interface FocusedCheckCommand {
 
 export interface FocusedVerificationResult {
   bundle: ValidationBundle;
+  preCheckInspection: WorktreeInspection;
   inspection: ReturnType<GitWorktreeManager["inspect"]>;
   checkResult: ProcessResult;
   suspiciousSignals: string[];
   scopeViolations: string[];
   executorDisagreements: string[];
+  verifierMutations: string[];
 }
 
 export class FocusedVerifier {
@@ -34,15 +36,8 @@ export class FocusedVerifier {
     executorResult: ExecutorResult,
     command: FocusedCheckCommand,
   ): Promise<FocusedVerificationResult> {
-    let originalUnchanged = true;
-    try {
-      this.git.intake(intake.repositoryPath, { expectedBaseOid: intake.baseOid });
-    } catch {
-      originalUnchanged = false;
-    }
-    const inspection = this.git.inspect(worktree);
-    const scopeViolations = inspection.changedPaths.filter((path) => !isWithinPositiveScope(path, decision.action.positiveScope) || isWithinNegativeScope(path, decision.action.negativeScope));
-    const suspiciousSignals = antiGreenwashingSignals(inspection.diff, inspection.changedPaths);
+    const originalBefore = this.git.snapshot(intake.repositoryPath);
+    const preCheckInspection = this.git.inspect(worktree);
     const process = this.supervisor.start({
       executable: command.executable,
       args: command.args,
@@ -52,19 +47,27 @@ export class FocusedVerifier {
       gracePeriodMs: 1000,
     });
     const checkResult = await process.completion;
-    const executorDisagreements = compareExecutorClaims(executorResult, inspection.changedPaths, checkResult);
+    const originalAfter = this.git.snapshot(intake.repositoryPath);
+    const inspection = this.git.inspect(worktree);
+    const originalUnchanged = originalMatchesIntake(originalAfter, intake);
+    const scopeViolations = inspection.changedPaths.filter((path) => !isWithinPositiveScope(path, decision.action.positiveScope) || isWithinNegativeScope(path, decision.action.negativeScope));
+    const suspiciousSignals = antiGreenwashingSignals(inspection.diff, inspection.changedPaths);
+    const executorDisagreements = compareExecutorClaims(executorResult, preCheckInspection.changedPaths, checkResult);
+    const verifierMutations = compareVerificationSnapshots(originalBefore, originalAfter, preCheckInspection, inspection);
     const checkPassed = checkResult.exitKind === "normal" && checkResult.exitCode === 0;
     const passed = originalUnchanged
       && inspection.baseOid === intake.baseOid
       && checkPassed
       && scopeViolations.length === 0
       && suspiciousSignals.length === 0
-      && executorDisagreements.length === 0;
+      && executorDisagreements.length === 0
+      && verifierMutations.length === 0;
     const evidence: ValidationEvidence[] = [
       this.evidence("diff", "inspected", `Git independently reported ${inspection.changedPaths.length} changed path(s) from base ${intake.baseOid}`),
       this.evidence("check", "automatically_tested", `${command.name} exited as ${checkResult.exitKind} code ${String(checkResult.exitCode)}`),
       this.evidence("review", "inspected", suspiciousSignals.length === 0 ? "basic anti-greenwashing scan found no suspicious signal" : `anti-greenwashing signals: ${suspiciousSignals.join("; ")}`),
       this.evidence("other", "inspected", originalUnchanged ? "original checkout remains clean at the recorded base" : "original checkout no longer matches the clean recorded base"),
+      this.evidence("other", "inspected", verifierMutations.length === 0 ? "focused check did not mutate managed Git evidence" : `focused-check mutations: ${verifierMutations.join("; ")}`),
     ];
     const checks: ValidationCheck[] = [
       { name: "original checkout invariant", outcome: originalUnchanged ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
@@ -72,6 +75,7 @@ export class FocusedVerifier {
       { name: command.name, outcome: checkPassed ? "passed" : "failed", evidenceClass: "automatically_tested", evidenceRefs: [] },
       { name: "anti-greenwashing heuristic", outcome: suspiciousSignals.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
       { name: "executor claim comparison", outcome: executorDisagreements.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
+      { name: "focused-check evidence integrity", outcome: verifierMutations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
     ];
     const bundle: ValidationBundle = {
       schemaVersion: CONTRACT_VERSIONS.validation,
@@ -88,12 +92,13 @@ export class FocusedVerifier {
           ...scopeViolations.map((path) => `scope:${path}`),
           ...suspiciousSignals,
           ...executorDisagreements,
+          ...verifierMutations,
           ...(checkPassed ? [] : [`${command.name} failed`]),
         ].join("; ")}`,
       checks,
       evidence,
     };
-    return { bundle, inspection, checkResult, suspiciousSignals, scopeViolations, executorDisagreements };
+    return { bundle, preCheckInspection, inspection, checkResult, suspiciousSignals, scopeViolations, executorDisagreements, verifierMutations };
   }
 
   private evidence(kind: ValidationEvidence["kind"], classification: ValidationEvidence["classification"], summary: string): ValidationEvidence {
@@ -105,6 +110,33 @@ export class FocusedVerifier {
       summary,
     };
   }
+}
+
+function originalMatchesIntake(snapshot: RepositorySnapshot, intake: RepositoryIntake): boolean {
+  return snapshot.repositoryPath === intake.repositoryPath
+    && snapshot.headOid === intake.baseOid
+    && snapshot.status.length === 0;
+}
+
+function compareVerificationSnapshots(
+  originalBefore: RepositorySnapshot,
+  originalAfter: RepositorySnapshot,
+  worktreeBefore: WorktreeInspection,
+  worktreeAfter: WorktreeInspection,
+): string[] {
+  const mutations: string[] = [];
+  if (JSON.stringify(originalBefore) !== JSON.stringify(originalAfter)) {
+    mutations.push("focused check mutated the original human-owned checkout");
+  }
+  if (
+    worktreeBefore.headOid !== worktreeAfter.headOid
+    || JSON.stringify(worktreeBefore.status) !== JSON.stringify(worktreeAfter.status)
+    || JSON.stringify(worktreeBefore.changedPaths) !== JSON.stringify(worktreeAfter.changedPaths)
+    || worktreeBefore.diff !== worktreeAfter.diff
+  ) {
+    mutations.push("focused check mutated managed worktree source evidence");
+  }
+  return mutations;
 }
 
 function compareExecutorClaims(result: ExecutorResult, actualPaths: string[], checkResult: ProcessResult): string[] {

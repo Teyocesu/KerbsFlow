@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 2 complete; independent review pending**
+Status: **Phase 2 targeted audit fixes implemented; independent review pending**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -71,7 +71,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 2 — First real vertical loop with Codex
 
-**Status:** complete on `phase2/codex-vertical-loop`; independent review pending.
+**Status:** targeted independent-audit fixes implemented on `phase2/codex-vertical-loop`; independent review pending. Real Codex dispatch currently fails closed because the installed CLI does not enforce the requested `/tmp` denial.
 
 **Objective:** Deliver the earliest useful real end-to-end loop in an isolated worktree using one executor.
 
@@ -99,7 +99,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Temporary Git repository tests for base/dirty/untracked/branch/lock/diff; subprocess fixtures for malformed JSONL, exit/signal/timeout/cancel; fake Codex executable contract tests; one opt-in live Codex smoke run with synthetic content.
 
-**Exit condition:** Satisfied. The deterministic suite exercises the real process/Git/adapter boundary, cancellation ordering, and conservative restart paths; an opt-in live Codex run completed and independently verified a bounded change in a disposable worktree without prompt/result copying.
+**Exit condition:** The deterministic Phase 2 and targeted-audit gates are satisfied. The revised installed-CLI probe rejects real dispatch because Codex CLI `0.155.0-alpha.9.2` still permits a synthetic `/tmp` write under the selected permission profile; the required repeat live smoke is therefore blocked before provider inference until that boundary is enforceable.
 
 **Expected route:** Codex/Luna Max for normal implementation, Sol Medium for process/CLI integration debugging, Sol High for security/recovery review.
 
@@ -258,4 +258,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 1 implementation and the targeted independent-audit corrections are complete. Final independent audit confirmation is pending at the updated remote HEAD; Phase 2 remains gated and must satisfy the durable cancellation-intent prerequisite above before connecting a real adapter.
+- Phase 1 and the targeted Phase 2 audit corrections are implemented. Phase 2 remains pending independent review, and real Codex dispatch remains fail-closed until the installed CLI proves denial of out-of-worktree temporary writes.

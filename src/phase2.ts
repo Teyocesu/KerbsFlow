@@ -28,11 +28,12 @@ export interface Phase2LoopRequest {
 }
 
 export interface Phase2LoopResult {
-  verdict: "PASS" | "REWORK" | "HUMAN_GATE" | "RECOVERY";
-  intake: RepositoryIntake;
-  worktree: WorktreeRecord;
+  verdict: "PASS" | "REWORK" | "HUMAN_GATE" | "RECOVERY" | "FAILED";
+  intake?: RepositoryIntake;
+  worktree?: WorktreeRecord;
   executorResult?: ExecutorResult;
   verification?: FocusedVerificationResult;
+  intakeIssue?: { code: string; summary: string };
   stateVersion: number;
 }
 
@@ -52,10 +53,26 @@ export class Phase2Loop {
     if (request.planningDecision.route.adapter !== "codex") {
       throw new KerbsFlowError("ROUTE_NOT_ALLOWED", "Phase 2 real loop accepts only the Codex adapter");
     }
-    const intake = this.git.intake(request.repositoryPath, {
-      ...(request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid }),
-    });
     let command = this.core.startRun(request.runId, request.objective, `${request.runId}:start`);
+    let intake: RepositoryIntake;
+    try {
+      intake = this.git.intake(request.repositoryPath, {
+        ...(request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid }),
+      });
+    } catch (error) {
+      if (!(error instanceof KerbsFlowError)) {
+        throw error;
+      }
+      const gateable = error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH";
+      command = gateable
+        ? this.core.gateIntake(request.runId, command.stateVersion, `${request.runId}:intake-gate`, error.code, error.message)
+        : this.core.failIntake(request.runId, command.stateVersion, `${request.runId}:intake-failed`, error.code, error.message);
+      return {
+        verdict: gateable ? "HUMAN_GATE" : "FAILED",
+        intakeIssue: { code: error.code, summary: error.message },
+        stateVersion: command.stateVersion,
+      };
+    }
     command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     const worktree = this.git.create(intake, request.runId);
     this.store.recordWorktree({

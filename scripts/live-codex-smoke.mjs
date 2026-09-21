@@ -116,6 +116,8 @@ try {
   process.stdout.write(`${JSON.stringify({
     verdict: result.verdict,
     adapterVersion: descriptor.adapterVersion,
+    isolationProbe: "passed",
+    workloadNetwork: descriptor.capabilities.network.workload,
     baseOid,
     originalStatus: git(["status", "--porcelain"]),
     changedPaths: result.verification?.inspection.changedPaths ?? [],

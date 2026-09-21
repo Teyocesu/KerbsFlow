@@ -13,6 +13,12 @@ export interface RepositoryIntake {
   status: GitStatusEntry[];
 }
 
+export interface RepositorySnapshot {
+  repositoryPath: string;
+  headOid: string;
+  status: GitStatusEntry[];
+}
+
 export interface GitStatusEntry {
   code: string;
   path: string;
@@ -92,6 +98,19 @@ export class GitWorktreeManager {
       branch: branchText === "" ? null : branchText,
       headRef: branchText === "" ? baseOid : branchText,
       status,
+    };
+  }
+
+  snapshot(repositoryPath: string): RepositorySnapshot {
+    const canonical = canonicalExistingDirectory(repositoryPath);
+    const inside = git(canonical, ["rev-parse", "--is-inside-work-tree"]);
+    if (inside !== "true") {
+      throw new KerbsFlowError("NOT_GIT_REPOSITORY", `${canonical} is not a Git worktree`);
+    }
+    return {
+      repositoryPath: canonical,
+      headOid: git(canonical, ["rev-parse", "--verify", "HEAD^{commit}"]),
+      status: parsePorcelain(gitBuffer(canonical, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])),
     };
   }
 

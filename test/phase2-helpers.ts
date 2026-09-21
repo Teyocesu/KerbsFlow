@@ -30,12 +30,19 @@ if (args[0] === "login" && args[1] === "status") {
   process.exit(0);
 }
 if (args[0] === "exec" && args.includes("--help")) {
-  console.log("--json --output-schema --output-last-message --model --sandbox --cd --config --ignore-user-config --strict-config resume");
+  console.log("--json --output-schema --output-last-message --model --cd --config --ignore-user-config --ignore-rules --strict-config --ephemeral resume");
   process.exit(0);
 }
 if (args[0] === "exec" && args[1] === "resume" && args.includes("--help")) {
   console.log("resume a session");
   process.exit(0);
+}
+if (args[0] === "sandbox" && args.includes("--help")) {
+  console.log("--permission-profile --cd --config");
+  process.exit(0);
+}
+if (args[0] === "sandbox") {
+  process.exit(args.includes("KERBSFLOW_DENY_PROBE") ? 1 : 0);
 }
 
 const valueAfter = (name) => args[args.indexOf(name) + 1];

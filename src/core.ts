@@ -109,6 +109,48 @@ export class KerbsFlowCore {
     return this.transition(runId, expectedStateVersion, idempotencyKey, "PLAN", "intake_validated", "core");
   }
 
+  gateIntake(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reasonCode: string, summary: string): CommandResult {
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "HUMAN_GATE", "core", reasonCode, { summary });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (run.state !== "INTAKE") {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", `intake gate requires INTAKE, found ${run.state}`);
+      }
+      const gate = parseHumanGate({
+        schemaVersion: CONTRACT_VERSIONS.humanGate,
+        gateId: asGateId(nextId("gate")),
+        runId,
+        reasonCode,
+        summary,
+        evidenceRefs: [],
+        options: [
+          { id: "cancel", label: "Cancel this run", consequence: "Preserve the checkout unchanged and stop this run.", target: "CANCELLED" },
+          { id: "fail", label: "Fail this run", consequence: "Preserve evidence; resolve the checkout ambiguity manually before starting another run.", target: "FAILED" },
+        ],
+        status: "open",
+      });
+      this.insertGate(tx, gate, now);
+      return {
+        transition: { to: "HUMAN_GATE", actor: "core", reasonCode, gateId: gate.gateId, payload: { summary } },
+        runPatch: { currentGateId: gate.gateId, recoveryRequired: false, recoveryReason: null },
+        details: { gateId: gate.gateId, reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
+  failIntake(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reasonCode: string, summary: string): CommandResult {
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "FAILED", "core", reasonCode, { summary });
+    return this.store.executeCommand(command, ({ run }) => {
+      if (run.state !== "INTAKE") {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", `intake failure requires INTAKE, found ${run.state}`);
+      }
+      return {
+        transition: { to: "FAILED", actor: "core", reasonCode, payload: { summary } },
+        runPatch: { recoveryRequired: false, recoveryReason: null },
+        details: { reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
   plan(runId: RunId, expectedStateVersion: number, idempotencyKey: string, value: unknown): CommandResult {
     const decision = parsePlanningDecision(value);
     if (decision.runId !== runId) {
