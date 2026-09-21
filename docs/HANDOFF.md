@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- **Current state:** Targeted Phase 2 audit fixes are complete in `43b61538479e758836005f907c48a45c5a65e485`; deterministic gates pass and independent review is pending.
-- **Unresolved:** Codex CLI `0.155.0-alpha.9.2` still permits the synthetic `/tmp` write, so KerbsFlow fails closed and the revised live smoke stops before provider inference.
-- **Next action:** Independently re-audit the pushed Phase 2 branch and repeat the live smoke only after the CLI proves the required boundary; Phase 3 has not started.
+- **Current state:** The Phase 2 compatibility blocker is resolved on branch HEAD: official standalone Codex CLI `0.157.0-alpha.1` passes deterministic gates, pre/post isolation probes, and one disposable live smoke.
+- **Unresolved:** The ChatGPT.app-bundled `0.155.0-alpha.9.2` remains incompatible and must not be selected; independent re-audit is pending.
+- **Next action:** Independently re-audit the pushed `phase2/codex-vertical-loop` HEAD; Phase 3 has not started.

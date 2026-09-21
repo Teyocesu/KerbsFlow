@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 2 targeted audit fixes implemented; independent review pending**
+Status: **Phase 2 compatibility blocker resolved; independent review pending**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -71,7 +71,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 2 — First real vertical loop with Codex
 
-**Status:** targeted independent-audit fixes implemented on `phase2/codex-vertical-loop`; independent review pending. Real Codex dispatch currently fails closed because the installed CLI does not enforce the requested `/tmp` denial.
+**Status:** targeted independent-audit fixes implemented on `phase2/codex-vertical-loop`; the compatibility blocker is resolved with an official standalone Codex CLI, and independent review is pending. The ChatGPT.app-bundled CLI remains incompatible and fails closed.
 
 **Objective:** Deliver the earliest useful real end-to-end loop in an isolated worktree using one executor.
 
@@ -99,7 +99,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Temporary Git repository tests for base/dirty/untracked/branch/lock/diff; subprocess fixtures for malformed JSONL, exit/signal/timeout/cancel; fake Codex executable contract tests; one opt-in live Codex smoke run with synthetic content.
 
-**Exit condition:** The deterministic Phase 2 and targeted-audit gates are satisfied. The revised installed-CLI probe rejects real dispatch because Codex CLI `0.155.0-alpha.9.2` still permits a synthetic `/tmp` write under the selected permission profile; the required repeat live smoke is therefore blocked before provider inference until that boundary is enforceable.
+**Exit condition:** Satisfied pending independent re-audit. The deterministic Phase 2 and targeted-audit gates pass. Official standalone Codex CLI `0.157.0-alpha.1` denies synthetic outside reads, `.env` reads, `/tmp`, `/private/tmp`, resolved `$TMPDIR`, and local network access while preserving worktree writes; one disposable live smoke passed, followed by a second passing negative probe. Executable selection remains injected through `cliPath`/`CODEX_BIN`, and the capability probe remains authoritative rather than relying on a hard-coded version. The ChatGPT.app-bundled `0.155.0-alpha.9.2` remains incompatible and must not be selected.
 
 **Expected route:** Codex/Luna Max for normal implementation, Sol Medium for process/CLI integration debugging, Sol High for security/recovery review.
 
@@ -258,4 +258,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 1 and the targeted Phase 2 audit corrections are implemented. Phase 2 remains pending independent review, and real Codex dispatch remains fail-closed until the installed CLI proves denial of out-of-worktree temporary writes.
+- Phase 1 and the targeted Phase 2 audit corrections are implemented. The official standalone `0.157.0-alpha.1` closes the macOS compatibility blocker; Phase 2 remains pending independent review before Phase 3 may begin.
