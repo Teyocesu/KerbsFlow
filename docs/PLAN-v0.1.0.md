@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 1 complete; Phase 2 pending; U-03 unresolved**
+Status: **Phase 1 complete; Phase 2 pending independent remote audit**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -27,7 +27,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 - Exactly the four requested canonical files exist.
 - No implementation source, manifest, dependency, framework, CI, database, or runtime directory was added.
-- State machine, authority, adapters, structured result, verification, persistence, recovery, worktree/process lifecycle, security, UI boundary, license status, and unresolved decisions are explicit.
+- State machine, authority, adapters, structured result, verification, persistence, recovery, worktree/process lifecycle, security, UI boundary, license status, and the decision record are explicit.
 
 **Focused validation:** Inspect repository file list/status and review the documents against every Phase 0 acceptance criterion in the SPEC.
 
@@ -65,7 +65,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Contract fixtures; full transition table tests; pause/resume matrix covering safe-origin and forced-`RECOVERY` targets, tampering/stale/duplicate resume, and cancellation from `PAUSED`; SQL migration/rollback tests; duplicate command tests; restart simulations at each persisted fake-attempt boundary.
 
-**Exit condition:** Satisfied. A deterministic fake vertical loop is automatically tested and current state can be queried headlessly after restart. Phase 2 remains pending the U-03 support-matrix decision.
+**Exit condition:** Satisfied. A deterministic fake vertical loop is automatically tested and current state can be queried headlessly after restart. Phase 2 remains pending the independent remote audit of Phase 1.
 
 **Expected route:** Codex/Luna Max for routine implementation; Codex/Sol High review for state atomicity, schema, and recovery model.
 
@@ -229,7 +229,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Exact scope:**
 
-- Confirm U-02 and U-03 were resolved at their earlier required gates; add/verify the human-selected license only after ownership confirmation.
+- Verify the resolved Apache-2.0 license decision and macOS/Linux v0.1 support matrix remain reflected in the release evidence; Windows remains deferred until its explicit platform gates pass.
 - Freeze contract/migration versions and document tested Codex/OpenCode/runtime/support versions.
 - Run the complete deterministic gate from the SPEC across the approved platforms.
 - Run synthetic end-to-end pass, rework, escalation, human gate, cancel, executor crash, orchestrator crash, and recovery scenarios through both adapters where live credentials are available; label unavailable live checks accurately.
@@ -253,7 +253,6 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Expected route:** Codex/Sol High for independent critical review and final verification; use another verified route for implementation fixes when appropriate.
 
-## Current blockers
+## Current gate
 
-- U-03 support matrix must be resolved before Phase 2 process acceptance.
-- U-02 does not block local Phase 1 work, but it must be resolved before the first public push containing production implementation code and before release. Documentation-only Phase 0 may remain public.
+- U-02 and U-03 are resolved. The next required action is an independent remote audit of Phase 1 before Phase 2 starts.

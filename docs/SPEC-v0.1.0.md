@@ -712,11 +712,11 @@ Never commit operational databases, runtime worktrees, raw/unredacted logs, cred
 
 Community boilerplate, CI, release automation, issue templates, and SECURITY/CONTRIBUTING/CODE_OF_CONDUCT files are deferred until they protect a concrete release/community need.
 
-### 19.2 License recommendation and status
+### 19.2 License selection and status
 
-Recommendation: **Apache License 2.0**, pending human confirmation of license and copyright holder (U-02). Both MIT and Apache-2.0 permit commercial use, modification, and redistribution. MIT is shorter and imposes mainly notice preservation; its standard text contains no express patent grant ([SPDX MIT text](https://spdx.org/licenses/preview/MIT.html)). Apache-2.0 adds an express contributor patent license and patent-litigation termination, plus change/notice obligations ([Apache-2.0 text](https://www.apache.org/licenses/LICENSE-2.0.html)).
+The selected license is **Apache License 2.0**. The copyright holder is **Teyocesu**, with copyright year **2026**. The canonical, unmodified license text is in `LICENSE`; the project attribution is in `NOTICE`. Both MIT and Apache-2.0 permit commercial use, modification, and redistribution. MIT is shorter and imposes mainly notice preservation; its standard text contains no express patent grant ([SPDX MIT text](https://spdx.org/licenses/preview/MIT.html)). Apache-2.0 adds an express contributor patent license and patent-litigation termination, plus change/notice obligations ([Apache-2.0 text](https://www.apache.org/licenses/LICENSE-2.0.html)).
 
-For developer infrastructure expected to accept outside contributions and integrate with commercial tooling, the explicit patent terms outweigh Apache-2.0's additional compliance text. Material tradeoffs are the requirement to preserve notices/state changes and incompatibility concerns for some GPLv2-only combinations. This is architectural guidance, not legal advice. No `LICENSE` is created until the human selects it and confirms ownership. U-02 does not block local Phase 1 implementation, and documentation-only Phase 0 may remain public; it must be resolved before the first public push of production implementation code and before release.
+For developer infrastructure expected to accept outside contributions and integrate with commercial tooling, the explicit patent terms outweigh Apache-2.0's additional compliance text. Material tradeoffs are the requirement to preserve notices/state changes and incompatibility concerns for some GPLv2-only combinations. This is architectural guidance, not legal advice. No source copyright headers are required for v0.1.
 
 ## 20. Deterministic validation expectations
 
@@ -761,23 +761,20 @@ v0.1 is acceptable only when:
 
 ## 22. Phase 0 acceptance
 
-Phase 0 is approved and frozen for implementation. Independent review confirmed that this SPEC and its PLAN define unambiguous scope, lifecycle/transitions, gates, adapter/result contracts, persistence/recovery, worktree/process ownership, verification, security, public-repository constraints, licensing status, and early vertical delivery. The final review corrections resolved the runtime baseline, selected the OpenCode V2 embedded-host preference, made pause/resume deterministic, and separated provider/control traffic from workload network permission. No production code, dependencies, scaffolding, or speculative systems were added.
+Phase 0 is approved and frozen for implementation. Independent review confirmed that this SPEC and its PLAN define unambiguous scope, lifecycle/transitions, gates, adapter/result contracts, persistence/recovery, worktree/process ownership, verification, security, public-repository constraints, licensing status, decision record, and early vertical delivery. The final review corrections resolved the runtime baseline, selected the OpenCode V2 embedded-host preference, made pause/resume deterministic, and separated provider/control traffic from workload network permission. No production code, dependencies, scaffolding, or speculative systems were added.
 
-## 23. Unresolved decisions
+## 23. Decision record
 
-### U-02 — Open-source license and copyright holder (blocks first public production-code push and release, not local Phase 1)
+### U-02 — Open-source license and copyright holder (resolved)
 
-- **Problem:** Apache-2.0 is preferred but license selection and the copyright holder are owner decisions.
-- **Alternatives:** MIT for maximum textual simplicity; Apache-2.0 for express patent grant/termination and contributor clarity.
-- **Recommendation:** Apache-2.0; confirm the correct copyright holder before creating `LICENSE`.
-- **Review required:** Human/owner decision before the first public push containing production implementation code and before release; legal review if the owner has any uncertainty. Documentation-only Phase 0 may remain public.
+- **Decision:** Apache License 2.0, copyright holder Teyocesu, copyright year 2026.
+- **Artifacts:** The canonical unmodified text is in `LICENSE`; the minimal project attribution is in `NOTICE`; no source copyright headers are required.
+- **Scope:** This decision authorizes publication of the Phase 1 production branch under Apache-2.0. It does not authorize merge, release, deployment, or any other automatic remote lifecycle action.
 
-### U-03 — v0.1 support matrix (must resolve before process implementation acceptance)
+### U-03 — v0.1 support matrix (resolved)
 
-- **Problem:** Process-group cancellation, filesystem permissions, and isolation mechanisms vary materially by OS.
-- **Alternatives:** macOS/Linux first with Windows deferred; or macOS/Linux/Windows from v0.1 at higher implementation/test cost.
-- **Recommendation:** Officially support macOS and Linux in v0.1; keep path/process abstractions portable and add Windows only after its job/process-tree and permission tests pass.
-- **Review required:** Human/product approval because platform support affects user expectations.
+- **Decision:** Official v0.1 support is macOS and Linux. Windows is deferred; its architecture remains portable, but it is not officially supported until Windows-specific process-tree cancellation, filesystem/permissions, worktree, and recovery gates pass.
+- **Scope:** No Windows implementation or support claim is added in Phase 1. Phase 2 and later process/worktree acceptance uses the approved macOS/Linux matrix unless a later decision expands it.
 
 ## 24. Explicitly deferred capabilities
 
