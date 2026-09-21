@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 1 complete; Phase 2 pending independent remote audit**
+Status: **Phase 1 independently confirmed; Phase 2 in progress**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -37,7 +37,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 1 — Headless contract and persistence foundation
 
-**Status:** complete with the targeted independent-audit correctness fixes applied.
+**Status:** complete and independently confirmed after the targeted correctness fixes.
 
 **Objective:** Produce a deterministic, restartable headless core that can run the lifecycle against a fake executor without touching a real repository.
 
@@ -65,11 +65,13 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Contract fixtures; full transition table tests; pause/resume matrix covering safe-origin and forced-`RECOVERY` targets, tampering/stale/duplicate resume, and cancellation from `PAUSED`; SQL migration/rollback tests; duplicate command tests; restart simulations at each persisted fake-attempt boundary.
 
-**Exit condition:** Satisfied. A deterministic fake vertical loop is automatically tested and current state can be queried headlessly after restart. Phase 2 remains pending the independent remote audit of Phase 1.
+**Exit condition:** Satisfied and independently confirmed. A deterministic fake vertical loop is automatically tested and current state can be queried headlessly after restart.
 
 **Expected route:** Codex/Luna Max for routine implementation; Codex/Sol High review for state atomicity, schema, and recovery model.
 
 ## Phase 2 — First real vertical loop with Codex
+
+**Status:** in progress on `phase2/codex-vertical-loop`.
 
 **Objective:** Deliver the earliest useful real end-to-end loop in an isolated worktree using one executor.
 
