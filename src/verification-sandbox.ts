@@ -51,6 +51,9 @@ export class VerificationSandbox implements VerificationCommandSandbox {
       mkdirSync(probeScratch, { mode: 0o700 });
       writeFileSync(join(probeWorktree, "readable.txt"), "readable", { mode: 0o600 });
       writeFileSync(join(probeWorktree, ".env"), "synthetic-credential", { mode: 0o600 });
+      writeFileSync(join(probeWorktree, ".env.local"), "synthetic-credential", { mode: 0o600 });
+      mkdirSync(join(probeWorktree, "subdir"), { mode: 0o700 });
+      writeFileSync(join(probeWorktree, "subdir", ".env.production"), "synthetic-credential", { mode: 0o600 });
       const outside = join(root, "outside.txt");
       writeFileSync(outside, "outside", { mode: 0o600 });
       const hostTmpProbe = `/tmp/kerbsflow-sandbox-${randomUUID()}`;
@@ -68,7 +71,7 @@ export class VerificationSandbox implements VerificationCommandSandbox {
         const probe = await this.supervisor.start(probeSpec).completion;
         let observed: Record<string, unknown>;
         try { observed = JSON.parse(probe.stdout) as Record<string, unknown>; } catch { throw unavailable("adversarial sandbox probe produced no valid evidence"); }
-        const expected = ["worktreeRead", "scratchWrite", "worktreeWriteDenied", "outsideReadDenied", "outsideWriteDenied", "credentialReadDenied", "hostTmpWriteDenied", "networkDenied", "outboundDenied", "childRestricted"];
+        const expected = ["worktreeRead", "scratchWrite", "worktreeWriteDenied", "outsideReadDenied", "outsideWriteDenied", "credentialReadDenied", "envLocalReadDenied", "nestedEnvProductionReadDenied", "hostTmpWriteDenied", "networkDenied", "outboundDenied", "childRestricted"];
         if (probe.exitKind !== "normal" || probe.exitCode !== 0 || expected.some((key) => observed[key] !== true)) {
           throw unavailable(`adversarial sandbox probe failed: ${expected.filter((key) => observed[key] !== true).join(", ") || probe.exitKind}`);
         }
@@ -192,7 +195,7 @@ function seatbeltProfile(worktree: string, scratch: string, executable: string, 
     "(version 1)", "(deny default)", "(allow process-exec)", "(allow process-fork)", "(allow sysctl-read)",
     `(allow file-read* ${[...literalPaths].map((path) => `(literal ${schemeString(path)})`).join(" ")} ${readPaths.map((path) => `(subpath ${schemeString(path)})`).join(" ")} ${exactFiles.map((path) => `(literal ${schemeString(path)})`).join(" ")})`,
     `(allow file-write* (subpath ${schemeString(scratch)}))`,
-    `(deny file-read* (regex #"(^|/)\\.env($|/)") (regex #"(^|/)\\.aws($|/)") (regex #"(^|/)\\.ssh($|/)") (regex #"(^|/)\\.config/gh($|/)") (regex #"(^|/)\\.npmrc($|/)") (regex #"(^|/)\\.netrc($|/)"))`,
+    `(deny file-read* (regex #"(^|/)\\.env(\\.[^/]*)?($|/)") (regex #"(^|/)\\.aws($|/)") (regex #"(^|/)\\.ssh($|/)") (regex #"(^|/)\\.config/gh($|/)") (regex #"(^|/)\\.npmrc($|/)") (regex #"(^|/)\\.netrc($|/)"))`,
   ];
   return lines.join("\n");
 }
@@ -275,13 +278,16 @@ const denied=(fn)=>{try{fn();return false}catch(e){return e&&(['EPERM','EACCES',
 const result={
  worktreeRead:fs.readFileSync(worktree+'/readable.txt','utf8')==='readable',
  scratchWrite:false,worktreeWriteDenied:false,outsideReadDenied:false,outsideWriteDenied:false,
- credentialReadDenied:false,hostTmpWriteDenied:false,networkDenied:false,outboundDenied:false,childRestricted:false
+ credentialReadDenied:false,envLocalReadDenied:false,nestedEnvProductionReadDenied:false,
+ hostTmpWriteDenied:false,networkDenied:false,outboundDenied:false,childRestricted:false
 };
 try{fs.writeFileSync(scratch+'/allowed','ok');result.scratchWrite=true}catch{}
 result.worktreeWriteDenied=denied(()=>fs.writeFileSync(worktree+'/blocked','x'));
 result.outsideReadDenied=denied(()=>fs.readFileSync(outside));
 result.outsideWriteDenied=denied(()=>fs.writeFileSync(outside,'x'));
 result.credentialReadDenied=denied(()=>fs.readFileSync(worktree+'/.env'));
+result.envLocalReadDenied=denied(()=>fs.readFileSync(worktree+'/.env.local'));
+result.nestedEnvProductionReadDenied=denied(()=>fs.readFileSync(worktree+'/subdir/.env.production'));
 result.hostTmpWriteDenied=denied(()=>fs.writeFileSync(hostTmpProbe,'x'));
 try{const child=cp.spawnSync(process.execPath,['-e','const fs=require("node:fs");try{fs.writeFileSync(process.argv[1],"x");process.exit(1)}catch{process.exit(0)}',outside]);result.childRestricted=child.status===0}catch{}
 const attempt=(host,port,codes)=>new Promise((resolve)=>{

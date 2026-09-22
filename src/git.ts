@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { KerbsFlowError } from "./errors.js";
@@ -99,11 +99,11 @@ export class GitWorktreeManager {
   intake(repositoryPath: string, options: IntakeOptions = {}): RepositoryIntake {
     const canonical = canonicalExistingDirectory(repositoryPath);
     this.assertRuntimeOutsideRepository(canonical);
+    assertSafeCheckoutConfiguration(canonical);
     const inside = git(canonical, ["rev-parse", "--is-inside-work-tree"]);
     if (inside !== "true") {
       throw new KerbsFlowError("NOT_GIT_REPOSITORY", `${canonical} is not a Git worktree`);
     }
-    assertSafeCheckoutConfiguration(canonical);
     const baseOid = git(canonical, ["rev-parse", "--verify", "HEAD^{commit}"]);
     if (options.expectedBaseOid !== undefined && baseOid !== options.expectedBaseOid) {
       throw new KerbsFlowError("BASE_OID_MISMATCH", `expected ${options.expectedBaseOid}, found ${baseOid}`);
@@ -413,12 +413,18 @@ export function gitEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.
 }
 
 function safeGitArgs(args: string[]): string[] {
-  return ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "diff.external=", ...args];
+  return ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "core.attributesFile=/dev/null", "-c", "diff.external=", ...args];
 }
 
 function assertSafeCheckoutConfiguration(repositoryPath: string): void {
-  const configKeys = gitBuffer(repositoryPath, ["config", "--local", "--no-includes", "--null", "--name-only", "--list"])
-    .toString("utf8").split("\0").filter(Boolean);
+  const localKeys = splitNul(gitBuffer(repositoryPath, ["config", "--local", "--no-includes", "--null", "--name-only", "--list"]));
+  const worktreeSetting = gitOptional(repositoryPath, ["config", "--local", "--no-includes", "--get", "--bool", "extensions.worktreeConfig"]);
+  if (localKeys.includes("extensions.worktreeconfig") && worktreeSetting !== "true" && worktreeSetting !== "false") {
+    throw new KerbsFlowError("GIT_EXECUTABLE_CONFIG_GATE", "worktree configuration extension cannot be safely interpreted");
+  }
+  const configKeys = worktreeSetting === "true"
+    ? [...localKeys, ...splitNul(gitBuffer(repositoryPath, ["config", "--worktree", "--no-includes", "--null", "--name-only", "--list"]))]
+    : localKeys;
   const executableConfig = /^(?:filter\..*|core\.(?:fsmonitor|attributesfile)|diff\.(?:external|.*\.(?:command|textconv))|merge\..*\.driver|include(?:if)?\..*)$/iu;
   const blocked = configKeys.filter((key) => executableConfig.test(key));
   if (blocked.length > 0) {
@@ -434,12 +440,44 @@ function assertSafeCheckoutConfiguration(repositoryPath: string): void {
   }
   const localAttributes = join(git(repositoryPath, ["rev-parse", "--git-common-dir"]), "info", "attributes");
   const attributesPath = isAbsolute(localAttributes) ? localAttributes : resolve(repositoryPath, localAttributes);
-  if (existsSync(attributesPath) && lstatSync(attributesPath).isSymbolicLink()) {
-    throw new KerbsFlowError("GIT_CHECKOUT_FILTER_GATE", "repository-local attributes link requires human review");
-  }
-  if (existsSync(attributesPath) && /(?:^|\s)filter(?:=|\s|$)/mu.test(readFileSync(attributesPath, "utf8"))) {
+  if (/(?:^|\s)filter(?:=|\s|$)/mu.test(readBoundedAttributes(attributesPath))) {
     throw new KerbsFlowError("GIT_CHECKOUT_FILTER_GATE", "repository-local attributes request a checkout filter; safe worktree semantics require human review");
   }
+}
+
+function readBoundedAttributes(path: string): string {
+  const gate = (): KerbsFlowError => new KerbsFlowError("GIT_CHECKOUT_FILTER_GATE", "repository-local attributes cannot be safely inspected");
+  const maximumBytes = 1024 * 1024;
+  let metadata;
+  try {
+    if (!lstatSync(dirname(dirname(path))).isDirectory() || !lstatSync(dirname(path)).isDirectory()) throw gate();
+  } catch { throw gate(); }
+  try {
+    metadata = lstatSync(path);
+  }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw gate();
+  }
+  if (!metadata.isFile() || metadata.size > maximumBytes) throw gate();
+  let descriptor: number;
+  try { descriptor = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch { throw gate(); }
+  try {
+    const opened = fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== metadata.dev || opened.ino !== metadata.ino || opened.size > maximumBytes) throw gate();
+    const buffer = Buffer.alloc(opened.size + 1);
+    let count = 0;
+    while (count < buffer.length) {
+      const bytes = readSync(descriptor, buffer, count, buffer.length - count, count);
+      if (bytes === 0) break;
+      count += bytes;
+    }
+    const after = fstatSync(descriptor);
+    if (count !== opened.size || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs || after.ctimeMs !== opened.ctimeMs) throw gate();
+    return buffer.subarray(0, count).toString("latin1");
+  } catch { throw gate(); }
+  finally { closeSync(descriptor); }
 }
 
 function parsePorcelain(buffer: Buffer): GitStatusEntry[] {

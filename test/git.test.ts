@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -58,6 +58,76 @@ test("repository filters and executable Git configuration gate before any sentin
       assert.equal(existsSync(sentinel), false, key);
     } finally {
       rmSync(sentinelRoot, { recursive: true, force: true });
+      rmSync(runtime, { recursive: true, force: true });
+      rmSync(repository.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("worktree-scoped external attributes and filter gate before checkout or sentinel execution", () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-worktree-config-runtime-"));
+  const outside = mkdtempSync(join(tmpdir(), "kerbsflow-worktree-config-outside-"));
+  try {
+    writeFileSync(join(repository.root, "fixture.txt"), "synthetic fixture\n");
+    git(repository.root, ["add", "fixture.txt"]);
+    git(repository.root, ["commit", "--quiet", "-m", "synthetic checkout fixture"]);
+    git(repository.root, ["config", "--local", "extensions.worktreeConfig", "true"]);
+    const attributes = join(outside, "attributes");
+    const sentinel = join(outside, "executed");
+    writeFileSync(attributes, "*.txt filter=synthetic\n");
+    git(repository.root, ["config", "--worktree", "core.attributesFile", attributes]);
+    git(repository.root, ["config", "--worktree", "filter.synthetic.smudge", `touch '${sentinel}'`]);
+    const manager = new GitWorktreeManager(runtime);
+    assert.throws(() => manager.intake(repository.root), (error: unknown) => error instanceof KerbsFlowError && error.code === "GIT_EXECUTABLE_CONFIG_GATE");
+    assert.equal(existsSync(sentinel), false);
+    assert.equal(git(repository.root, ["worktree", "list", "--porcelain"]).includes(join(runtime, "worktrees")), false);
+  } finally {
+    rmSync(outside, { recursive: true, force: true });
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
+test("worktree-scoped process filters, fsmonitor, and includes gate at intake", () => {
+  for (const key of ["filter.synthetic.process", "core.fsmonitor", "include.path"]) {
+    const repository = createGitRepository();
+    const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-worktree-scope-runtime-"));
+    try {
+      git(repository.root, ["config", "--local", "extensions.worktreeConfig", "true"]);
+      git(repository.root, ["config", "--worktree", key, "/nonexistent/synthetic-command-or-config"]);
+      const manager = new GitWorktreeManager(runtime);
+      assert.throws(() => manager.intake(repository.root), (error: unknown) => error instanceof KerbsFlowError && error.code === "GIT_EXECUTABLE_CONFIG_GATE", key);
+    } finally {
+      rmSync(runtime, { recursive: true, force: true });
+      rmSync(repository.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("repository-local attributes inspection rejects links and oversized files", () => {
+  for (const kind of ["link", "linked-directory", "oversized"]) {
+    const repository = createGitRepository();
+    const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-info-attributes-runtime-"));
+    const outside = mkdtempSync(join(tmpdir(), "kerbsflow-info-attributes-outside-"));
+    try {
+      const attributes = join(repository.root, ".git", "info", "attributes");
+      if (kind === "link") {
+        const target = join(outside, "attributes");
+        writeFileSync(target, "*.txt filter=synthetic\n");
+        symlinkSync(target, attributes);
+      } else if (kind === "linked-directory") {
+        renameSync(join(repository.root, ".git", "info"), join(repository.root, ".git", "info-original"));
+        mkdirSync(join(outside, "info"));
+        writeFileSync(join(outside, "info", "attributes"), "*.txt filter=synthetic\n");
+        symlinkSync(join(outside, "info"), join(repository.root, ".git", "info"));
+      } else {
+        writeFileSync(attributes, "x".repeat(1024 * 1024 + 1));
+      }
+      const manager = new GitWorktreeManager(runtime);
+      assert.throws(() => manager.intake(repository.root), (error: unknown) => error instanceof KerbsFlowError && error.code === "GIT_CHECKOUT_FILTER_GATE", kind);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
       rmSync(runtime, { recursive: true, force: true });
       rmSync(repository.root, { recursive: true, force: true });
     }

@@ -174,7 +174,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 5 — Isolation and operational hardening
 
-**Status:** targeted independent-audit corrections F1–F5 implemented and macOS deterministic/security gates passed on the Phase 5 branch; independent review remains required. Phase 4 was independently confirmed **PASS** before the Phase 5 branch was created from canonical closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. The Phase 5 support-matrix exit remains **BLOCKED** pending a real Linux Node 24 operational gate.
+**Status:** final targeted pre-Linux F1/F2 corrections implemented and macOS deterministic/security gates passed on the Phase 5 branch; independent re-audit remains required. F3–F5 remain accepted. Phase 4 was independently confirmed **PASS** before the Phase 5 branch was created from canonical closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. The Phase 5 support-matrix exit remains **BLOCKED** pending a real Linux Node 24 operational gate.
 
 **Objective:** Close the remaining filesystem, process, worktree, network, secret, artifact, and cross-platform risks on the approved support matrix.
 
@@ -200,7 +200,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Adversarial path/symlink/argv/env/log fixtures; network-policy capability tests; process-tree tests per OS; dirty/missing/moved worktree matrix; database corruption/migration backup tests.
 
-**Exit condition:** Pending. On macOS Darwin 24.3.0 / Node v24.15.0, the focused F1–F5 regressions, typecheck, full 234-test deterministic suite, high-severity dependency audit, and `git diff --check` passed. Rollback journaling remains the selected single-owner architecture, now guarded across processes by a private owner record. Linux capability fixtures are deterministic only; live Linux sandbox, filesystem, process-tree, worktree, and SQLite behavior is **NOT TESTED**. The independent Phase 5 security/recovery audit and real Linux gate must close before a support-matrix **PASS**. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
+**Exit condition:** Pending. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did typecheck, the full 237-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Linux capability fixtures are deterministic only; live Linux sandbox, filesystem, process-tree, worktree, and SQLite behavior is **NOT TESTED**. Independent Phase 5 re-audit and the real Linux gate must close before a support-matrix **PASS**. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
 
 **Expected route:** Codex/Sol High for implementation decisions and independent security/hardening review.
 

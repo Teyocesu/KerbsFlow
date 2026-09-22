@@ -18,6 +18,9 @@ test("verification command and descendant cannot escape read-only worktree, scra
   mkdirSync(join(home, ".aws"), { recursive: true });
   writeFileSync(join(worktree, "source.txt"), "source");
   writeFileSync(join(worktree, ".env"), "synthetic-secret");
+  writeFileSync(join(worktree, ".env.local"), "synthetic-secret");
+  mkdirSync(join(worktree, "subdir"));
+  writeFileSync(join(worktree, "subdir", ".env.production"), "synthetic-secret");
   const outside = join(root, "outside.txt");
   const credential = join(home, ".aws", "credentials");
   writeFileSync(outside, "outside");
@@ -41,6 +44,8 @@ test("verification command and descendant cannot escape read-only worktree, scra
       result.symlinkEscapeReadDenied=denied(()=>fs.readFileSync(worktree+'/outside-link'));
       result.outsideWriteDenied=denied(()=>fs.writeFileSync(outside,'x'));
       result.envReadDenied=denied(()=>fs.readFileSync(worktree+'/.env'));
+      result.envLocalReadDenied=denied(()=>fs.readFileSync(worktree+'/.env.local'));
+      result.nestedEnvProductionReadDenied=denied(()=>fs.readFileSync(worktree+'/subdir/.env.production'));
       result.credentialReadDenied=denied(()=>fs.readFileSync(credential));
       result.hostTmpWriteDenied=denied(()=>fs.writeFileSync(hostTmpProbe,'x'));
       const child=cp.spawnSync(process.execPath,['-e','const fs=require("node:fs");try{fs.writeFileSync(process.argv[1],"x");process.exit(1)}catch{process.exit(0)}',outside]);
