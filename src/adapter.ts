@@ -12,9 +12,21 @@ import type {
   SemanticReviewRequest,
 } from "./contracts.js";
 
+export interface AdapterRoutingReadiness {
+  ready: boolean;
+  models: Array<{
+    provider: string;
+    model: string;
+    aliases: string[];
+    reasoning: string[];
+  }>;
+  reason: string;
+}
+
 export interface ExecutorAdapter {
   select?(adapter: string): void;
   probe(): AdapterDescriptor;
+  routingReadiness?(workingDirectory: string): Promise<AdapterRoutingReadiness>;
   start(request: ExecutionRequest): AttemptHandle;
   events(handle: AttemptHandle): AsyncIterable<NormalizedEvent>;
   wait(handle: AttemptHandle): Promise<unknown>;

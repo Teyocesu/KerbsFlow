@@ -34,6 +34,7 @@ import {
   asValidationId,
   canonicalJson,
   parseHumanGate,
+  parseAdapterDescriptor,
   parseCommand,
   parseCommandResult,
   parsePauseContract,
@@ -51,7 +52,16 @@ import { DatabaseIntegrityError, IdempotencyConflictError, KerbsFlowError, NotFo
 import { containsLikelySecret, SENSITIVE_RESULT_REJECTION } from "./secrets.js";
 import { assertAuthoritativePhaseValidation, type AuthoritativePhaseValidation, type PhaseValidationBinding } from "./verifier.js";
 import { assertReviewDispatchAuthority, type ReviewDispatchAuthority } from "./reviewer.js";
-import { assertRoutingDecision, type RoutingDecision } from "./routing.js";
+import {
+  assertAttemptRoutingProvenance,
+  assertRoutingDecision,
+  assertTrustedAttemptRoutingProvenance,
+  assertTrustedRoutingDecision,
+  type AttemptRoutingProvenance,
+  type RoutingDecision,
+  type TrustedAttemptRoutingProvenance,
+  type TrustedRoutingDecision,
+} from "./routing.js";
 
 export type SqlValue = string | number | bigint | Uint8Array | null;
 
@@ -344,6 +354,23 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE UNIQUE INDEX routing_decisions_attempt_idx ON routing_decisions(attempt_id) WHERE attempt_id IS NOT NULL;
     `,
   },
+  {
+    version: 8,
+    name: "phase4-attempt-routing-provenance",
+    sql: `
+      CREATE TABLE attempt_routing_provenance (
+        attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+        planning_decision_id TEXT NOT NULL REFERENCES routing_decisions(planning_decision_id),
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        capability_snapshot_hash TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX attempt_routing_provenance_run_task_idx ON attempt_routing_provenance(run_id, task_id);
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -427,6 +454,11 @@ export interface StoredRoutingDecision {
   decision: RoutingDecision;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface StoredAttemptRoutingProvenance {
+  provenance: AttemptRoutingProvenance;
+  createdAt: string;
 }
 
 export interface StoredRun {
@@ -673,12 +705,12 @@ export class StateStore {
     return row === undefined ? undefined : parseRoutingDecisionRow(row);
   }
 
-  recordRoutingDecision(value: RoutingDecision): StoredRoutingDecision {
+  recordRoutingDecision(value: TrustedRoutingDecision): StoredRoutingDecision {
     this.assertOpen();
-    const decision = assertRoutingDecision(value);
-    if (containsLikelySecret(decision)) {
+    if (containsLikelySecret(value)) {
       throw new KerbsFlowError("ROUTING_METADATA_SECRET_REJECTED", SENSITIVE_RESULT_REJECTION);
     }
+    const decision = assertTrustedRoutingDecision(value);
     return this.withTransaction((tx) => {
       const task = tx.get("SELECT run_id, decision_json FROM tasks WHERE task_id = ?", decision.taskId) as Row | undefined;
       if (task?.run_id !== decision.runId) {
@@ -702,7 +734,7 @@ export class StateStore {
         decision.planningDecisionId,
         decision.runId,
         decision.taskId,
-        decision.attemptId ?? null,
+        null,
         JSON.stringify(decision),
         now,
         now,
@@ -711,24 +743,60 @@ export class StateStore {
     });
   }
 
-  linkRoutingDecision(planningDecisionId: string, attemptId: AttemptId): StoredRoutingDecision {
+  getAttemptRoutingProvenance(attemptId: AttemptId): StoredAttemptRoutingProvenance | undefined {
     this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM attempt_routing_provenance WHERE attempt_id = ?").get(attemptId) as Row | undefined;
+    return row === undefined ? undefined : parseAttemptRoutingProvenanceRow(row);
+  }
+
+  listAttemptRoutingProvenance(runId: RunId, taskId: TaskId): StoredAttemptRoutingProvenance[] {
+    this.assertOpen();
+    return (this.db.prepare("SELECT * FROM attempt_routing_provenance WHERE run_id = ? AND task_id = ? ORDER BY rowid").all(runId, taskId) as Row[]).map(parseAttemptRoutingProvenanceRow);
+  }
+
+  recordAttemptRoutingProvenance(value: TrustedAttemptRoutingProvenance): StoredAttemptRoutingProvenance {
+    this.assertOpen();
+    if (containsLikelySecret(value)) throw new KerbsFlowError("ROUTING_METADATA_SECRET_REJECTED", SENSITIVE_RESULT_REJECTION);
+    const provenance = assertTrustedAttemptRoutingProvenance(value);
     return this.withTransaction((tx) => {
-      const row = tx.get("SELECT * FROM routing_decisions WHERE planning_decision_id = ?", planningDecisionId) as Row | undefined;
-      if (row === undefined) throw new NotFoundError("routing decision", planningDecisionId);
-      const stored = parseRoutingDecisionRow(row);
-      if (stored.decision.attemptId !== undefined && stored.decision.attemptId !== attemptId) {
-        throw new KerbsFlowError("ROUTING_ATTEMPT_CONFLICT", "routing decision is already linked to a different attempt");
+      const attempt = tx.get("SELECT run_id, task_id, adapter_descriptor_json FROM attempts WHERE attempt_id = ?", provenance.attemptId) as Row | undefined;
+      if (attempt?.run_id !== provenance.runId || attempt.task_id !== provenance.taskId) {
+        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the persisted attempt run/task");
       }
-      const attempt = tx.get("SELECT run_id, task_id FROM attempts WHERE attempt_id = ?", attemptId) as Row | undefined;
-      if (attempt?.run_id !== stored.decision.runId || attempt.task_id !== stored.decision.taskId) {
-        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt does not match the routing decision run/task");
+      const descriptorJson = nullableString(attempt.adapter_descriptor_json, "attempts.adapter_descriptor_json");
+      if (descriptorJson === null || parseAdapterDescriptorForRouting(descriptorJson).adapter !== provenance.selected.adapter) {
+        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the prepared adapter descriptor");
       }
-      if (stored.decision.attemptId === attemptId) return stored;
-      const decision = assertRoutingDecision({ ...stored.decision, attemptId });
+      const task = tx.get("SELECT decision_json FROM tasks WHERE task_id = ?", provenance.taskId) as Row | undefined;
+      if (task === undefined) throw new NotFoundError("task", provenance.taskId);
+      const planning = parsePlanningDecision(JSON.parse(stringValue(task.decision_json, "tasks.decision_json")));
+      if (planning.decisionId !== provenance.planningDecisionId || planning.route.adapter !== provenance.selected.adapter || planning.route.model !== provenance.selected.model || planning.route.reasoning !== provenance.selected.reasoning) {
+        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the current persisted planning route");
+      }
+      const routing = tx.get("SELECT decision_json FROM routing_decisions WHERE planning_decision_id = ?", provenance.planningDecisionId) as Row | undefined;
+      if (routing === undefined) throw new NotFoundError("routing decision", provenance.planningDecisionId);
+      const decision = assertRoutingDecision(JSON.parse(stringValue(routing.decision_json, "routing_decisions.decision_json")) as RoutingDecision);
+      if (decision.capabilitySnapshotHash !== provenance.capabilitySnapshotHash) {
+        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the persisted discovery snapshot");
+      }
+      const existing = tx.get("SELECT * FROM attempt_routing_provenance WHERE attempt_id = ?", provenance.attemptId) as Row | undefined;
+      if (existing !== undefined) {
+        const stored = parseAttemptRoutingProvenanceRow(existing);
+        if (canonicalJson(stored.provenance) !== canonicalJson(provenance)) throw new KerbsFlowError("ROUTING_ATTEMPT_CONFLICT", `attempt ${provenance.attemptId} already has different routing provenance`);
+        return stored;
+      }
       const now = this.clock.now();
-      tx.run("UPDATE routing_decisions SET attempt_id = ?, decision_json = ?, updated_at = ? WHERE planning_decision_id = ?", attemptId, JSON.stringify(decision), now, planningDecisionId);
-      return parseRoutingDecisionRow(tx.get("SELECT * FROM routing_decisions WHERE planning_decision_id = ?", planningDecisionId)!);
+      tx.run(
+        "INSERT INTO attempt_routing_provenance (attempt_id, planning_decision_id, run_id, task_id, capability_snapshot_hash, provenance_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        provenance.attemptId,
+        provenance.planningDecisionId,
+        provenance.runId,
+        provenance.taskId,
+        provenance.capabilitySnapshotHash,
+        JSON.stringify(provenance),
+        now,
+      );
+      return parseAttemptRoutingProvenanceRow(tx.get("SELECT * FROM attempt_routing_provenance WHERE attempt_id = ?", provenance.attemptId)!);
     });
   }
 
@@ -1741,12 +1809,10 @@ function parseWorktreeRow(row: Row): StoredWorktree {
 
 function parseRoutingDecisionRow(row: Row): StoredRoutingDecision {
   const decision = assertRoutingDecision(JSON.parse(stringValue(row.decision_json, "routing_decisions.decision_json")) as RoutingDecision);
-  const attemptId = nullableString(row.attempt_id, "routing_decisions.attempt_id");
   if (
     decision.planningDecisionId !== stringValue(row.planning_decision_id, "routing_decisions.planning_decision_id")
     || decision.runId !== asRunId(stringValue(row.run_id, "routing_decisions.run_id"))
     || decision.taskId !== asTaskId(stringValue(row.task_id, "routing_decisions.task_id"))
-    || decision.attemptId !== (attemptId === null ? undefined : asAttemptId(attemptId))
   ) {
     throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "routing decision identity does not match its indexed columns");
   }
@@ -1755,6 +1821,22 @@ function parseRoutingDecisionRow(row: Row): StoredRoutingDecision {
     createdAt: stringValue(row.created_at, "routing_decisions.created_at"),
     updatedAt: stringValue(row.updated_at, "routing_decisions.updated_at"),
   };
+}
+
+function parseAttemptRoutingProvenanceRow(row: Row): StoredAttemptRoutingProvenance {
+  const provenance = assertAttemptRoutingProvenance(JSON.parse(stringValue(row.provenance_json, "attempt_routing_provenance.provenance_json")) as AttemptRoutingProvenance);
+  if (
+    provenance.attemptId !== asAttemptId(stringValue(row.attempt_id, "attempt_routing_provenance.attempt_id"))
+    || provenance.planningDecisionId !== stringValue(row.planning_decision_id, "attempt_routing_provenance.planning_decision_id")
+    || provenance.runId !== asRunId(stringValue(row.run_id, "attempt_routing_provenance.run_id"))
+    || provenance.taskId !== asTaskId(stringValue(row.task_id, "attempt_routing_provenance.task_id"))
+    || provenance.capabilitySnapshotHash !== stringValue(row.capability_snapshot_hash, "attempt_routing_provenance.capability_snapshot_hash")
+  ) throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "attempt routing provenance identity does not match its indexed columns");
+  return { provenance, createdAt: stringValue(row.created_at, "attempt_routing_provenance.created_at") };
+}
+
+function parseAdapterDescriptorForRouting(value: string) {
+  return parseAdapterDescriptor(JSON.parse(value), "attempts.adapter_descriptor_json");
 }
 
 function parseCancellationIntentRow(row: Row): StoredCancellationIntent {

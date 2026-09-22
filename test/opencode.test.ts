@@ -5,6 +5,8 @@ import { Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ExecutorAdapter } from "../src/adapter.js";
+
 import {
   OPENCODE_EXECUTOR_PERMISSIONS,
   OPENCODE_RESULT_END,
@@ -31,6 +33,7 @@ import { KerbsFlowCore } from "../src/core.js";
 import { FakeArtifactStore } from "../src/fake.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { StateStore } from "../src/persistence.js";
+import { RoutedExecutorAdapter } from "../src/routing.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 
 test("the official OpenCode V2 SDK is pinned and its embedded API enforces the tested tool policy without a listener", async () => {
@@ -69,6 +72,12 @@ test("the official OpenCode V2 SDK is pinned and its embedded API enforces the t
     assert.equal(await check("read", "src/index.ts"), "allow");
     assert.equal(await check("edit", "src/index.ts"), "allow");
     assert.equal(await check("read", ".env"), "deny");
+    assert.equal(await check("edit", ".env"), "deny");
+    assert.equal(await check("read", ".env.local"), "deny");
+    assert.equal(await check("edit", ".env.local"), "deny");
+    assert.equal(await check("edit", ".env.production"), "deny");
+    assert.equal(await check("read", "packages/api/.env"), "deny");
+    assert.equal(await check("edit", "packages/api/.env.test"), "deny");
     assert.equal(await check("external_directory", "/private/tmp/*"), "deny");
     assert.equal(await check("shell", "git status"), "deny");
     assert.equal(await check("webfetch", "https://example.com"), "deny");
@@ -191,7 +200,8 @@ test("ambiguous OpenCode terminal output enters RECOVERY without dispatching a f
     fixture.host.contextScenario = "missing";
     fixture.host.logEvents = [event("event-terminal", 1, "session.execution.succeeded")];
     const decision = openCodeDecision("ambiguous");
-    const core = openCodeCore(store, fixture.adapter, clock, ids);
+    let codexStarts = 0;
+    const core = openCodeCore(store, new RoutedExecutorAdapter([fixture.adapter, trackingCodexAdapter(() => { codexStarts += 1; })]), clock, ids);
     let command = core.startRun(decision.runId, "ambiguous OpenCode output", "opencode-ambiguous:start");
     command = core.completeIntake(decision.runId, command.stateVersion, "opencode-ambiguous:intake");
     command = core.plan(decision.runId, command.stateVersion, "opencode-ambiguous:plan", decision);
@@ -200,6 +210,7 @@ test("ambiguous OpenCode terminal output enters RECOVERY without dispatching a f
     command = await core.completeAttempt(decision.runId, command.stateVersion, "opencode-ambiguous:complete");
     assert.equal(command.to, "RECOVERY");
     assert.equal(fixture.host.sessionsById.size, 1);
+    assert.equal(codexStarts, 0);
     assert.equal(store.listTransitions(decision.runId).filter((transition) => transition.to === "EXECUTE").length, 1);
   } finally {
     await fixture.adapter.close().catch(() => undefined);
@@ -244,6 +255,28 @@ for (const scenario of ["missing", "malformed", "identity"] as const) {
       fixture.host.contextScenario = scenario;
       fixture.host.logEvents = [event("event-terminal", 1, "session.execution.succeeded")];
       const handle = fixture.adapter.start(executionRequest(fixture.root, `attempt_opencode_${scenario}`));
+      for await (const _event of fixture.adapter.events(handle)) { /* drain */ }
+      const raw = await fixture.adapter.wait(handle);
+      assert.throws(() => parseExecutorResult(raw));
+    } finally {
+      await fixture.adapter.close().catch(() => undefined);
+      fixture.cleanup();
+    }
+  });
+}
+
+for (const [name, messages] of [
+  ["an earlier valid result followed by prose", (session: FakeSession) => [assistant(resultBlock(session)), assistant("later commentary")]],
+  ["an earlier malformed marker followed by a valid result", (session: FakeSession) => [assistant(`${OPENCODE_RESULT_START}\n{bad json}`), assistant(resultBlock(session))]],
+  ["multiple blocks in the final assistant output", (session: FakeSession) => [assistant(`${resultBlock(session)}\n${resultBlock(session)}`)]],
+  ["prose after the final marker", (session: FakeSession) => [assistant(`${resultBlock(session)}\nextra prose`)]],
+] as const) {
+  test(`OpenCodeAdapter rejects ${name}`, async () => {
+    const fixture = adapterFixture();
+    try {
+      fixture.host.contextBuilder = messages;
+      fixture.host.logEvents = [event("event-terminal", 1, "session.execution.succeeded")];
+      const handle = fixture.adapter.start(executionRequest(fixture.root, `attempt_opencode_exact_${name.replaceAll(" ", "_")}`));
       for await (const _event of fixture.adapter.events(handle)) { /* drain */ }
       const raw = await fixture.adapter.wait(handle);
       assert.throws(() => parseExecutorResult(raw));
@@ -374,6 +407,89 @@ test("active-session close uses native interrupt, and close/listener failures ar
   }
 });
 
+test("close before session creation aborts preparation and proves that no session exists", async () => {
+  const modelGate = deferred<void>();
+  const fixture = adapterFixture({ modelListGate: modelGate });
+  try {
+    fixture.adapter.start(executionRequest(fixture.root, "attempt_close_before_create"));
+    await fixture.host.modelListEntered.promise;
+    await fixture.adapter.close();
+    assert.equal(fixture.host.createCalls, 0);
+    assert.equal(fixture.host.sessionsById.size, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close during delayed session creation aborts it with proven no external session", async () => {
+  const createGate = deferred<void>();
+  const fixture = adapterFixture({ createGate });
+  try {
+    fixture.adapter.start(executionRequest(fixture.root, "attempt_close_during_create"));
+    await fixture.host.createEntered.promise;
+    await fixture.adapter.close();
+    assert.equal(fixture.host.sessionsById.size, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close discovers a session created externally before prepare assigns its identity", async () => {
+  const createGate = deferred<void>();
+  const fixture = adapterFixture({ createGate, createExternallyBeforeGate: true });
+  try {
+    fixture.adapter.start(executionRequest(fixture.root, "attempt_close_external_before_assignment"));
+    await fixture.host.createEntered.promise;
+    assert.equal(fixture.host.sessionsById.size, 1);
+    await fixture.adapter.close();
+    assert.equal(fixture.host.interrupts, 1);
+    assert.equal([...fixture.host.sessionsById.values()][0]?.outcome, "interrupted");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close during prompt dispatch interrupts and reconciles the already-created session", async () => {
+  const promptGate = deferred<void>();
+  const fixture = adapterFixture({ promptGate });
+  try {
+    fixture.adapter.start(executionRequest(fixture.root, "attempt_close_during_prompt"));
+    await fixture.host.promptEntered.promise;
+    await fixture.adapter.close();
+    assert.equal(fixture.host.interrupts, 1);
+    assert.equal([...fixture.host.sessionsById.values()][0]?.outcome, "interrupted");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("possible provider dispatch with unknown terminal state makes close uncertain", async () => {
+  const promptGate = deferred<void>();
+  const fixture = adapterFixture({ promptGate, ignorePromptAbort: true, interruptLeavesRunning: true });
+  try {
+    fixture.adapter.start(executionRequest(fixture.root, "attempt_close_unknown_dispatch"));
+    await fixture.host.promptEntered.promise;
+    await assert.rejects(fixture.adapter.close(), /OPENCODE_CLOSE_UNCERTAIN|unproven active sessions/i);
+    assert.equal(fixture.host.closed, 1);
+  } finally {
+    promptGate.resolve();
+    fixture.cleanup();
+  }
+});
+
+test("close is idempotent and new starts are rejected as soon as close begins", async () => {
+  const fixture = adapterFixture();
+  try {
+    const closing = fixture.adapter.close();
+    assert.throws(() => fixture.adapter.start(executionRequest(fixture.root, "attempt_after_close")), /close|closing/i);
+    await closing;
+    await fixture.adapter.close();
+    assert.equal(fixture.host.closed, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 function executionRequest(root: string, attempt: string): ExecutionRequest {
   return {
     schemaVersion: CONTRACT_VERSIONS.executionRequest,
@@ -405,7 +521,7 @@ function openCodeDecision(suffix: string) {
   return parsePlanningDecision({ ...base, route: { adapter: "opencode", model: "opencode/muse-fixture" }, policyVersion: "kerbsflow.phase4-routing/v1" });
 }
 
-function openCodeCore(store: StateStore, adapter: OpenCodeAdapter, clock: FixedClock, ids: SequenceIdSource): KerbsFlowCore {
+function openCodeCore(store: StateStore, adapter: ExecutorAdapter, clock: FixedClock, ids: SequenceIdSource): KerbsFlowCore {
   return new KerbsFlowCore(store, adapter, new FakeArtifactStore(ids), {
     clock,
     ids,
@@ -416,6 +532,27 @@ function openCodeCore(store: StateStore, adapter: OpenCodeAdapter, clock: FixedC
       runOverride: DEFAULT_RUN_OVERRIDE,
     },
   });
+}
+
+function trackingCodexAdapter(onStart: () => void): ExecutorAdapter {
+  return {
+    probe: () => ({
+      schemaVersion: CONTRACT_VERSIONS.adapterDescriptor,
+      adapter: "codex",
+      provider: "openai",
+      adapterVersion: "fixture",
+      capabilities: {
+        eventTransport: "jsonl", finalJsonSchema: true, modelSelection: true, reasoningEffort: ["max"], agentSelection: false,
+        filesystemEnforcement: "enforced", network: { providerControlPlane: "provider_owned", workload: "enforced" },
+        cancellation: "process_only", resumableSession: true, authentication: { owner: "provider", mode: "provider-owned" }, healthProbe: true,
+      },
+    }),
+    start: (request) => { onStart(); return { schemaVersion: CONTRACT_VERSIONS.attemptHandle, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId }; },
+    events: async function* () { /* no events */ },
+    wait: async () => ({ schemaVersion: "invalid" }),
+    cancel: () => ({ outcome: "unknown", summary: "not used" }),
+    reconcile: async () => ({ outcome: "not_found", summary: "not used" }),
+  };
 }
 
 function resultFor(session: FakeSession, wrongIdentity = false): ExecutorResult {
@@ -448,15 +585,33 @@ interface FakeSession {
   metadata: Record<string, string>;
 }
 
+interface FakeHostBehavior {
+  closeFails?: boolean;
+  urls?: string[];
+  interruptDelayMs?: number;
+  interruptLeavesRunning?: boolean;
+  sessionPageSize?: number;
+  modelListGate?: Deferred<void>;
+  createGate?: Deferred<void>;
+  createExternallyBeforeGate?: boolean;
+  promptGate?: Deferred<void>;
+  ignorePromptAbort?: boolean;
+}
+
 class FakeOpenCodeHost implements OpenCodeHostBoundary {
   readonly sessionsById = new Map<string, FakeSession>();
   logEvents: unknown[] = [];
   contextScenario: "valid" | "missing" | "malformed" | "identity" = "valid";
+  contextBuilder?: (session: FakeSession) => unknown[];
   closed = 0;
   interrupts = 0;
   logReturned = 0;
+  createCalls = 0;
+  readonly modelListEntered = deferred<void>();
+  readonly createEntered = deferred<void>();
+  readonly promptEntered = deferred<void>();
 
-  constructor(private readonly behavior: { closeFails?: boolean; urls?: string[]; interruptDelayMs?: number; interruptLeavesRunning?: boolean; sessionPageSize?: number } = {}) {}
+  constructor(private readonly behavior: FakeHostBehavior = {}) {}
 
   readonly server = {
     info: async () => ({ version: OPENCODE_SDK_VERSION, pid: process.pid, urls: this.behavior.urls ?? [], paths: { tmp: "/synthetic/opencode" } }),
@@ -467,7 +622,11 @@ class FakeOpenCodeHost implements OpenCodeHostBoundary {
   };
 
   readonly model = {
-    list: async () => ({ data: [{ id: "muse-fixture", modelID: "muse-fixture", providerID: "opencode", name: "Muse Fixture", enabled: true, status: "active" as const, variants: [] }] }),
+    list: async (_input?: unknown, options?: { signal?: AbortSignal }) => {
+      this.modelListEntered.resolve();
+      await waitForGate(this.behavior.modelListGate, options?.signal);
+      return { data: [{ id: "muse-fixture", modelID: "muse-fixture", providerID: "opencode", name: "Muse Fixture", enabled: true, status: "active" as const, variants: [] }] };
+    },
   };
 
   readonly permission = {
@@ -475,12 +634,20 @@ class FakeOpenCodeHost implements OpenCodeHostBoundary {
   };
 
   readonly sessions = {
-    create: async (input: { metadata: Record<string, string> }) => {
+    create: async (input: { metadata: Record<string, string> }, options?: { signal?: AbortSignal }) => {
+      this.createCalls += 1;
+      this.createEntered.resolve();
       const session: FakeSession = { id: `session-${this.sessionsById.size + 1}`, metadata: input.metadata };
-      this.sessionsById.set(session.id, session);
+      if (this.behavior.createExternallyBeforeGate) this.sessionsById.set(session.id, session);
+      await waitForGate(this.behavior.createGate, options?.signal);
+      if (!this.behavior.createExternallyBeforeGate) this.sessionsById.set(session.id, session);
       return session;
     },
-    prompt: async () => ({ id: "inbox-fixture" }),
+    prompt: async (_input: unknown, options?: { signal?: AbortSignal }) => {
+      this.promptEntered.resolve();
+      await waitForGate(this.behavior.promptGate, options?.signal, this.behavior.ignorePromptAbort ?? false);
+      return { id: "inbox-fixture" };
+    },
     wait: async ({ sessionID }: { sessionID: string }) => {
       const session = this.required(sessionID);
       session.outcome ??= "succeeded";
@@ -495,6 +662,7 @@ class FakeOpenCodeHost implements OpenCodeHostBoundary {
     },
     context: async ({ sessionID }: { sessionID: string }) => {
       const session = this.required(sessionID);
+      if (this.contextBuilder !== undefined) return this.contextBuilder(session);
       if (this.contextScenario === "missing") return [{ type: "assistant", content: [{ type: "text", text: "done" }] }];
       if (this.contextScenario === "malformed") return [{ type: "assistant", content: [{ type: "text", text: `${OPENCODE_RESULT_START}\n{bad json}\n${OPENCODE_RESULT_END}` }] }];
       const result = resultFor(session, this.contextScenario === "identity");
@@ -548,7 +716,15 @@ class FakeOpenCodeHost implements OpenCodeHostBoundary {
   }
 }
 
-function adapterFixture(behavior: { closeFails?: boolean; urls?: string[]; interruptDelayMs?: number; interruptLeavesRunning?: boolean; sessionPageSize?: number } = {}): {
+function resultBlock(session: FakeSession): string {
+  return `${OPENCODE_RESULT_START}\n${JSON.stringify(resultFor(session))}\n${OPENCODE_RESULT_END}`;
+}
+
+function assistant(text: string): unknown {
+  return { type: "assistant", content: [{ type: "text", text }] };
+}
+
+function adapterFixture(behavior: FakeHostBehavior = {}): {
   root: string;
   host: FakeOpenCodeHost;
   adapter: OpenCodeAdapter;
@@ -567,12 +743,34 @@ function adapterFixture(behavior: { closeFails?: boolean; urls?: string[]; inter
     runtimeRoot: root,
     hostIdentity: "fixture-host",
     now: () => "2026-09-22T12:00:00.000Z",
+    closePreparationTimeoutMs: 50,
     createHost: async (options) => {
       fixture.options = options;
       return host;
     },
   });
   return fixture;
+}
+
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve(value: T): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function waitForGate(gate: Deferred<void> | undefined, signal: AbortSignal | undefined, ignoreAbort = false): Promise<void> {
+  if (signal?.aborted && !ignoreAbort) throw new Error("synthetic operation aborted");
+  if (gate === undefined) return;
+  if (ignoreAbort || signal === undefined) return gate.promise;
+  await Promise.race([
+    gate.promise,
+    new Promise<never>((_resolve, reject) => signal.addEventListener("abort", () => reject(new Error("synthetic operation aborted")), { once: true })),
+  ]);
 }
 
 function event(id: string, sequence: number, type: string): Record<string, unknown> {

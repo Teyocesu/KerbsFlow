@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
-import type { ExecutorAdapter } from "./adapter.js";
+import type { AdapterRoutingReadiness, ExecutorAdapter } from "./adapter.js";
 import {
   CONTRACT_VERSIONS,
   type AdapterDescriptor,
@@ -42,6 +42,10 @@ export const OPENCODE_EXECUTOR_PERMISSIONS: readonly OpenCodePermissionRule[] = 
   { action: "read", resource: ".env.*", effect: "deny" },
   { action: "read", resource: "*/.env", effect: "deny" },
   { action: "read", resource: "*/.env.*", effect: "deny" },
+  { action: "edit", resource: ".env", effect: "deny" },
+  { action: "edit", resource: ".env.*", effect: "deny" },
+  { action: "edit", resource: "*/.env", effect: "deny" },
+  { action: "edit", resource: "*/.env.*", effect: "deny" },
   { action: "external_directory", resource: "*", effect: "deny" },
   { action: "shell", resource: "*", effect: "deny" },
   { action: "webfetch", resource: "*", effect: "deny" },
@@ -122,6 +126,7 @@ export interface OpenCodeAdapterOptions {
   createHost?: OpenCodeHostFactory;
   hostIdentity?: string;
   now?: () => string;
+  closePreparationTimeoutMs?: number;
 }
 
 export interface OpenCodeReadiness {
@@ -194,16 +199,23 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   private readonly createHost: OpenCodeHostFactory;
   private readonly hostIdentity: string;
   private readonly now: () => string;
+  private readonly closePreparationTimeoutMs: number;
   private readonly root: string;
   private readonly databasePath: string;
   private readonly attempts = new Map<string, OpenCodeAttempt>();
   private hostPromise: Promise<OpenCodeHostBoundary> | undefined;
+  private closePromise: Promise<void> | undefined;
+  private lifecycle: "open" | "closing" | "closed" = "open";
   private generation = 0;
 
   constructor(options: OpenCodeAdapterOptions) {
     this.createHost = options.createHost ?? DEFAULT_HOST_FACTORY;
     this.hostIdentity = options.hostIdentity ?? randomUUID();
     this.now = options.now ?? (() => new Date().toISOString());
+    this.closePreparationTimeoutMs = options.closePreparationTimeoutMs ?? 1000;
+    if (!Number.isSafeInteger(this.closePreparationTimeoutMs) || this.closePreparationTimeoutMs < 1) {
+      throw new KerbsFlowError("OPENCODE_CLOSE_TIMEOUT_INVALID", "OpenCode close preparation timeout must be a positive integer");
+    }
     this.root = resolve(options.runtimeRoot, "opencode");
     this.databasePath = join(this.root, "sessions.sqlite");
     mkdirSync(this.root, { recursive: true, mode: 0o700 });
@@ -246,7 +258,22 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     };
   }
 
+  async routingReadiness(workingDirectory: string): Promise<AdapterRoutingReadiness> {
+    const readiness = await this.readiness(workingDirectory);
+    return {
+      ready: readiness.ready,
+      models: readiness.models.map((model) => ({
+        provider: model.providerID,
+        model: `${model.providerID}/${model.id}`,
+        aliases: [model.id, ...(model.modelID === undefined ? [] : [model.modelID])],
+        reasoning: model.variants.map((variant) => variant.id),
+      })),
+      reason: readiness.reason,
+    };
+  }
+
   start(value: ExecutionRequest): AttemptHandle {
+    if (this.lifecycle !== "open") throw new KerbsFlowError("OPENCODE_ADAPTER_CLOSING", "OpenCodeAdapter does not accept work after close begins");
     const request = parseExecutionRequest(value);
     if (request.permissionPolicy.filesystem !== "worktree_only" || request.permissionPolicy.network !== "denied") {
       throw new KerbsFlowError("OPENCODE_POLICY_UNSUPPORTED", "OpenCodeAdapter accepts only worktree-only filesystem and denied workload-network requests");
@@ -410,22 +437,55 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     }
   }
 
-  async close(): Promise<void> {
+  close(): Promise<void> {
+    if (this.closePromise !== undefined) return this.closePromise;
+    if (this.lifecycle === "closed") return Promise.resolve();
+    this.lifecycle = "closing";
+    this.closePromise = this.closeOwnedHost();
+    return this.closePromise;
+  }
+
+  private async closeOwnedHost(): Promise<void> {
+    for (const attempt of this.attempts.values()) attempt.abort.abort();
     const hostPromise = this.hostPromise;
-    if (hostPromise === undefined) return;
-    const host = await hostPromise;
+    if (hostPromise === undefined) {
+      this.lifecycle = "closed";
+      return;
+    }
+    const hostSettlement = await boundedSettlement(hostPromise, this.closePreparationTimeoutMs);
+    if (hostSettlement.status !== "fulfilled") {
+      this.lifecycle = "closed";
+      this.hostPromise = undefined;
+      if (hostSettlement.status === "pending") {
+        void hostPromise.then((host) => host.close()).catch(() => undefined);
+        throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", "OpenCode host creation did not settle before the close coordination deadline");
+      }
+      throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", `OpenCode host creation failed during close: ${message(hostSettlement.reason)}`);
+    }
+    const host = hostSettlement.value;
     const uncertain: string[] = [];
     for (const attempt of this.attempts.values()) {
-      if (attempt.session?.outcome !== undefined || attempt.session?.id === undefined) continue;
-      attempt.abort.abort();
+      const preparation = await boundedSettlement(attempt.preparation, this.closePreparationTimeoutMs);
+      let session = attempt.session;
       try {
-        const outcome = await host.sessions.interrupt({ sessionID: attempt.session.id });
-        const current = outcome.interrupted ? await host.sessions.get({ sessionID: attempt.session.id }) : undefined;
-        if (current?.outcome === undefined) {
-          uncertain.push(attempt.request.attemptId);
-        } else {
-          attempt.session = current;
+        session ??= await this.findSession(host, attempt.request);
+      } catch {
+        uncertain.push(attempt.request.attemptId);
+        continue;
+      }
+      if (session === undefined) {
+        if (preparation.status === "pending") uncertain.push(attempt.request.attemptId);
+        continue;
+      }
+      attempt.session = session;
+      try {
+        let current = await host.sessions.get({ sessionID: session.id });
+        if (current.outcome === undefined) {
+          const outcome = await host.sessions.interrupt({ sessionID: session.id });
+          current = outcome.interrupted ? await host.sessions.get({ sessionID: session.id }) : current;
         }
+        if (current.outcome === undefined) uncertain.push(attempt.request.attemptId);
+        else attempt.session = current;
       } catch {
         uncertain.push(attempt.request.attemptId);
       }
@@ -434,15 +494,18 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       await host.close();
     } catch (error) {
       this.hostPromise = undefined;
+      this.lifecycle = "closed";
       throw new KerbsFlowError("OPENCODE_CLOSE_FAILED", `OpenCode embedded host close failed: ${message(error)}`);
     }
     this.hostPromise = undefined;
+    this.lifecycle = "closed";
     if (uncertain.length > 0) {
       throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", `OpenCode host closed with unproven active sessions: ${uncertain.join(", ")}`);
     }
   }
 
   private async host(): Promise<OpenCodeHostBoundary> {
+    if (this.lifecycle !== "open") throw new KerbsFlowError("OPENCODE_ADAPTER_CLOSING", "OpenCode embedded host cannot open after close begins");
     if (this.hostPromise === undefined) {
       this.generation += 1;
       const options: OpenCodeHostCreateOptions = {
@@ -469,8 +532,9 @@ export class OpenCodeAdapter implements ExecutorAdapter {
 
   private async prepare(attempt: OpenCodeAttempt): Promise<void> {
     const host = await this.host();
-    const selected = await this.selectModel(host, attempt.request.workingDirectory, attempt.request.model, attempt.request.reasoning);
+    const selected = await this.selectModel(host, attempt.request.workingDirectory, attempt.request.model, attempt.request.reasoning, attempt.abort.signal);
     attempt.selectedModel = selected;
+    if (attempt.abort.signal.aborted) throw new Error("OpenCode preparation was aborted before session creation");
     const session = await host.sessions.create({
       title: `KerbsFlow ${attempt.request.attemptId}`,
       agent: OPENCODE_AGENT,
@@ -497,8 +561,8 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     await host.sessions.prompt({ sessionID: session.id, text: openCodePrompt(attempt.request) }, { signal: attempt.abort.signal });
   }
 
-  private async selectModel(host: OpenCodeHostBoundary, directory: string, requested: string, reasoning?: string): Promise<SelectedModel> {
-    const output = await host.model.list({ location: { directory } });
+  private async selectModel(host: OpenCodeHostBoundary, directory: string, requested: string, reasoning: string | undefined, signal: AbortSignal): Promise<SelectedModel> {
+    const output = await host.model.list({ location: { directory } }, { signal });
     const enabled = output.data.filter((model) => model.enabled && model.status !== "deprecated");
     const slash = requested.indexOf("/");
     const requestedProvider = slash < 0 ? undefined : requested.slice(0, slash);
@@ -535,12 +599,20 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         .join("");
       if (text.length > 0) texts.push(text);
     }
-    const candidate = [...texts].reverse().find((text) => text.includes(OPENCODE_RESULT_START));
-    if (candidate === undefined) throw new Error("terminal OpenCode context contains no structured ExecutorResult marker");
+    const candidate = texts.at(-1);
+    if (candidate === undefined) throw new Error("terminal OpenCode context contains no assistant textual output");
+    if (texts.slice(0, -1).some((text) => text.includes(OPENCODE_RESULT_START) || text.includes(OPENCODE_RESULT_END))) {
+      throw new Error("terminal OpenCode context contains an earlier ambiguous result marker");
+    }
     const trimmed = candidate.trim();
     const prefix = `${OPENCODE_RESULT_START}\n`;
     const suffix = `\n${OPENCODE_RESULT_END}`;
-    if (!trimmed.startsWith(prefix) || !trimmed.endsWith(suffix)) throw new Error("structured ExecutorResult marker is malformed or accompanied by untrusted terminal prose");
+    if (
+      occurrences(trimmed, OPENCODE_RESULT_START) !== 1
+      || occurrences(trimmed, OPENCODE_RESULT_END) !== 1
+      || !trimmed.startsWith(prefix)
+      || !trimmed.endsWith(suffix)
+    ) throw new Error("final assistant output is not exactly one structured ExecutorResult block");
     const json = trimmed.slice(prefix.length, -suffix.length);
     if (Buffer.byteLength(json) > 1024 * 1024) throw new Error("structured OpenCode result exceeds the 1 MiB bound");
     const raw: unknown = JSON.parse(json);
@@ -756,4 +828,36 @@ function safeModelMetadata(model: OpenCodeModelInfo): OpenCodeModelInfo {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : "unknown OpenCode error";
+}
+
+function occurrences(value: string, marker: string): number {
+  let count = 0;
+  let offset = 0;
+  while ((offset = value.indexOf(marker, offset)) >= 0) {
+    count += 1;
+    offset += marker.length;
+  }
+  return count;
+}
+
+type PromiseSettlement<T> =
+  | { status: "fulfilled"; value: T }
+  | { status: "rejected"; reason: unknown }
+  | { status: "pending" };
+
+async function boundedSettlement<T>(promise: Promise<T>, timeoutMs: number): Promise<PromiseSettlement<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise.then<PromiseSettlement<T>, PromiseSettlement<T>>(
+        (value) => ({ status: "fulfilled", value }),
+        (reason: unknown) => ({ status: "rejected", reason }),
+      ),
+      new Promise<PromiseSettlement<T>>((resolve) => {
+        timer = setTimeout(() => resolve({ status: "pending" }), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
 }

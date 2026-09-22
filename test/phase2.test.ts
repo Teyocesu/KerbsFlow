@@ -12,14 +12,16 @@ import {
   DEFAULT_RUN_OVERRIDE,
   DEFAULT_USER_PREFERENCES,
   type ExecutorResult,
+  type ExecutionRequest,
   type SemanticReviewHandle,
   type SemanticReviewRequest,
   asAttemptId,
   asRunId,
   asTaskId,
   asValidationId,
+  parsePlanningDecision,
 } from "../src/contracts.js";
-import type { SemanticReviewAdapter } from "../src/adapter.js";
+import type { ExecutorAdapter, SemanticReviewAdapter } from "../src/adapter.js";
 import { KerbsFlowCore } from "../src/core.js";
 import { GitWorktreeManager } from "../src/git.js";
 import { Phase2Loop, type Phase2LoopRequest } from "../src/phase2.js";
@@ -29,8 +31,101 @@ import { ProcessSupervisor } from "../src/process.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { FocusedVerifier } from "../src/verifier.js";
 import { IndependentSemanticReviewer } from "../src/reviewer.js";
+import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery } from "../src/routing.js";
 import { createFakeCodex, createGitRepository, git } from "./phase2-helpers.js";
 import { createFixture, primeExecute } from "./helpers.js";
+
+test("Phase 4 planning cannot execute without a runtime-trusted routing decision", async () => {
+  const fixture = integratedLoopFixture("phase4-authority-missing");
+  try {
+    const planningDecision = parsePlanningDecision({ ...fixture.decision, policyVersion: "kerbsflow.phase4-routing/v1" });
+    const loop = new Phase2Loop(
+      codexCore(fixture.store, fixture.adapter, fixture.ids),
+      fixture.store,
+      fixture.gitManager,
+      new FocusedVerifier(fixture.gitManager, new ProcessSupervisor(), fixture.ids),
+      fixture.ids,
+    );
+    await assert.rejects(loop.run({
+      runId: fixture.runId,
+      taskId: fixture.taskId,
+      objective: "reject missing Phase 4 authority",
+      repositoryPath: fixture.repository.root,
+      expectedBaseOid: fixture.repository.head,
+      planningDecision,
+      focusedCheck: { name: "unused", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      executionTimeoutMs: 5000,
+    }), /trusted routing decision|routing authority/i);
+    assert.equal(fixture.store.getRun(fixture.runId), undefined);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("the real Phase 4 loop persists distinct OpenCode and Codex escalation provenance", async () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-phase4-routed-loop-"));
+  const ids = new SequenceIdSource("phase4_routed_loop");
+  const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
+  const codex = new CodexAdapter({ cliPath: createFakeCodex(runtime), runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+  const open = invariantOpenCodeAdapter();
+  const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+  const runId = asRunId("run_phase4_routed_loop");
+  const taskId = asTaskId("task_phase4_routed_loop");
+  try {
+    const base = createPhase2PlanningDecision({
+      decisionId: "decision_phase4_routed_loop",
+      runId,
+      taskId,
+      objective: "SCENARIO=success prove cross-adapter provenance",
+      acceptance: ["the Codex fallback creates the expected result"],
+      positiveScope: ["result.txt", "test/example.test.ts"],
+      negativeScope: ["README.md"],
+      model: "placeholder",
+      canonicalContext: "phase4 routed loop",
+    });
+    const discovery = await new RoutingDiscovery([
+      { adapter: "opencode", implementation: open },
+      { adapter: "codex", implementation: codex },
+    ], { now: () => "2026-09-22T12:00:00.000Z" }).discover({
+      workingDirectory: repository.root,
+      models: [
+        { adapter: "opencode", provider: "opencode", model: "opencode/muse-fixture", family: "muse" },
+        { adapter: "codex", provider: "openai", model: "fixture-model", family: "sol", reasoning: "high" },
+      ],
+    });
+    const routed = new PolicyRouter().route({ planningDecision: base, classification: "normal", discovery });
+    const loop = new Phase2Loop(
+      codexCore(store, new RoutedExecutorAdapter([open, codex]), ids),
+      store,
+      gitManager,
+      new FocusedVerifier(gitManager, new ProcessSupervisor(), ids),
+      ids,
+    );
+    const result = await loop.run({
+      runId,
+      taskId,
+      objective: "phase4 routed loop",
+      repositoryPath: repository.root,
+      expectedBaseOid: repository.head,
+      planningDecision: routed.planningDecision,
+      routingDecision: routed.routingDecision,
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      phaseCheck: { level: "phase", commandId: "phase4-routed", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      executionTimeoutMs: 5000,
+      failurePolicy: { higherCodexRoute: { model: "fixture-model", reasoning: "high" } },
+    });
+    assert.equal(result.verdict, "PASS");
+    assert.equal(result.attempts, 2);
+    const provenance = store.listAttemptRoutingProvenance(runId, taskId).map((entry) => entry.provenance);
+    assert.deepEqual(provenance.map((entry) => entry.selected.adapter), ["opencode", "codex"]);
+    assert.match(provenance[1]?.escalationReason ?? "", /escalat|higher|invariant/i);
+  } finally {
+    store.close();
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository.root, { recursive: true, force: true });
+  }
+});
 
 test("executor start observes durable PREPARED and a spawn failure remains conservatively PREPARED", async () => {
   const fixture = createFixture();
@@ -731,16 +826,59 @@ test("restart preserves real process identity, prevents duplicate dispatch, and 
   }
 });
 
-function codexCore(store: StateStore, adapter: CodexAdapter, ids: SequenceIdSource): KerbsFlowCore {
+function codexCore(store: StateStore, adapter: ExecutorAdapter, ids: SequenceIdSource): KerbsFlowCore {
   return new KerbsFlowCore(store, adapter, new FileArtifactStore(join(adapterRuntimeRoot(store), "artifacts"), ids), {
     ids,
     configuration: {
       hardInvariants: DEFAULT_HARD_INVARIANTS,
-      projectPolicy: { schemaVersion: CONTRACT_VERSIONS.config, allowedAdapters: ["codex"], maxImplementationAttempts: 2, validationLevel: "focused", workloadNetwork: "denied", automaticReleaseActions: false },
+      projectPolicy: { schemaVersion: CONTRACT_VERSIONS.config, allowedAdapters: ["codex", "opencode"], maxImplementationAttempts: 2, validationLevel: "focused", workloadNetwork: "denied", automaticReleaseActions: false },
       userPreferences: DEFAULT_USER_PREFERENCES,
       runOverride: DEFAULT_RUN_OVERRIDE,
     },
   });
+}
+
+function invariantOpenCodeAdapter(): ExecutorAdapter {
+  const requests = new Map<string, ExecutionRequest>();
+  return {
+    probe: () => ({
+      schemaVersion: CONTRACT_VERSIONS.adapterDescriptor,
+      adapter: "opencode",
+      provider: "provider-selected",
+      adapterVersion: "fixture",
+      capabilities: {
+        eventTransport: "async_iterable", finalJsonSchema: false, modelSelection: true, reasoningEffort: [], agentSelection: true,
+        filesystemEnforcement: "tool_policy_only", network: { providerControlPlane: "provider_owned", workload: "tool_policy_only" },
+        cancellation: "native", resumableSession: true, authentication: { owner: "provider", mode: "provider-owned" }, healthProbe: true,
+      },
+    }),
+    routingReadiness: async () => ({ ready: true, models: [{ provider: "opencode", model: "opencode/muse-fixture", aliases: ["muse-fixture"], reasoning: [] }], reason: "synthetic Muse is ready" }),
+    start: (request) => {
+      requests.set(request.attemptId, request);
+      return { schemaVersion: CONTRACT_VERSIONS.attemptHandle, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId, providerSessionId: `synthetic:${request.attemptId}` };
+    },
+    events: async function* () { /* no provider events are needed for this bounded fixture */ },
+    wait: async (handle) => {
+      const request = requests.get(handle.attemptId);
+      if (request === undefined) throw new Error("missing synthetic OpenCode request");
+      return {
+        schemaVersion: CONTRACT_VERSIONS.executorResult,
+        runId: request.runId,
+        taskId: request.taskId,
+        attemptId: request.attemptId,
+        executor: { adapter: "opencode", adapterVersion: "fixture", provider: "opencode", model: "opencode/muse-fixture" },
+        outcome: "failed",
+        failureClass: "invariant_violation",
+        scopeClaim: "within_scope",
+        summary: "synthetic OpenCode invariant failure",
+        filesChanged: [], checks: [], evidence: [], invariantViolations: ["synthetic invariant failure"], risks: [], warnings: [], artifacts: [], humanGate: null,
+        recommendedNext: "rework",
+        exit: { kind: "normal", code: 1 },
+      } satisfies ExecutorResult;
+    },
+    cancel: () => ({ outcome: "unknown", summary: "not used" }),
+    reconcile: async () => ({ outcome: "not_found", summary: "not used" }),
+  };
 }
 
 function adapterRuntimeRoot(store: StateStore): string {

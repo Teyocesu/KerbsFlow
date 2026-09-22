@@ -15,7 +15,12 @@ import { KerbsFlowError } from "./errors.js";
 import { GitWorktreeManager, type RepositoryIntake, type WorktreeRecord } from "./git.js";
 import { FailurePolicyCoordinator, escalatePlanningRoute } from "./phase3.js";
 import { buildExecutorPrompt } from "./planning.js";
-import type { RoutingDecision } from "./routing.js";
+import {
+  PHASE4_ROUTING_POLICY,
+  assertTrustedRoutingDecision,
+  createAttemptRoutingProvenance,
+  type TrustedRoutingDecision,
+} from "./routing.js";
 import { StateStore, type StoredFailureOccurrence } from "./persistence.js";
 import { IndependentSemanticReviewer } from "./reviewer.js";
 import type { IdSource } from "./runtime.js";
@@ -36,7 +41,7 @@ export interface Phase2LoopRequest {
     higherCodexRoute?: { model: string; reasoning?: string };
   };
   semanticReview?: { model: string; reasoning?: string; canonicalContract: string };
-  routingDecision?: RoutingDecision;
+  routingDecision?: TrustedRoutingDecision;
 }
 
 export interface Phase2LoopResult {
@@ -82,14 +87,22 @@ export class Phase2Loop {
     if (request.routingDecision !== undefined) this.store.recordRoutingDecision(request.routingDecision);
     let decision = request.planningDecision;
     let attempts = 0;
+    let nextSelectionReason = request.routingDecision?.selectionReason ?? "pre-Phase-4 planning route";
+    let nextEscalationReason: string | undefined;
 
     while (true) {
       attempts += 1;
       command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
-      if (attempts === 1 && request.routingDecision !== undefined) {
+      if (request.routingDecision !== undefined) {
         const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
-        if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing metadata linkage requires the prepared attempt");
-        this.store.linkRoutingDecision(request.routingDecision.planningDecisionId, attemptId);
+        if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing provenance requires the prepared attempt");
+        this.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+          routingDecision: request.routingDecision,
+          planningDecision: decision,
+          attemptId,
+          selectionReason: nextSelectionReason,
+          ...(nextEscalationReason === undefined ? {} : { escalationReason: nextEscalationReason }),
+        }));
       }
       command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
       command = await this.core.completeAttempt(request.runId, command.stateVersion, `${request.runId}:complete:${attempts}`);
@@ -112,6 +125,11 @@ export class Phase2Loop {
           const higher = request.failurePolicy?.higherCodexRoute;
           if (higher === undefined) throw new KerbsFlowError("ESCALATION_ROUTE_REQUIRED", "policy selected escalation without an eligible Codex route");
           decision = escalatePlanningRoute(decision, higher);
+          nextEscalationReason = policy.escalationReason ?? "failure policy selected an eligible higher Codex route";
+          nextSelectionReason = `escalated after ${categoryLabel("focused_verification")}`;
+        } else {
+          nextEscalationReason = undefined;
+          nextSelectionReason = `failure policy selected ${policy.resultingAction} after focused verification`;
         }
         command = this.core.reworkToReady(request.runId, command.stateVersion, `${request.runId}:continue:${attempts}`, decision);
         continue;
@@ -142,6 +160,11 @@ export class Phase2Loop {
           const higher = request.failurePolicy?.higherCodexRoute;
           if (higher === undefined) throw new KerbsFlowError("ESCALATION_ROUTE_REQUIRED", "policy selected escalation without an eligible Codex route");
           decision = escalatePlanningRoute(decision, higher);
+          nextEscalationReason = policy.escalationReason ?? "failure policy selected an eligible higher Codex route";
+          nextSelectionReason = `escalated after ${categoryLabel("phase_verification")}`;
+        } else {
+          nextEscalationReason = undefined;
+          nextSelectionReason = `failure policy selected ${policy.resultingAction} after phase verification`;
         }
         command = this.core.reworkToReady(request.runId, command.stateVersion, `${request.runId}:phase-continue:${attempts}`, decision);
         continue;
@@ -178,7 +201,18 @@ export class Phase2Loop {
 
   private assertRequest(request: Phase2LoopRequest): void {
     if (request.planningDecision.runId !== request.runId || request.planningDecision.taskId !== request.taskId) throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "planning decision IDs do not match the Phase 3 loop request");
-    if (request.routingDecision !== undefined && (request.routingDecision.runId !== request.runId || request.routingDecision.taskId !== request.taskId || request.routingDecision.selected.adapter !== request.planningDecision.route.adapter || request.routingDecision.selected.model !== request.planningDecision.route.model)) {
+    if (request.planningDecision.policyVersion === PHASE4_ROUTING_POLICY && request.routingDecision === undefined) {
+      throw new KerbsFlowError("ROUTING_AUTHORITY_REQUIRED", "Phase 4 execution requires its trusted routing decision");
+    }
+    const routing = request.routingDecision === undefined ? undefined : assertTrustedRoutingDecision(request.routingDecision);
+    if (routing !== undefined && (
+      routing.runId !== request.runId
+      || routing.taskId !== request.taskId
+      || routing.planningDecisionId !== request.planningDecision.decisionId
+      || routing.selected.adapter !== request.planningDecision.route.adapter
+      || routing.selected.model !== request.planningDecision.route.model
+      || routing.selected.reasoning !== request.planningDecision.route.reasoning
+    )) {
       throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "routing metadata does not match the Phase 4 loop request");
     }
   }
@@ -208,6 +242,10 @@ export class Phase2Loop {
   private policyTerminalResult(state: string, intake: RepositoryIntake, worktree: WorktreeRecord, executorResult: ExecutorResult, verification: FocusedVerificationResult, attempts: number, stateVersion: number): Phase2LoopResult | undefined {
     return state === "REWORK" ? undefined : { verdict: state === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification, attempts, stateVersion };
   }
+}
+
+function categoryLabel(category: "focused_verification" | "phase_verification"): string {
+  return category === "focused_verification" ? "focused verification" : "phase verification";
 }
 
 function providerSessionId(value: string | null): string | undefined {
