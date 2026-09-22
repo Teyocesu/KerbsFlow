@@ -289,6 +289,13 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX phase_boundaries_run_status_idx ON phase_boundaries(run_id, status);
     `,
   },
+  {
+    version: 4,
+    name: "phase3-review-context-redaction",
+    sql: `
+      ALTER TABLE semantic_review_attempts ADD COLUMN stored_request_hash TEXT;
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -545,6 +552,7 @@ export class StateStore {
     try {
       configureDatabase(db, busyTimeoutMs);
       applyMigrations(db, options.migrations ?? MIGRATIONS, clock);
+      sanitizePersistedSemanticReviewContext(db);
       assertIntegrity(db);
       const store = new StateStore(databasePath, db, clock, ids);
       store.detectStartupRecovery();
@@ -646,15 +654,17 @@ export class StateStore {
         throw new KerbsFlowError("ACTIVE_REVIEWER_EXISTS", `review attempt ${String(active.review_attempt_id)} is already nonterminal`);
       }
       const now = this.clock.now();
+      const persistedRequest = semanticReviewPersistenceEnvelope(request);
       tx.run(
-        "INSERT INTO semantic_review_attempts (review_attempt_id, run_id, task_id, attempt_id, lifecycle, request_json, request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO semantic_review_attempts (review_attempt_id, run_id, task_id, attempt_id, lifecycle, request_json, request_hash, stored_request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         request.reviewAttemptId,
         request.runId,
         request.taskId,
         request.attemptId,
         "PREPARED",
-        JSON.stringify(request),
+        JSON.stringify(persistedRequest),
         hash,
+        requestHash(persistedRequest),
         now,
         now,
       );
@@ -1530,7 +1540,7 @@ function parseSemanticReviewAttemptRow(row: Row): StoredSemanticReviewAttempt {
     || request.runId !== row.run_id
     || request.taskId !== row.task_id
     || request.attemptId !== row.attempt_id
-    || requestHash(request) !== row.request_hash
+    || requestHash(request) !== stringValue(row.stored_request_hash, "semantic_review_attempts.stored_request_hash")
     || (result !== null && (result.reviewAttemptId !== request.reviewAttemptId || result.runId !== request.runId || result.taskId !== request.taskId || result.attemptId !== request.attemptId))
   ) {
     throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "semantic review columns and contract identity do not agree");
@@ -1551,6 +1561,36 @@ function parseSemanticReviewAttemptRow(row: Row): StoredSemanticReviewAttempt {
     endedAt: nullableString(row.ended_at, "semantic_review_attempts.ended_at"),
     updatedAt: stringValue(row.updated_at, "semantic_review_attempts.updated_at"),
   };
+}
+
+function semanticReviewPersistenceEnvelope(request: SemanticReviewRequest): SemanticReviewRequest {
+  return {
+    ...request,
+    promptSummary: `review context omitted from SQLite; sha256=${createHash("sha256").update(request.promptSummary).digest("hex")}`,
+  };
+}
+
+function sanitizePersistedSemanticReviewContext(db: DatabaseSync): void {
+  const rows = db.prepare("SELECT review_attempt_id, request_json FROM semantic_review_attempts WHERE stored_request_hash IS NULL").all() as Row[];
+  if (rows.length === 0) {
+    return;
+  }
+  db.exec("PRAGMA secure_delete = ON");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const update = db.prepare("UPDATE semantic_review_attempts SET request_json = ?, stored_request_hash = ? WHERE review_attempt_id = ? AND stored_request_hash IS NULL");
+    for (const row of rows) {
+      const request = parseSemanticReviewRequest(JSON.parse(stringValue(row.request_json, "semantic_review_attempts.request_json")), "semantic_review_attempts.request_json");
+      const envelope = semanticReviewPersistenceEnvelope(request);
+      const result = update.run(JSON.stringify(envelope), requestHash(envelope), stringValue(row.review_attempt_id, "semantic_review_attempts.review_attempt_id"));
+      if (result.changes !== 1 && result.changes !== 1n) {
+        throw new KerbsFlowError("REVIEW_CONTEXT_REDACTION_FAILED", "semantic review context redaction did not update exactly one row");
+      }
+    }
+    db.exec("COMMIT");
+  } catch (error) {
+    rollbackAndRethrow(db, error);
+  }
 }
 
 function parseFailureOccurrenceRow(row: Row): StoredFailureOccurrence {

@@ -75,7 +75,22 @@ test("fresh semantic reviewer persists a scoped structured inspected result", as
     assert.equal(result.outcome, "supports_continuation");
     assert.equal(fixture.adapter.request?.role, "review");
     assert.deepEqual(fixture.adapter.request?.permissionPolicy, { filesystem: "read_only", network: "denied" });
-    assert.equal(fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId)?.lifecycle, "SUCCEEDED");
+    const stored = fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId);
+    assert.equal(stored?.lifecycle, "SUCCEEDED");
+    assert.match(stored?.request.promptSummary ?? "", /context omitted from SQLite/);
+    assert.doesNotMatch(stored?.request.promptSummary ?? "", /synthetic contract|synthetic diff/);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("likely credentials are rejected before reviewer dispatch or persistence", async () => {
+  const fixture = reviewerFixture("sensitive_context");
+  try {
+    fixture.input.diff = "const API_KEY='sk-fixture123456';";
+    await assert.rejects(() => fixture.reviewer.review(fixture.input), /credential|sensitive/i);
+    assert.equal(fixture.adapter.request, undefined);
+    assert.equal(fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId), undefined);
   } finally {
     fixture.close();
   }
