@@ -4,14 +4,16 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { CodexAdapter, codexPermissionArguments } from "../src/codex.js";
+import { CodexAdapter, codexPermissionArguments, codexReviewPermissionArguments } from "../src/codex.js";
 import {
   CONTRACT_VERSIONS,
   type ExecutionRequest,
   asAttemptId,
+  asReviewId,
   asRunId,
   asTaskId,
   parseExecutorResult,
+  parseSemanticReviewResult,
 } from "../src/contracts.js";
 import { createFakeCodex } from "./phase2-helpers.js";
 
@@ -56,6 +58,84 @@ test("Codex executor permission configuration is workspace-only and disables ext
   assert.match(filesystem ?? "", /"\.env\.\*"="deny"/);
   assert.match(filesystem ?? "", /"\*\*\/\.env"="deny"/);
   assert.match(filesystem ?? "", /"\."="write"/);
+});
+
+test("Codex reviewer permission configuration is enforced read-only with workload tools disabled", () => {
+  const values = codexReviewPermissionArguments().filter((_, index) => index % 2 === 1);
+  assert.ok(values.includes("default_permissions=\"kerbsflow-review\""));
+  assert.ok(values.includes("web_search=\"disabled\""));
+  assert.ok(values.includes("permissions.kerbsflow-review.network.enabled=false"));
+  const filesystem = values.find((value) => value.startsWith("permissions.kerbsflow-review.filesystem="));
+  assert.match(filesystem ?? "", /":root"="deny"/);
+  assert.match(filesystem ?? "", /":workspace_roots"=\{"\."="read"/);
+  assert.doesNotMatch(filesystem ?? "", /"\."="write"/);
+  assert.match(filesystem ?? "", /"\.env"="deny"/);
+});
+
+test("Codex reviewer probe exercises the read-only boundary before reporting availability", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-review-"));
+  try {
+    const adapter = new CodexAdapter({ cliPath: createFakeCodex(root), runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    assert.equal(adapter.probeReview().capabilities.filesystemEnforcement, "enforced");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex reviewer concurrently drains events and persists one terminal process result", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-review-"));
+  try {
+    const adapter = new CodexAdapter({ cliPath: createFakeCodex(root), runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    adapter.probeReview();
+    const handle = adapter.startReview({
+      schemaVersion: CONTRACT_VERSIONS.semanticReviewRequest,
+      reviewAttemptId: asReviewId("review_codex"),
+      runId: asRunId("run_codex"),
+      taskId: asTaskId("task_codex"),
+      attemptId: asAttemptId("attempt_codex_review"),
+      role: "review",
+      workingDirectory: root,
+      promptSummary: "Expected result identity:\n- reviewAttemptId: review_codex\n- runId: run_codex\n- taskId: task_codex\n- attemptId: attempt_codex_review",
+      model: "fixture-model",
+      permissionPolicy: { filesystem: "read_only", network: "denied" },
+      canonicalContextHash: "canonical-hash",
+      diffHash: "diff-hash",
+      validationIds: [],
+      expectedResultSchema: CONTRACT_VERSIONS.semanticReviewResult,
+    });
+    const events: unknown[] = [];
+    const [raw] = await Promise.all([
+      adapter.waitReview(handle),
+      (async () => {
+        for await (const event of adapter.reviewEvents(handle)) {
+          events.push(event);
+        }
+      })(),
+    ]);
+    const result = parseSemanticReviewResult(raw);
+    assert.equal(result.reviewAttemptId, handle.reviewAttemptId);
+    assert.equal(result.evidence[0]?.classification, "inspected");
+    assert.ok(events.length > 0);
+    assert.match(readFileSync(join(root, "codex-reviews", handle.reviewAttemptId, "process-result.json"), "utf8"), /"exitKind":"normal"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex reviewer availability fails closed when its profile permits a synthetic mutation", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-review-"));
+  try {
+    const cliPath = createFakeCodex(root);
+    const source = readFileSync(cliPath, "utf8").replace(
+      'process.exit(args.includes("KERBSFLOW_DENY_PROBE") ? 1 : 0);',
+      'const profile = args[args.indexOf("--permission-profile") + 1]; process.exit(args.includes("KERBSFLOW_DENY_PROBE") && profile !== "kerbsflow-review" ? 1 : 0);',
+    );
+    writeFileSync(cliPath, source, { encoding: "utf8", mode: 0o700 });
+    const adapter = new CodexAdapter({ cliPath, runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    assert.throws(() => adapter.probeReview(), /unexpectedly permitted|isolation/i);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("Codex probe fails closed when the permission boundary cannot deny an outside read", () => {

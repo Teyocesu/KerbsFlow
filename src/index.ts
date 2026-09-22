@@ -12,4 +12,8 @@ export * from "./process.js";
 export * from "./planning.js";
 export * from "./codex.js";
 export * from "./verifier.js";
+export * from "./anti-greenwashing.js";
+export * from "./phase3.js";
+export * from "./reviewer.js";
+export * from "./canonical.js";
 export * from "./phase2.js";

@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 2 compatibility blocker resolved; independent review pending**
+Status: **Phase 3 implementation and deterministic validation complete; independent review pending**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -71,7 +71,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 2 — First real vertical loop with Codex
 
-**Status:** targeted independent-audit fixes implemented on `phase2/codex-vertical-loop`; the compatibility blocker is resolved with an official standalone Codex CLI, and independent review is pending. The ChatGPT.app-bundled CLI remains incompatible and fails closed.
+**Status:** complete and independently confirmed at approved baseline `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. The compatibility blocker is resolved with an official standalone Codex CLI; the ChatGPT.app-bundled CLI remains incompatible and fails closed.
 
 **Objective:** Deliver the earliest useful real end-to-end loop in an isolated worktree using one executor.
 
@@ -99,11 +99,13 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Temporary Git repository tests for base/dirty/untracked/branch/lock/diff; subprocess fixtures for malformed JSONL, exit/signal/timeout/cancel; fake Codex executable contract tests; one opt-in live Codex smoke run with synthetic content.
 
-**Exit condition:** Satisfied pending independent re-audit. The deterministic Phase 2 and targeted-audit gates pass. Official standalone Codex CLI `0.157.0-alpha.1` denies synthetic outside reads, `.env` reads, `/tmp`, `/private/tmp`, resolved `$TMPDIR`, and local network access while preserving worktree writes; one disposable live smoke passed, followed by a second passing negative probe. Executable selection remains injected through `cliPath`/`CODEX_BIN`, and the capability probe remains authoritative rather than relying on a hard-coded version. The ChatGPT.app-bundled `0.155.0-alpha.9.2` remains incompatible and must not be selected.
+**Exit condition:** Satisfied and independently confirmed. The deterministic Phase 2 and targeted-audit gates pass. Official standalone Codex CLI `0.157.0-alpha.1` denies synthetic outside reads, `.env` reads, `/tmp`, `/private/tmp`, resolved `$TMPDIR`, and local network access while preserving worktree writes; one disposable live smoke passed, followed by a second passing negative probe. Executable selection remains injected through `cliPath`/`CODEX_BIN`, and the capability probe remains authoritative rather than relying on a hard-coded version. The ChatGPT.app-bundled `0.155.0-alpha.9.2` remains incompatible and must not be selected.
 
 **Expected route:** Codex/Luna Max for normal implementation, Sol Medium for process/CLI integration debugging, Sol High for security/recovery review.
 
 ## Phase 3 — Verification, review, and conservative recovery
+
+**Status:** implementation complete on `phase3/verification-recovery` from the independently approved Phase 2 baseline `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`; independent review pending.
 
 **Objective:** Make pass/rework/escalation/phase closure trustworthy under failures and validation manipulation.
 
@@ -129,7 +131,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Mutation-style fixtures for weakened gates; failure-fingerprint table tests; crash matrix; gate option/consequence tests; read-only reviewer enforcement tests.
 
-**Exit condition:** The Codex vertical loop can close a phase only through independently supported evidence and can recover conservatively from each simulated crash window.
+**Exit condition:** Satisfied for implementation and deterministic validation; independent review is pending. The Codex vertical loop closes a phase only through independently supported classified evidence, canonical intent is checked from the repository by the core, and ambiguous executor/reviewer crash windows recover conservatively without redispatch.
 
 **Expected route:** Codex/Sol High for verification, recovery, security, and independent phase review.
 
@@ -258,4 +260,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 1 and the targeted Phase 2 audit corrections are implemented. The official standalone `0.157.0-alpha.1` closes the macOS compatibility blocker; Phase 2 remains pending independent review before Phase 3 may begin.
+- Phase 2 is independently confirmed at `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. Phase 3 implementation and deterministic validation are complete on `phase3/verification-recovery`; independent review is pending. Phase 4 has not started.

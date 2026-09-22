@@ -34,11 +34,11 @@ test("failed migration rolls back its DDL and preserves the prior schema", () =>
   try {
     const brokenMigrations = [
       ...MIGRATIONS,
-      { version: 3, name: "broken", sql: "CREATE TABLE should_rollback (id INTEGER); INSERT INTO missing_table VALUES (1);" },
+      { version: 4, name: "broken", sql: "CREATE TABLE should_rollback (id INTEGER); INSERT INTO missing_table VALUES (1);" },
     ];
     assert.throws(() => applyMigrations(db, brokenMigrations, clock));
     assert.equal((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'").get() as unknown), undefined);
-    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count, 2);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count, 3);
   } finally {
     db.close();
   }

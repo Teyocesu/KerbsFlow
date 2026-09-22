@@ -20,6 +20,9 @@ import {
   ValidationBundle,
   HumanGate,
   ReviewDecision,
+  ReviewId,
+  SemanticReviewRequest,
+  SemanticReviewResult,
   AttemptLifecycle,
   asAttemptId,
   asCommandId,
@@ -34,6 +37,8 @@ import {
   parsePauseContract,
   parsePlanningDecision,
   parseReviewDecision,
+  parseSemanticReviewRequest,
+  parseSemanticReviewResult,
   parseRunState,
   parseValidationBundle,
   requestHash,
@@ -222,7 +227,121 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX cancellation_intents_run_idx ON cancellation_intents(run_id, status);
     `,
   },
+  {
+    version: 3,
+    name: "phase3-verification-recovery",
+    sql: `
+      CREATE TABLE semantic_review_attempts (
+        review_attempt_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+        lifecycle TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        provider_identity_json TEXT,
+        result_json TEXT,
+        failure_summary TEXT,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        ended_at TEXT,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE failure_occurrences (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        task_id TEXT NOT NULL REFERENCES tasks(task_id),
+        attempt_id TEXT REFERENCES attempts(attempt_id),
+        fingerprint TEXT NOT NULL,
+        occurrence INTEGER NOT NULL CHECK (occurrence > 0),
+        failure_class TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        normalized_json TEXT NOT NULL,
+        route_json TEXT NOT NULL,
+        resulting_action TEXT NOT NULL,
+        escalation_reason TEXT,
+        created_at TEXT NOT NULL,
+        UNIQUE (run_id, task_id, fingerprint, occurrence)
+      ) STRICT;
+
+      CREATE TABLE canonical_snapshots (
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        repository_path TEXT NOT NULL,
+        base_oid TEXT NOT NULL,
+        hashes_json TEXT NOT NULL,
+        captured_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE TABLE phase_boundaries (
+        boundary_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        status TEXT NOT NULL,
+        expected_hashes_json TEXT NOT NULL,
+        observed_hashes_json TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      ) STRICT;
+
+      CREATE INDEX semantic_reviews_run_lifecycle_idx ON semantic_review_attempts(run_id, lifecycle);
+      CREATE INDEX failure_occurrences_fingerprint_idx ON failure_occurrences(run_id, task_id, fingerprint, occurrence);
+      CREATE UNIQUE INDEX failure_occurrences_attempt_fingerprint_idx ON failure_occurrences(run_id, task_id, attempt_id, fingerprint) WHERE attempt_id IS NOT NULL;
+      CREATE INDEX phase_boundaries_run_status_idx ON phase_boundaries(run_id, status);
+    `,
+  },
 ];
+
+export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
+
+export interface StoredSemanticReviewAttempt {
+  reviewAttemptId: ReviewId;
+  runId: RunId;
+  taskId: TaskId;
+  attemptId: AttemptId;
+  lifecycle: SemanticReviewLifecycle;
+  request: SemanticReviewRequest;
+  requestHash: string;
+  providerIdentityJson: string | null;
+  result: SemanticReviewResult | null;
+  failureSummary: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  endedAt: string | null;
+  updatedAt: string;
+}
+
+export interface StoredFailureOccurrence {
+  runId: RunId;
+  taskId: TaskId;
+  attemptId: AttemptId | null;
+  fingerprint: string;
+  occurrence: number;
+  failureClass: string;
+  reasonCode: string;
+  normalizedJson: string;
+  routeJson: string;
+  resultingAction: string;
+  escalationReason: string | null;
+  createdAt: string;
+}
+
+export interface StoredCanonicalSnapshot {
+  runId: RunId;
+  repositoryPath: string;
+  baseOid: string;
+  hashes: Record<string, string>;
+  capturedAt: string;
+}
+
+export interface StoredPhaseBoundary {
+  boundaryId: string;
+  runId: RunId;
+  status: "PREPARED" | "APPLIED";
+  expectedHashes: Record<string, string>;
+  observedHashes: Record<string, string> | null;
+  createdAt: string;
+  updatedAt: string;
+}
 
 export interface StoredWorktree {
   runId: RunId;
@@ -503,6 +622,251 @@ export class StateStore {
     this.assertOpen();
     const row = this.db.prepare("SELECT * FROM cancellation_intents WHERE attempt_id = ?").get(attemptId) as Row | undefined;
     return row === undefined ? undefined : parseCancellationIntentRow(row);
+  }
+
+  prepareSemanticReview(requestValue: unknown): StoredSemanticReviewAttempt {
+    this.assertOpen();
+    const request = parseSemanticReviewRequest(requestValue);
+    return this.withTransaction((tx) => {
+      const existing = tx.get("SELECT * FROM semantic_review_attempts WHERE review_attempt_id = ?", request.reviewAttemptId) as Row | undefined;
+      const hash = requestHash(request);
+      if (existing !== undefined) {
+        const parsed = parseSemanticReviewAttemptRow(existing);
+        if (parsed.requestHash !== hash) {
+          throw new KerbsFlowError("REVIEW_ATTEMPT_CONFLICT", `review attempt ${request.reviewAttemptId} was reused for different input`);
+        }
+        return parsed;
+      }
+      const attempt = tx.get("SELECT run_id, task_id FROM attempts WHERE attempt_id = ?", request.attemptId) as Row | undefined;
+      if (attempt?.run_id !== request.runId || attempt.task_id !== request.taskId) {
+        throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "semantic review request does not match a persisted implementation attempt");
+      }
+      const active = tx.get("SELECT review_attempt_id FROM semantic_review_attempts WHERE run_id = ? AND lifecycle IN ('PREPARED', 'RUNNING', 'UNKNOWN') LIMIT 1", request.runId) as Row | undefined;
+      if (active !== undefined) {
+        throw new KerbsFlowError("ACTIVE_REVIEWER_EXISTS", `review attempt ${String(active.review_attempt_id)} is already nonterminal`);
+      }
+      const now = this.clock.now();
+      tx.run(
+        "INSERT INTO semantic_review_attempts (review_attempt_id, run_id, task_id, attempt_id, lifecycle, request_json, request_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        request.reviewAttemptId,
+        request.runId,
+        request.taskId,
+        request.attemptId,
+        "PREPARED",
+        JSON.stringify(request),
+        hash,
+        now,
+        now,
+      );
+      return this.requiredSemanticReviewInTransaction(tx, request.reviewAttemptId);
+    });
+  }
+
+  markSemanticReviewRunning(reviewAttemptId: ReviewId, providerIdentity: JsonValue): StoredSemanticReviewAttempt {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+      if (review.lifecycle !== "PREPARED") {
+        throw new KerbsFlowError("REVIEW_NOT_PREPARED", `review attempt ${reviewAttemptId} is ${review.lifecycle}`);
+      }
+      const now = this.clock.now();
+      tx.run(
+        "UPDATE semantic_review_attempts SET lifecycle = 'RUNNING', provider_identity_json = ?, started_at = ?, updated_at = ? WHERE review_attempt_id = ?",
+        JSON.stringify(providerIdentity),
+        now,
+        now,
+        reviewAttemptId,
+      );
+      return this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+    });
+  }
+
+  completeSemanticReview(reviewAttemptId: ReviewId, resultValue: unknown): StoredSemanticReviewAttempt {
+    this.assertOpen();
+    const result = parseSemanticReviewResult(resultValue);
+    return this.withTransaction((tx) => {
+      const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+      if (review.lifecycle !== "RUNNING" && review.lifecycle !== "PREPARED") {
+        throw new KerbsFlowError("REVIEW_NOT_ACTIVE", `review attempt ${reviewAttemptId} is ${review.lifecycle}`);
+      }
+      if (result.reviewAttemptId !== review.reviewAttemptId || result.runId !== review.runId || result.taskId !== review.taskId || result.attemptId !== review.attemptId) {
+        throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "semantic review result identity does not match its persisted request");
+      }
+      const now = this.clock.now();
+      tx.run(
+        "UPDATE semantic_review_attempts SET lifecycle = 'SUCCEEDED', result_json = ?, ended_at = ?, updated_at = ? WHERE review_attempt_id = ?",
+        JSON.stringify(result),
+        now,
+        now,
+        reviewAttemptId,
+      );
+      return this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+    });
+  }
+
+  failSemanticReview(reviewAttemptId: ReviewId, summary: string, uncertain = false): StoredSemanticReviewAttempt {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+      if (review.lifecycle !== "PREPARED" && review.lifecycle !== "RUNNING") {
+        throw new KerbsFlowError("REVIEW_NOT_ACTIVE", `review attempt ${reviewAttemptId} is ${review.lifecycle}`);
+      }
+      const now = this.clock.now();
+      tx.run(
+        "UPDATE semantic_review_attempts SET lifecycle = ?, failure_summary = ?, ended_at = ?, updated_at = ? WHERE review_attempt_id = ?",
+        uncertain ? "UNKNOWN" : "FAILED",
+        summary.slice(0, 4000),
+        now,
+        now,
+        reviewAttemptId,
+      );
+      return this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+    });
+  }
+
+  getSemanticReviewAttempt(reviewAttemptId: ReviewId): StoredSemanticReviewAttempt | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM semantic_review_attempts WHERE review_attempt_id = ?").get(reviewAttemptId) as Row | undefined;
+    return row === undefined ? undefined : parseSemanticReviewAttemptRow(row);
+  }
+
+  recordFailureOccurrence(input: Omit<StoredFailureOccurrence, "occurrence" | "createdAt">): StoredFailureOccurrence {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      if (input.attemptId !== null) {
+        const existing = tx.get("SELECT * FROM failure_occurrences WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND fingerprint = ?", input.runId, input.taskId, input.attemptId, input.fingerprint) as Row | undefined;
+        if (existing !== undefined) {
+          const parsed = parseFailureOccurrenceRow(existing);
+          if (parsed.resultingAction !== input.resultingAction || parsed.failureClass !== input.failureClass || parsed.reasonCode !== input.reasonCode) {
+            throw new KerbsFlowError("FAILURE_OCCURRENCE_CONFLICT", "the same attempt/fingerprint was recorded with a different policy result");
+          }
+          return parsed;
+        }
+      }
+      const row = tx.get("SELECT COALESCE(MAX(occurrence), 0) AS occurrence FROM failure_occurrences WHERE run_id = ? AND task_id = ? AND fingerprint = ?", input.runId, input.taskId, input.fingerprint) as Row | undefined;
+      const occurrence = numberValue(row?.occurrence ?? 0, "failure_occurrences.occurrence") + 1;
+      const now = this.clock.now();
+      tx.run(
+        "INSERT INTO failure_occurrences (run_id, task_id, attempt_id, fingerprint, occurrence, failure_class, reason_code, normalized_json, route_json, resulting_action, escalation_reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        input.runId,
+        input.taskId,
+        input.attemptId,
+        input.fingerprint,
+        occurrence,
+        input.failureClass,
+        input.reasonCode,
+        input.normalizedJson,
+        input.routeJson,
+        input.resultingAction,
+        input.escalationReason,
+        now,
+      );
+      return { ...input, occurrence, createdAt: now };
+    });
+  }
+
+  countFailureOccurrences(runId: RunId, taskId: TaskId, fingerprint: string): number {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM failure_occurrences WHERE run_id = ? AND task_id = ? AND fingerprint = ?").get(runId, taskId, fingerprint) as Row | undefined;
+    return numberValue(row?.count ?? 0, "failure_occurrences.count");
+  }
+
+  countTaskAttempts(runId: RunId, taskId: TaskId): number {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE run_id = ? AND task_id = ?").get(runId, taskId) as Row | undefined;
+    return numberValue(row?.count ?? 0, "attempts.count");
+  }
+
+  hasFailureEscalation(runId: RunId, taskId: TaskId): boolean {
+    this.assertOpen();
+    return this.db.prepare("SELECT 1 AS present FROM failure_occurrences WHERE run_id = ? AND task_id = ? AND escalation_reason IS NOT NULL LIMIT 1").get(runId, taskId) !== undefined;
+  }
+
+  getFailureOccurrenceForAttempt(runId: RunId, taskId: TaskId, attemptId: AttemptId, fingerprint: string): StoredFailureOccurrence | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM failure_occurrences WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND fingerprint = ?").get(runId, taskId, attemptId, fingerprint) as Row | undefined;
+    return row === undefined ? undefined : parseFailureOccurrenceRow(row);
+  }
+
+  listFailureOccurrences(runId: RunId, taskId: TaskId): StoredFailureOccurrence[] {
+    this.assertOpen();
+    const rows = this.db.prepare("SELECT * FROM failure_occurrences WHERE run_id = ? AND task_id = ? ORDER BY sequence").all(runId, taskId) as Row[];
+    return rows.map(parseFailureOccurrenceRow);
+  }
+
+  recordCanonicalSnapshot(snapshot: Omit<StoredCanonicalSnapshot, "capturedAt">): StoredCanonicalSnapshot {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      const existing = tx.get("SELECT * FROM canonical_snapshots WHERE run_id = ?", snapshot.runId) as Row | undefined;
+      const now = this.clock.now();
+      if (existing !== undefined) {
+        const parsed = parseCanonicalSnapshotRow(existing);
+        if (canonicalJson({ ...parsed, capturedAt: "" }) !== canonicalJson({ ...snapshot, capturedAt: "" })) {
+          throw new KerbsFlowError("CANONICAL_SNAPSHOT_CONFLICT", "canonical hashes cannot be silently refreshed during a run");
+        }
+        return parsed;
+      }
+      tx.run("INSERT INTO canonical_snapshots (run_id, repository_path, base_oid, hashes_json, captured_at) VALUES (?, ?, ?, ?, ?)", snapshot.runId, snapshot.repositoryPath, snapshot.baseOid, JSON.stringify(snapshot.hashes), now);
+      return { ...snapshot, capturedAt: now };
+    });
+  }
+
+  getCanonicalSnapshot(runId: RunId): StoredCanonicalSnapshot | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM canonical_snapshots WHERE run_id = ?").get(runId) as Row | undefined;
+    return row === undefined ? undefined : parseCanonicalSnapshotRow(row);
+  }
+
+  preparePhaseBoundary(boundary: Omit<StoredPhaseBoundary, "status" | "observedHashes" | "createdAt" | "updatedAt">): StoredPhaseBoundary {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      const existing = tx.get("SELECT * FROM phase_boundaries WHERE boundary_id = ?", boundary.boundaryId) as Row | undefined;
+      if (existing !== undefined) {
+        const parsed = parsePhaseBoundaryRow(existing);
+        if (canonicalJson(parsed.expectedHashes) !== canonicalJson(boundary.expectedHashes) || parsed.runId !== boundary.runId) {
+          throw new KerbsFlowError("PHASE_BOUNDARY_CONFLICT", `phase boundary ${boundary.boundaryId} was reused with different intent`);
+        }
+        return parsed;
+      }
+      const now = this.clock.now();
+      tx.run("INSERT INTO phase_boundaries (boundary_id, run_id, status, expected_hashes_json, created_at, updated_at) VALUES (?, ?, 'PREPARED', ?, ?, ?)", boundary.boundaryId, boundary.runId, JSON.stringify(boundary.expectedHashes), now, now);
+      return { ...boundary, status: "PREPARED", observedHashes: null, createdAt: now, updatedAt: now };
+    });
+  }
+
+  completePhaseBoundary(boundaryId: string, observedHashes: Record<string, string>): StoredPhaseBoundary {
+    this.assertOpen();
+    return this.withTransaction((tx) => {
+      const existing = tx.get("SELECT * FROM phase_boundaries WHERE boundary_id = ?", boundaryId) as Row | undefined;
+      if (existing === undefined) {
+        throw new NotFoundError("phase boundary", boundaryId);
+      }
+      const boundary = parsePhaseBoundaryRow(existing);
+      if (boundary.status === "APPLIED") {
+        if (canonicalJson(boundary.observedHashes ?? {}) !== canonicalJson(observedHashes)) {
+          throw new KerbsFlowError("PHASE_BOUNDARY_CONFLICT", "completed phase boundary cannot be rewritten");
+        }
+        return boundary;
+      }
+      const snapshotRow = tx.get("SELECT * FROM canonical_snapshots WHERE run_id = ?", boundary.runId) as Row | undefined;
+      if (snapshotRow === undefined) {
+        throw new KerbsFlowError("CANONICAL_SNAPSHOT_REQUIRED", "phase boundary cannot complete without its canonical snapshot");
+      }
+      const snapshot = parseCanonicalSnapshotRow(snapshotRow);
+      if (canonicalJson(snapshot.hashes) !== canonicalJson(boundary.expectedHashes)) {
+        throw new KerbsFlowError("CANONICAL_INTENT_DRIFT", "canonical snapshot no longer matches the prepared phase boundary");
+      }
+      const now = this.clock.now();
+      tx.run("UPDATE phase_boundaries SET status = 'APPLIED', observed_hashes_json = ?, updated_at = ? WHERE boundary_id = ?", JSON.stringify(observedHashes), now, boundaryId);
+      tx.run("UPDATE canonical_snapshots SET hashes_json = ?, captured_at = ? WHERE run_id = ?", JSON.stringify(observedHashes), now, boundary.runId);
+      return parsePhaseBoundaryRow(tx.get("SELECT * FROM phase_boundaries WHERE boundary_id = ?", boundaryId) as Row);
+    });
+  }
+
+  getPhaseBoundary(boundaryId: string): StoredPhaseBoundary | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM phase_boundaries WHERE boundary_id = ?").get(boundaryId) as Row | undefined;
+    return row === undefined ? undefined : parsePhaseBoundaryRow(row);
   }
 
   readModel(runId: RunId): ReadModel | undefined {
@@ -797,6 +1161,14 @@ export class StateStore {
     } catch (error) {
       return rollbackAndRethrow(this.db, error);
     }
+  }
+
+  private requiredSemanticReviewInTransaction(tx: SqlTransaction, reviewAttemptId: ReviewId): StoredSemanticReviewAttempt {
+    const row = tx.get("SELECT * FROM semantic_review_attempts WHERE review_attempt_id = ?", reviewAttemptId) as Row | undefined;
+    if (row === undefined) {
+      throw new NotFoundError("semantic review attempt", reviewAttemptId);
+    }
+    return parseSemanticReviewAttemptRow(row);
   }
 
   private assertOpen(): void {
@@ -1142,6 +1514,97 @@ function parseCancellationIntentRow(row: Row): StoredCancellationIntent {
     requestedAt: stringValue(row.requested_at, "cancellation_intents.requested_at"),
     updatedAt: stringValue(row.updated_at, "cancellation_intents.updated_at"),
     terminalAt: nullableString(row.terminal_at, "cancellation_intents.terminal_at"),
+  };
+}
+
+function parseSemanticReviewAttemptRow(row: Row): StoredSemanticReviewAttempt {
+  const lifecycle = stringValue(row.lifecycle, "semantic_review_attempts.lifecycle");
+  if (lifecycle !== "PREPARED" && lifecycle !== "RUNNING" && lifecycle !== "SUCCEEDED" && lifecycle !== "FAILED" && lifecycle !== "UNKNOWN") {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", `unknown semantic review lifecycle ${lifecycle}`);
+  }
+  const request = parseSemanticReviewRequest(JSON.parse(stringValue(row.request_json, "semantic_review_attempts.request_json")), "semantic_review_attempts.request_json");
+  const resultJson = nullableString(row.result_json, "semantic_review_attempts.result_json");
+  const result = resultJson === null ? null : parseSemanticReviewResult(JSON.parse(resultJson), "semantic_review_attempts.result_json");
+  if (
+    request.reviewAttemptId !== row.review_attempt_id
+    || request.runId !== row.run_id
+    || request.taskId !== row.task_id
+    || request.attemptId !== row.attempt_id
+    || requestHash(request) !== row.request_hash
+    || (result !== null && (result.reviewAttemptId !== request.reviewAttemptId || result.runId !== request.runId || result.taskId !== request.taskId || result.attemptId !== request.attemptId))
+  ) {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "semantic review columns and contract identity do not agree");
+  }
+  return {
+    reviewAttemptId: request.reviewAttemptId,
+    runId: request.runId,
+    taskId: request.taskId,
+    attemptId: request.attemptId,
+    lifecycle,
+    request,
+    requestHash: stringValue(row.request_hash, "semantic_review_attempts.request_hash"),
+    providerIdentityJson: nullableString(row.provider_identity_json, "semantic_review_attempts.provider_identity_json"),
+    result,
+    failureSummary: nullableString(row.failure_summary, "semantic_review_attempts.failure_summary"),
+    createdAt: stringValue(row.created_at, "semantic_review_attempts.created_at"),
+    startedAt: nullableString(row.started_at, "semantic_review_attempts.started_at"),
+    endedAt: nullableString(row.ended_at, "semantic_review_attempts.ended_at"),
+    updatedAt: stringValue(row.updated_at, "semantic_review_attempts.updated_at"),
+  };
+}
+
+function parseFailureOccurrenceRow(row: Row): StoredFailureOccurrence {
+  return {
+    runId: asRunId(stringValue(row.run_id, "failure_occurrences.run_id")),
+    taskId: asTaskId(stringValue(row.task_id, "failure_occurrences.task_id")),
+    attemptId: nullableString(row.attempt_id, "failure_occurrences.attempt_id") === null ? null : asAttemptId(nullableString(row.attempt_id, "failure_occurrences.attempt_id")!),
+    fingerprint: stringValue(row.fingerprint, "failure_occurrences.fingerprint"),
+    occurrence: numberValue(row.occurrence, "failure_occurrences.occurrence"),
+    failureClass: stringValue(row.failure_class, "failure_occurrences.failure_class"),
+    reasonCode: stringValue(row.reason_code, "failure_occurrences.reason_code"),
+    normalizedJson: stringValue(row.normalized_json, "failure_occurrences.normalized_json"),
+    routeJson: stringValue(row.route_json, "failure_occurrences.route_json"),
+    resultingAction: stringValue(row.resulting_action, "failure_occurrences.resulting_action"),
+    escalationReason: nullableString(row.escalation_reason, "failure_occurrences.escalation_reason"),
+    createdAt: stringValue(row.created_at, "failure_occurrences.created_at"),
+  };
+}
+
+function parseCanonicalSnapshotRow(row: Row): StoredCanonicalSnapshot {
+  const rawHashes = JSON.parse(stringValue(row.hashes_json, "canonical_snapshots.hashes_json")) as unknown;
+  if (typeof rawHashes !== "object" || rawHashes === null || Array.isArray(rawHashes) || Object.values(rawHashes).some((value) => typeof value !== "string")) {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "canonical snapshot hashes are invalid");
+  }
+  return {
+    runId: asRunId(stringValue(row.run_id, "canonical_snapshots.run_id")),
+    repositoryPath: stringValue(row.repository_path, "canonical_snapshots.repository_path"),
+    baseOid: stringValue(row.base_oid, "canonical_snapshots.base_oid"),
+    hashes: rawHashes as Record<string, string>,
+    capturedAt: stringValue(row.captured_at, "canonical_snapshots.captured_at"),
+  };
+}
+
+function parsePhaseBoundaryRow(row: Row): StoredPhaseBoundary {
+  const status = stringValue(row.status, "phase_boundaries.status");
+  if (status !== "PREPARED" && status !== "APPLIED") {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", `unknown phase boundary status ${status}`);
+  }
+  const parseHashes = (value: unknown, path: string): Record<string, string> => {
+    const parsed = JSON.parse(stringValue(value, path)) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed) || Object.values(parsed).some((entry) => typeof entry !== "string")) {
+      throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", `${path} is invalid`);
+    }
+    return parsed as Record<string, string>;
+  };
+  const observed = nullableString(row.observed_hashes_json, "phase_boundaries.observed_hashes_json");
+  return {
+    boundaryId: stringValue(row.boundary_id, "phase_boundaries.boundary_id"),
+    runId: asRunId(stringValue(row.run_id, "phase_boundaries.run_id")),
+    status,
+    expectedHashes: parseHashes(row.expected_hashes_json, "phase_boundaries.expected_hashes_json"),
+    observedHashes: observed === null ? null : parseHashes(observed, "phase_boundaries.observed_hashes_json"),
+    createdAt: stringValue(row.created_at, "phase_boundaries.created_at"),
+    updatedAt: stringValue(row.updated_at, "phase_boundaries.updated_at"),
   };
 }
 

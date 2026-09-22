@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import {
   AttemptHandle,
   AttemptId,
@@ -16,8 +18,10 @@ import {
   asAttemptId,
   asCommandId,
   asGateId,
+  asReviewId,
   asRunId,
   asTaskId,
+  asValidationId,
   parseAdapterDescriptor,
   parseExecutorResult,
   parseExecutionRequest,
@@ -29,6 +33,8 @@ import {
   parseReviewDecision,
   parseValidationBundle,
   parseCommand,
+  parseSemanticReviewResult,
+  canonicalJson,
 } from "./contracts.js";
 import type { ExecutorAdapter } from "./adapter.js";
 import type { ArtifactStore } from "./artifacts.js";
@@ -44,6 +50,9 @@ import {
 } from "./persistence.js";
 import { Clock, IdSource, RandomIdSource } from "./runtime.js";
 import { assertLegalTransition, assertResumeTarget, choosePauseContract, isLegalTransition } from "./state-machine.js";
+import { detectAntiGreenwashing } from "./anti-greenwashing.js";
+import { decideTrustedReview } from "./phase3.js";
+import { hashCanonicalDocuments } from "./canonical.js";
 import {
   ConfigLayers,
   DEFAULT_HARD_INVARIANTS,
@@ -519,7 +528,8 @@ export class KerbsFlowCore {
             { id: "rework", label: "Bounded rework", consequence: "Return to REWORK without changing scope.", target: "REWORK" },
             { id: "fail", label: "Fail the run", consequence: "Stop automatic continuation and preserve evidence.", target: "FAILED" },
           ],
-          ...(decision.failureClass === undefined ? {} : { recommendation: `Investigate ${decision.failureClass} before continuing.` }),
+          ...(decision.evidence === undefined ? {} : { evidence: decision.evidence }),
+          ...(decision.failureClass === undefined || (decision.evidenceRefs.length === 0 && (decision.evidence?.length ?? 0) === 0) ? {} : { recommendation: `Investigate ${decision.failureClass} before continuing.` }),
           status: "open",
         };
         this.insertGate(tx, gate, now);
@@ -536,6 +546,134 @@ export class KerbsFlowCore {
         },
         runPatch: { currentGateId: gate?.gateId ?? null, recoveryRequired: false, recoveryReason: null },
         details: { reviewId: decision.reviewId, outcome: decision.outcome, ...(gate === undefined ? {} : { gateId: gate.gateId }) },
+      } satisfies CommandMutation;
+    });
+  }
+
+  completeTrustedPhaseValidation(
+    runId: RunId,
+    expectedStateVersion: number,
+    idempotencyKey: string,
+    input: {
+      validation: unknown;
+      diff: string;
+      changedPaths: string[];
+      semanticReview?: unknown;
+    },
+  ): CommandResult {
+    const validation = parseValidationBundle(input.validation);
+    const semanticReview = input.semanticReview === undefined ? undefined : parseSemanticReviewResult(input.semanticReview);
+    const diffHash = createHash("sha256").update(input.diff).digest("hex");
+    if (semanticReview !== undefined) {
+      const persistedReview = this.store.getSemanticReviewAttempt(semanticReview.reviewAttemptId);
+      if (persistedReview?.lifecycle !== "SUCCEEDED" || persistedReview.result === null || canonicalJson(persistedReview.result) !== canonicalJson(semanticReview)) {
+        throw new KerbsFlowError("REVIEW_EVIDENCE_UNPERSISTED", "trusted phase closure requires the exact persisted terminal semantic review result");
+      }
+      const reviewedTask = this.store.getTask(persistedReview.taskId);
+      if (
+        persistedReview.request.diffHash !== diffHash
+        || !persistedReview.request.validationIds.includes(validation.validationId)
+        || reviewedTask?.decision.canonicalContextHash !== persistedReview.request.canonicalContextHash
+      ) {
+        throw new KerbsFlowError("REVIEW_EVIDENCE_STALE", "semantic review evidence does not match the canonical context, diff, and validation used for phase closure");
+      }
+    }
+    const antiGreenwashing = detectAntiGreenwashing(input.diff, input.changedPaths);
+    const canonicalSnapshot = this.store.getCanonicalSnapshot(runId);
+    let canonicalIntentCurrent = false;
+    if (canonicalSnapshot !== undefined) {
+      try {
+        const observedCanonicalHashes = hashCanonicalDocuments(canonicalSnapshot.repositoryPath);
+        canonicalIntentCurrent = canonicalJson(canonicalSnapshot.hashes) === canonicalJson(observedCanonicalHashes);
+      } catch {
+        canonicalIntentCurrent = false;
+      }
+    }
+    const trusted = decideTrustedReview({
+      requiredLevel: "phase",
+      validation,
+      antiGreenwashing,
+      ...(semanticReview === undefined ? {} : { semanticReview }),
+      canonicalIntentCurrent,
+      phaseCloseRequested: true,
+    });
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", {
+      validationId: validation.validationId,
+      diffHash,
+      ...(semanticReview === undefined ? {} : { semanticReviewId: semanticReview.reviewAttemptId }),
+    });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (run.state !== "VERIFY_PHASE" || run.currentTaskId === null || run.activeAttemptId === null) {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", "trusted phase validation requires VERIFY_PHASE with a current task and attempt");
+      }
+      if (validation.runId !== runId || validation.taskId !== run.currentTaskId || validation.attemptId !== run.activeAttemptId) {
+        throw new KerbsFlowError("VALIDATION_SCOPE_MISMATCH", "phase validation is stale or belongs to another run/task/attempt");
+      }
+      if (semanticReview !== undefined && (semanticReview.runId !== runId || semanticReview.taskId !== run.currentTaskId || semanticReview.attemptId !== run.activeAttemptId)) {
+        throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "semantic review is stale or belongs to another run/task/attempt");
+      }
+      tx.run(
+        "INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        validation.validationId,
+        runId,
+        validation.taskId,
+        validation.attemptId,
+        validation.level,
+        validation.outcome,
+        JSON.stringify(validation),
+        now,
+      );
+      const reviewId = asReviewId(nextId("review"));
+      const reviewDecision: ReviewDecision = {
+        schemaVersion: CONTRACT_VERSIONS.reviewDecision,
+        reviewId,
+        runId,
+        taskId: validation.taskId,
+        outcome: trusted.outcome,
+        ...(trusted.failureClass === undefined ? {} : { failureClass: trusted.failureClass }),
+        summary: trusted.reasonCode,
+        evidenceRefs: trusted.evidence.flatMap((evidence) => evidence.artifactRef === undefined ? [] : [evidence.artifactRef]),
+        evidence: trusted.evidence,
+        reasonCode: trusted.reasonCode,
+      };
+      tx.run("INSERT INTO reviews (review_id, run_id, task_id, outcome, decision_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", reviewId, runId, validation.taskId, trusted.outcome, JSON.stringify(reviewDecision), now);
+      let gate: HumanGate | undefined;
+      if (trusted.outcome === "human_gate") {
+        gate = {
+          schemaVersion: CONTRACT_VERSIONS.humanGate,
+          gateId: asGateId(nextId("gate")),
+          runId,
+          taskId: validation.taskId,
+          attemptId: validation.attemptId,
+          reasonCode: trusted.reasonCode,
+          summary: "trusted phase closure cannot continue automatically",
+          evidenceRefs: reviewDecision.evidenceRefs,
+          evidence: trusted.evidence,
+          options: [
+            { id: "rework", label: "Bounded rework", consequence: "Return to REWORK without changing approved scope.", target: "REWORK" },
+            { id: "fail", label: "Fail conservatively", consequence: "Stop automatic continuation and preserve all evidence.", target: "FAILED" },
+          ],
+          ...(trusted.evidence.length === 0 ? {} : { recommendation: "Resolve the cited evidence gap before continuing." }),
+          status: "open",
+        };
+        this.insertGate(tx, gate, now);
+      }
+      const target = trusted.outcome === "next_phase" ? "NEXT_PHASE" : trusted.outcome === "rework" ? "REWORK" : trusted.outcome === "human_gate" ? "HUMAN_GATE" : "VERIFY_PHASE";
+      if (target === "VERIFY_PHASE") {
+        throw new KerbsFlowError("PHASE_VALIDATION_INCOMPLETE", "trusted phase validation did not reach a closure decision");
+      }
+      return {
+        transition: {
+          to: target,
+          actor: "verifier",
+          reasonCode: trusted.reasonCode,
+          taskId: validation.taskId,
+          attemptId: validation.attemptId,
+          gateId: gate?.gateId ?? null,
+          payload: { validationId: validation.validationId, reviewId },
+        },
+        runPatch: { currentGateId: gate?.gateId ?? null, recoveryRequired: false, recoveryReason: null },
+        details: { validationId: validation.validationId, reviewId, outcome: trusted.outcome },
       } satisfies CommandMutation;
     });
   }
@@ -618,6 +756,17 @@ export class KerbsFlowCore {
         details: { gateId: storedGate.gateId, optionId, target: option.target },
       } satisfies CommandMutation;
     });
+  }
+
+  resolveGateScoped(runId: RunId, expectedStateVersion: number, idempotencyKey: string, gateId: ReturnType<typeof asGateId>, optionId: string, note?: string): CommandResult {
+    const model = this.requiredModel(runId);
+    const gate = this.store.getGate(gateId);
+    const currentMatches = model.run.currentGateId === gateId;
+    const replayCandidate = model.run.currentGateId === null && gate?.runId === runId && gate.status !== "open";
+    if (!currentMatches && !replayCandidate) {
+      throw new KerbsFlowError("GATE_SCOPE_MISMATCH", `gate scope mismatch: ${gateId} is not the current gate for run ${runId} at state version ${expectedStateVersion}`);
+    }
+    return this.resolveGate(runId, expectedStateVersion, idempotencyKey, optionId, note);
   }
 
   pause(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
@@ -1154,14 +1303,26 @@ export class KerbsFlowCore {
   }
 
   private insertGate(tx: SqlTransaction, gate: HumanGate, now: string): void {
+    const normalizedGate: HumanGate = gate.evidence !== undefined && gate.evidence.length > 0
+      ? gate
+      : {
+        ...gate,
+        evidence: [{
+          schemaVersion: CONTRACT_VERSIONS.validation,
+          id: asValidationId(`validation_gate_${gate.gateId}`),
+          kind: "other",
+          classification: "not_tested",
+          summary: gate.evidenceRefs.length > 0 ? "gate references artifacts whose evidence classification was not supplied" : "no classified supporting evidence was supplied for this gate",
+        }],
+      };
     tx.run(
       "INSERT INTO human_gates (gate_id, run_id, task_id, attempt_id, status, gate_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      gate.gateId,
-      gate.runId,
-      gate.taskId ?? null,
-      gate.attemptId ?? null,
-      gate.status,
-      JSON.stringify(gate),
+      normalizedGate.gateId,
+      normalizedGate.runId,
+      normalizedGate.taskId ?? null,
+      normalizedGate.attemptId ?? null,
+      normalizedGate.status,
+      JSON.stringify(normalizedGate),
       now,
     );
   }
@@ -1169,6 +1330,9 @@ export class KerbsFlowCore {
   private assertExecutorGate(gate: HumanGate, runId: RunId, taskId: TaskId, attemptId: AttemptId): HumanGate {
     if (gate.runId !== runId || gate.taskId !== taskId || gate.attemptId !== attemptId || gate.status !== "open") {
       throw new KerbsFlowError("GATE_SCOPE_MISMATCH", "executor human gate does not match the active run/task/attempt");
+    }
+    if (gate.recommendation !== undefined && gate.evidenceRefs.length === 0 && (gate.evidence?.length ?? 0) === 0) {
+      throw new KerbsFlowError("GATE_RECOMMENDATION_UNSUPPORTED", "executor gate recommendation requires classified supporting evidence");
     }
     const optionIds = new Set<string>();
     for (const option of gate.options) {
@@ -1180,7 +1344,16 @@ export class KerbsFlowCore {
         throw new KerbsFlowError("GATE_TARGET_ILLEGAL", `executor human gate option ${option.id} targets illegal transition HUMAN_GATE -> ${option.target}`);
       }
     }
-    return gate;
+    return {
+      ...gate,
+      ...(gate.evidence === undefined ? {} : {
+        evidence: gate.evidence.map((evidence) => ({
+          ...evidence,
+          classification: "not_tested" as const,
+          summary: `Executor claim (not independently validated): ${evidence.summary}`,
+        })),
+      }),
+    };
   }
 
   private validatePersistedExecutorResultForRecovery(

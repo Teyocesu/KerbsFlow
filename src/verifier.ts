@@ -3,6 +3,7 @@ import { CONTRACT_VERSIONS, asValidationId } from "./contracts.js";
 import { GitWorktreeManager, type RepositoryIntake, type RepositorySnapshot, type WorktreeInspection, type WorktreeRecord } from "./git.js";
 import { ProcessSupervisor, codexEnvironment, type ProcessResult } from "./process.js";
 import type { IdSource } from "./runtime.js";
+import { detectAntiGreenwashing, type AntiGreenwashingSignal } from "./anti-greenwashing.js";
 
 export interface FocusedCheckCommand {
   name: string;
@@ -16,7 +17,7 @@ export interface FocusedVerificationResult {
   preCheckInspection: WorktreeInspection;
   inspection: ReturnType<GitWorktreeManager["inspect"]>;
   checkResult: ProcessResult;
-  suspiciousSignals: string[];
+  suspiciousSignals: AntiGreenwashingSignal[];
   scopeViolations: string[];
   executorDisagreements: string[];
   verifierMutations: string[];
@@ -51,7 +52,7 @@ export class FocusedVerifier {
     const inspection = this.git.inspect(worktree);
     const originalUnchanged = originalMatchesIntake(originalAfter, intake);
     const scopeViolations = inspection.changedPaths.filter((path) => !isWithinPositiveScope(path, decision.action.positiveScope) || isWithinNegativeScope(path, decision.action.negativeScope));
-    const suspiciousSignals = antiGreenwashingSignals(inspection.diff, inspection.changedPaths);
+    const suspiciousSignals = detectAntiGreenwashing(inspection.diff, inspection.changedPaths);
     const executorDisagreements = compareExecutorClaims(executorResult, preCheckInspection.changedPaths, checkResult);
     const verifierMutations = compareVerificationSnapshots(originalBefore, originalAfter, preCheckInspection, inspection);
     const checkPassed = checkResult.exitKind === "normal" && checkResult.exitCode === 0;
@@ -65,7 +66,7 @@ export class FocusedVerifier {
     const evidence: ValidationEvidence[] = [
       this.evidence("diff", "inspected", `Git independently reported ${inspection.changedPaths.length} changed path(s) from base ${intake.baseOid}`),
       this.evidence("check", "automatically_tested", `${command.name} exited as ${checkResult.exitKind} code ${String(checkResult.exitCode)}`),
-      this.evidence("review", "inspected", suspiciousSignals.length === 0 ? "basic anti-greenwashing scan found no suspicious signal" : `anti-greenwashing signals: ${suspiciousSignals.join("; ")}`),
+      this.evidence("review", "inspected", suspiciousSignals.length === 0 ? "anti-greenwashing scan found no suspicious signal" : `anti-greenwashing signals: ${suspiciousSignals.map((signal) => signal.code).join("; ")}`),
       this.evidence("other", "inspected", originalUnchanged ? "original checkout remains clean at the recorded base" : "original checkout no longer matches the clean recorded base"),
       this.evidence("other", "inspected", verifierMutations.length === 0 ? "focused check did not mutate managed Git evidence" : `focused-check mutations: ${verifierMutations.join("; ")}`),
     ];
@@ -90,7 +91,7 @@ export class FocusedVerifier {
         : `independent verification failed: ${[
           ...(originalUnchanged ? [] : ["original checkout changed"]),
           ...scopeViolations.map((path) => `scope:${path}`),
-          ...suspiciousSignals,
+          ...suspiciousSignals.map((signal) => signal.code),
           ...executorDisagreements,
           ...verifierMutations,
           ...(checkPassed ? [] : [`${command.name} failed`]),
@@ -151,34 +152,6 @@ function compareExecutorClaims(result: ExecutorResult, actualPaths: string[], ch
     disagreements.push("executor claimed a passing check but the independent focused command failed");
   }
   return disagreements;
-}
-
-function antiGreenwashingSignals(diff: string, changedPaths: string[]): string[] {
-  const added = diff.split("\n").filter((line) => line.startsWith("+") && !line.startsWith("+++"));
-  const removed = diff.split("\n").filter((line) => line.startsWith("-") && !line.startsWith("---"));
-  const signals: string[] = [];
-  if (changedPaths.some((path) => /(^|\/)(test|tests|__tests__)\//u.test(path)) && diff.includes("deleted file mode")) {
-    signals.push("test file deleted");
-  }
-  if (added.some((line) => /\.(skip|only)\s*\(|\b(?:xit|xdescribe)\s*\(/u.test(line))) {
-    signals.push("test skip/focus marker introduced");
-  }
-  if (removed.some((line) => /\b(assert|expect)\s*\(/u.test(line))) {
-    signals.push("assertion removed; semantic review required");
-  }
-  if (added.some((line) => /@ts-ignore|eslint-disable|noqa|type:\s*ignore|coverage\s+ignore/iu.test(line))) {
-    signals.push("suppression introduced");
-  }
-  if (added.some((line) => /catch\s*(?:\([^)]*\))?\s*\{\s*\}/u.test(line))) {
-    signals.push("empty catch introduced");
-  }
-  if (added.some((line) => /catch[^\n]*\{[^\n]*(?:return\s+(?:undefined|null|false|\[\]|\{\})|continue;)/u.test(line))) {
-    signals.push("possible silent fallback introduced");
-  }
-  if (removed.some((line) => /"(?:test|typecheck|lint)"\s*:/u.test(line)) || added.some((line) => /"noEmit"\s*:\s*false/u.test(line))) {
-    signals.push("validation configuration weakened or removed");
-  }
-  return signals;
 }
 
 function isWithinPositiveScope(path: string, scopes: string[]): boolean {

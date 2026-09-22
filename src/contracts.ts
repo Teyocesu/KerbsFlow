@@ -13,6 +13,9 @@ export const CONTRACT_VERSIONS = {
   validation: "kerbsflow.validation/v1",
   humanGate: "kerbsflow.human-gate/v1",
   reviewDecision: "kerbsflow.review-decision/v1",
+  semanticReviewRequest: "kerbsflow.semantic-review-request/v1",
+  semanticReviewResult: "kerbsflow.semantic-review-result/v1",
+  semanticReviewHandle: "kerbsflow.semantic-review-handle/v1",
   recoveryDecision: "kerbsflow.recovery-decision/v1",
   config: "kerbsflow.config/v1",
 } as const;
@@ -358,6 +361,7 @@ export interface HumanGate {
   reasonCode: string;
   summary: string;
   evidenceRefs: ArtifactId[];
+  evidence?: ValidationEvidence[];
   options: HumanGateOption[];
   recommendation?: string;
   status: "open" | "resolved" | "rejected";
@@ -522,7 +526,66 @@ export interface ReviewDecision {
   failureClass?: FailureClassification;
   summary: string;
   evidenceRefs: ArtifactId[];
+  evidence?: ValidationEvidence[];
   reasonCode: string;
+}
+
+export type SemanticReviewOutcome = "supports_continuation" | "rework_required" | "escalation_required" | "human_gate_required" | "evidence_insufficient";
+
+export interface SemanticReviewRequest {
+  schemaVersion: typeof CONTRACT_VERSIONS.semanticReviewRequest;
+  reviewAttemptId: ReviewId;
+  runId: RunId;
+  taskId: TaskId;
+  attemptId: AttemptId;
+  role: "review";
+  workingDirectory: string;
+  promptSummary: string;
+  model: string;
+  reasoning?: string;
+  permissionPolicy: {
+    filesystem: "read_only";
+    network: "denied";
+  };
+  canonicalContextHash: string;
+  diffHash: string;
+  validationIds: ValidationId[];
+  expectedResultSchema: typeof CONTRACT_VERSIONS.semanticReviewResult;
+}
+
+export interface SemanticReviewResult {
+  schemaVersion: typeof CONTRACT_VERSIONS.semanticReviewResult;
+  reviewAttemptId: ReviewId;
+  runId: RunId;
+  taskId: TaskId;
+  attemptId: AttemptId;
+  reviewer: {
+    adapter: string;
+    adapterVersion: string;
+    provider: string;
+    model: string;
+    reasoning?: string;
+  };
+  outcome: SemanticReviewOutcome;
+  summary: string;
+  findings: Array<{
+    code: string;
+    severity: "info" | "warning" | "blocking";
+    summary: string;
+    path?: string;
+  }>;
+  evidence: ValidationEvidence[];
+  scopeConcerns: string[];
+  invariantViolations: string[];
+}
+
+export interface SemanticReviewHandle {
+  schemaVersion: typeof CONTRACT_VERSIONS.semanticReviewHandle;
+  reviewAttemptId: ReviewId;
+  runId: RunId;
+  taskId: TaskId;
+  attemptId: AttemptId;
+  providerSessionId?: string;
 }
 
 export interface RecoveryDecision {
@@ -980,7 +1043,7 @@ export function parseValidationBundle(value: unknown, path = "validation"): Vali
 export function parseHumanGate(value: unknown, path = "humanGate"): HumanGate {
   const object = record(value, path);
   assertVersion(object, CONTRACT_VERSIONS.humanGate, path);
-  assertKeys(object, ["schemaVersion", "gateId", "runId", "taskId", "attemptId", "reasonCode", "summary", "evidenceRefs", "options", "recommendation", "status", "resolution"], path);
+  assertKeys(object, ["schemaVersion", "gateId", "runId", "taskId", "attemptId", "reasonCode", "summary", "evidenceRefs", "evidence", "options", "recommendation", "status", "resolution"], path);
   const status = object.status;
   if (status !== "open" && status !== "resolved" && status !== "rejected") {
     throw new ContractValidationError(`${path}.status`, "unknown human gate status");
@@ -1007,6 +1070,7 @@ export function parseHumanGate(value: unknown, path = "humanGate"): HumanGate {
     reasonCode: boundedString(object.reasonCode, `${path}.reasonCode`, 120),
     summary: boundedString(object.summary, `${path}.summary`, 4000),
     evidenceRefs: parseIdArray(object.evidenceRefs, `${path}.evidenceRefs`, asArtifactId),
+    ...(object.evidence === undefined ? {} : { evidence: parseEvidenceArray(object.evidence, `${path}.evidence`) }),
     options,
     ...(object.recommendation === undefined ? {} : { recommendation: boundedString(object.recommendation, `${path}.recommendation`, 1000) }),
     status,
@@ -1024,7 +1088,7 @@ export function parseHumanGate(value: unknown, path = "humanGate"): HumanGate {
 export function parseReviewDecision(value: unknown, path = "reviewDecision"): ReviewDecision {
   const object = record(value, path);
   assertVersion(object, CONTRACT_VERSIONS.reviewDecision, path);
-  assertKeys(object, ["schemaVersion", "reviewId", "runId", "taskId", "outcome", "failureClass", "summary", "evidenceRefs", "reasonCode"], path);
+  assertKeys(object, ["schemaVersion", "reviewId", "runId", "taskId", "outcome", "failureClass", "summary", "evidenceRefs", "evidence", "reasonCode"], path);
   const outcome = object.outcome;
   if (outcome !== "rework" && outcome !== "verify_phase" && outcome !== "next_phase" && outcome !== "final_verify" && outcome !== "human_gate" && outcome !== "failed") {
     throw new ContractValidationError(`${path}.outcome`, "unknown review outcome");
@@ -1038,7 +1102,102 @@ export function parseReviewDecision(value: unknown, path = "reviewDecision"): Re
     ...(object.failureClass === undefined ? {} : { failureClass: parseFailureClass(object.failureClass, `${path}.failureClass`) }),
     summary: boundedString(object.summary, `${path}.summary`, 4000),
     evidenceRefs: parseIdArray(object.evidenceRefs, `${path}.evidenceRefs`, asArtifactId),
+    ...(object.evidence === undefined ? {} : { evidence: parseEvidenceArray(object.evidence, `${path}.evidence`) }),
     reasonCode: boundedString(object.reasonCode, `${path}.reasonCode`, 120),
+  };
+}
+
+export function parseSemanticReviewRequest(value: unknown, path = "semanticReviewRequest"): SemanticReviewRequest {
+  const object = record(value, path);
+  assertVersion(object, CONTRACT_VERSIONS.semanticReviewRequest, path);
+  assertKeys(object, ["schemaVersion", "reviewAttemptId", "runId", "taskId", "attemptId", "role", "workingDirectory", "promptSummary", "model", "reasoning", "permissionPolicy", "canonicalContextHash", "diffHash", "validationIds", "expectedResultSchema"], path);
+  const permissionPolicy = record(object.permissionPolicy, `${path}.permissionPolicy`);
+  assertKeys(permissionPolicy, ["filesystem", "network"], `${path}.permissionPolicy`);
+  if (object.role !== "review" || permissionPolicy.filesystem !== "read_only" || permissionPolicy.network !== "denied") {
+    throw new ContractValidationError(path, "semantic review requires the review role with read-only filesystem and denied workload network");
+  }
+  if (object.expectedResultSchema !== CONTRACT_VERSIONS.semanticReviewResult) {
+    throw new ContractValidationError(`${path}.expectedResultSchema`, `expected ${CONTRACT_VERSIONS.semanticReviewResult}`);
+  }
+  return {
+    schemaVersion: CONTRACT_VERSIONS.semanticReviewRequest,
+    reviewAttemptId: asReviewId(requiredString(object, "reviewAttemptId", path)),
+    runId: asRunId(requiredString(object, "runId", path)),
+    taskId: asTaskId(requiredString(object, "taskId", path)),
+    attemptId: asAttemptId(requiredString(object, "attemptId", path)),
+    role: "review",
+    workingDirectory: boundedString(object.workingDirectory, `${path}.workingDirectory`, 2000),
+    promptSummary: boundedString(object.promptSummary, `${path}.promptSummary`, 20_000),
+    model: boundedString(object.model, `${path}.model`, 200),
+    ...(object.reasoning === undefined ? {} : { reasoning: boundedString(object.reasoning, `${path}.reasoning`, 100) }),
+    permissionPolicy: { filesystem: "read_only", network: "denied" },
+    canonicalContextHash: boundedString(object.canonicalContextHash, `${path}.canonicalContextHash`, 200),
+    diffHash: boundedString(object.diffHash, `${path}.diffHash`, 200),
+    validationIds: parseIdArray(object.validationIds, `${path}.validationIds`, asValidationId),
+    expectedResultSchema: CONTRACT_VERSIONS.semanticReviewResult,
+  };
+}
+
+export function parseSemanticReviewResult(value: unknown, path = "semanticReviewResult"): SemanticReviewResult {
+  const object = record(value, path);
+  assertVersion(object, CONTRACT_VERSIONS.semanticReviewResult, path);
+  assertKeys(object, ["schemaVersion", "reviewAttemptId", "runId", "taskId", "attemptId", "reviewer", "outcome", "summary", "findings", "evidence", "scopeConcerns", "invariantViolations"], path);
+  const reviewer = record(object.reviewer, `${path}.reviewer`);
+  assertKeys(reviewer, ["adapter", "adapterVersion", "provider", "model", "reasoning"], `${path}.reviewer`);
+  const outcome = object.outcome;
+  if (outcome !== "supports_continuation" && outcome !== "rework_required" && outcome !== "escalation_required" && outcome !== "human_gate_required" && outcome !== "evidence_insufficient") {
+    throw new ContractValidationError(`${path}.outcome`, "unknown semantic review outcome");
+  }
+  const findings = array(object.findings, `${path}.findings`).map((entry, index) => {
+    const finding = record(entry, `${path}.findings[${index}]`);
+    assertKeys(finding, ["code", "severity", "summary", "path"], `${path}.findings[${index}]`);
+    if (finding.severity !== "info" && finding.severity !== "warning" && finding.severity !== "blocking") {
+      throw new ContractValidationError(`${path}.findings[${index}].severity`, "unknown finding severity");
+    }
+    return {
+      code: boundedString(finding.code, `${path}.findings[${index}].code`, 120),
+      severity: finding.severity as SemanticReviewResult["findings"][number]["severity"],
+      summary: boundedString(finding.summary, `${path}.findings[${index}].summary`, 2000),
+      ...(finding.path === undefined ? {} : { path: boundedString(finding.path, `${path}.findings[${index}].path`, 1000) }),
+    };
+  });
+  const result: SemanticReviewResult = {
+    schemaVersion: CONTRACT_VERSIONS.semanticReviewResult,
+    reviewAttemptId: asReviewId(requiredString(object, "reviewAttemptId", path)),
+    runId: asRunId(requiredString(object, "runId", path)),
+    taskId: asTaskId(requiredString(object, "taskId", path)),
+    attemptId: asAttemptId(requiredString(object, "attemptId", path)),
+    reviewer: {
+      adapter: boundedString(reviewer.adapter, `${path}.reviewer.adapter`, 100),
+      adapterVersion: boundedString(reviewer.adapterVersion, `${path}.reviewer.adapterVersion`, 100),
+      provider: boundedString(reviewer.provider, `${path}.reviewer.provider`, 100),
+      model: boundedString(reviewer.model, `${path}.reviewer.model`, 200),
+      ...(reviewer.reasoning === undefined ? {} : { reasoning: boundedString(reviewer.reasoning, `${path}.reviewer.reasoning`, 100) }),
+    },
+    outcome,
+    summary: boundedString(object.summary, `${path}.summary`, 4000),
+    findings,
+    evidence: parseEvidenceArray(object.evidence, `${path}.evidence`),
+    scopeConcerns: boundedStringArray(object.scopeConcerns, `${path}.scopeConcerns`, 50, 1000),
+    invariantViolations: boundedStringArray(object.invariantViolations, `${path}.invariantViolations`, 50, 1000),
+  };
+  if (result.outcome === "supports_continuation" && (result.findings.some((finding) => finding.severity === "blocking") || result.scopeConcerns.length > 0 || result.invariantViolations.length > 0)) {
+    throw new ContractValidationError(path, "a reviewer cannot support continuation while reporting blocking, scope, or invariant concerns");
+  }
+  return result;
+}
+
+export function parseSemanticReviewHandle(value: unknown, path = "semanticReviewHandle"): SemanticReviewHandle {
+  const object = record(value, path);
+  assertVersion(object, CONTRACT_VERSIONS.semanticReviewHandle, path);
+  assertKeys(object, ["schemaVersion", "reviewAttemptId", "runId", "taskId", "attemptId", "providerSessionId"], path);
+  return {
+    schemaVersion: CONTRACT_VERSIONS.semanticReviewHandle,
+    reviewAttemptId: asReviewId(requiredString(object, "reviewAttemptId", path)),
+    runId: asRunId(requiredString(object, "runId", path)),
+    taskId: asTaskId(requiredString(object, "taskId", path)),
+    attemptId: asAttemptId(requiredString(object, "attemptId", path)),
+    ...(object.providerSessionId === undefined ? {} : { providerSessionId: boundedString(object.providerSessionId, `${path}.providerSessionId`, 300) }),
   };
 }
 

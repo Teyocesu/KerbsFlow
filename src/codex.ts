@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { constants, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-import type { ExecutorAdapter } from "./adapter.js";
+import type { ExecutorAdapter, SemanticReviewAdapter } from "./adapter.js";
 import {
   CONTRACT_VERSIONS,
   type AdapterDescriptor,
@@ -15,9 +15,14 @@ import {
   type ExecutorResult,
   type NormalizedEvent,
   type ReconcileOutcome,
+  type SemanticReviewHandle,
+  type SemanticReviewRequest,
+  type SemanticReviewResult,
   asValidationId,
   parseExecutorResult,
   parseExecutionRequest,
+  parseSemanticReviewRequest,
+  parseSemanticReviewResult,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
 import {
@@ -45,7 +50,17 @@ interface CodexSession {
   processResult?: ProcessResult;
 }
 
+interface CodexReviewSession {
+  request: SemanticReviewRequest;
+  handle: SemanticReviewHandle;
+  process: SupervisedProcess;
+  directory: string;
+  resultPath: string;
+  processResult?: ProcessResult;
+}
+
 export const CODEX_PERMISSION_PROFILE = "kerbsflow-worktree";
+export const CODEX_REVIEW_PERMISSION_PROFILE = "kerbsflow-review";
 
 const CODEX_PERMISSION_OVERRIDES = [
   `default_permissions="${CODEX_PERMISSION_PROFILE}"`,
@@ -69,22 +84,183 @@ const CODEX_PERMISSION_OVERRIDES = [
   "features.skill_search=false",
 ] as const;
 
+const CODEX_REVIEW_PERMISSION_OVERRIDES = [
+  `default_permissions="${CODEX_REVIEW_PERMISSION_PROFILE}"`,
+  `permissions.${CODEX_REVIEW_PERMISSION_PROFILE}.filesystem={":root"="deny",":minimal"="read","/System/Library/OpenSSL"="read",":tmpdir"="deny",":slash_tmp"="deny","/tmp"="deny","/private/tmp"="deny",":workspace_roots"={"."="read",".git"="read",".codex"="read",".env"="deny",".env.*"="deny","**/.env"="deny","**/.env.*"="deny"}}`,
+  `permissions.${CODEX_REVIEW_PERMISSION_PROFILE}.network.enabled=false`,
+  "web_search=\"disabled\"",
+  "approval_policy=\"never\"",
+  "allow_login_shell=false",
+  "mcp_servers={}",
+  "features.apps=false",
+  "features.browser_use=false",
+  "features.browser_use_external=false",
+  "features.browser_use_full_cdp_access=false",
+  "features.computer_use=false",
+  "features.hooks=false",
+  "features.image_generation=false",
+  "features.in_app_browser=false",
+  "features.multi_agent=false",
+  "features.plugins=false",
+  "features.remote_plugin=false",
+  "features.skill_search=false",
+] as const;
+
 export function codexPermissionArguments(): string[] {
   return CODEX_PERMISSION_OVERRIDES.flatMap((value) => ["--config", value]);
 }
 
-export class CodexAdapter implements ExecutorAdapter {
+export function codexReviewPermissionArguments(): string[] {
+  return CODEX_REVIEW_PERMISSION_OVERRIDES.flatMap((value) => ["--config", value]);
+}
+
+export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   private readonly supervisor: ProcessSupervisor;
   private readonly environment: NodeJS.ProcessEnv;
   private readonly attemptsRoot: string;
+  private readonly reviewsRoot: string;
   private readonly sessions = new Map<string, CodexSession>();
+  private readonly reviewSessions = new Map<string, CodexReviewSession>();
   private descriptor: AdapterDescriptor | undefined;
+  private reviewDescriptor: AdapterDescriptor | undefined;
 
   constructor(private readonly options: CodexAdapterOptions) {
     this.supervisor = options.supervisor ?? new ProcessSupervisor();
     this.environment = codexEnvironment(options.environment ?? process.env);
     this.attemptsRoot = resolve(options.runtimeRoot, "codex-attempts");
+    this.reviewsRoot = resolve(options.runtimeRoot, "codex-reviews");
     mkdirSync(this.attemptsRoot, { recursive: true, mode: 0o700 });
+    mkdirSync(this.reviewsRoot, { recursive: true, mode: 0o700 });
+  }
+
+  probeReview(): AdapterDescriptor {
+    if (this.reviewDescriptor !== undefined) {
+      return this.reviewDescriptor;
+    }
+    const descriptor = this.descriptor ?? this.probe();
+    this.probeReviewerIsolationBoundary();
+    this.reviewDescriptor = descriptor;
+    return this.reviewDescriptor;
+  }
+
+  startReview(request: SemanticReviewRequest): SemanticReviewHandle {
+    request = parseSemanticReviewRequest(request);
+    const descriptor = this.reviewDescriptor ?? this.probeReview();
+    if (this.reviewSessions.has(request.reviewAttemptId)) {
+      throw new KerbsFlowError("DUPLICATE_REVIEW", `review attempt ${request.reviewAttemptId} is already active in this adapter`);
+    }
+    const directory = join(this.reviewsRoot, String(request.reviewAttemptId));
+    mkdirSync(directory, { recursive: false, mode: 0o700 });
+    const schemaPath = join(directory, "semantic-review-result.schema.json");
+    const resultPath = join(directory, "semantic-review-result.json");
+    writeFileSync(schemaPath, `${JSON.stringify(SEMANTIC_REVIEW_RESULT_JSON_SCHEMA)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    const args = [
+      "exec",
+      "--json",
+      "--output-schema", schemaPath,
+      "--output-last-message", resultPath,
+      "--cd", request.workingDirectory,
+      "--model", request.model,
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--strict-config",
+      "--ephemeral",
+      ...codexReviewPermissionArguments(),
+      ...(request.reasoning === undefined ? [] : ["--config", `model_reasoning_effort="${safeConfigToken(request.reasoning)}"`]),
+      request.promptSummary,
+    ];
+    const process = this.supervisor.start({
+      executable: this.options.cliPath,
+      args,
+      cwd: request.workingDirectory,
+      environment: this.environment,
+      timeoutMs: 120_000,
+      gracePeriodMs: 2000,
+    });
+    const handle: SemanticReviewHandle = {
+      schemaVersion: CONTRACT_VERSIONS.semanticReviewHandle,
+      reviewAttemptId: request.reviewAttemptId,
+      runId: request.runId,
+      taskId: request.taskId,
+      attemptId: request.attemptId,
+      providerSessionId: `process:${process.identity.supervisorId}:${process.identity.pid}`,
+    };
+    writeFileSync(join(directory, "process.json"), `${JSON.stringify({
+      schemaVersion: "kerbsflow.codex-review-process/v1",
+      reviewAttemptId: request.reviewAttemptId,
+      runId: request.runId,
+      taskId: request.taskId,
+      attemptId: request.attemptId,
+      process: process.identity,
+      resultPath,
+      adapterVersion: descriptor.adapterVersion,
+    })}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    this.reviewSessions.set(request.reviewAttemptId, { request, handle, process, directory, resultPath });
+    return handle;
+  }
+
+  async *reviewEvents(handle: SemanticReviewHandle): AsyncIterable<NormalizedEvent> {
+    const session = this.requiredReviewSession(handle.reviewAttemptId);
+    let sequence = 0;
+    for await (const event of session.process.events()) {
+      sequence = event.sequence;
+      const value = typeof event.value === "object" && event.value !== null ? event.value as Record<string, unknown> : undefined;
+      if (value?.type === "thread.started" && typeof value.thread_id === "string" && value.thread_id.length > 0) {
+        session.handle.providerSessionId = `${session.handle.providerSessionId ?? "process:unknown"}:thread:${value.thread_id}`;
+      }
+      yield normalizeReviewEvent(session.request, event);
+    }
+    const result = await this.awaitReviewProcess(session);
+    if (result.eventsTruncated) {
+      yield normalizedReview(session.request, sequence + 1, "warning", "Codex reviewer JSONL capture was truncated");
+    }
+  }
+
+  async waitReview(handle: SemanticReviewHandle): Promise<unknown> {
+    const session = this.requiredReviewSession(handle.reviewAttemptId);
+    const processResult = await this.awaitReviewProcess(session);
+    if (processResult.events.some((event) => event.malformed) || processResult.exitKind !== "normal" || processResult.exitCode !== 0 || !existsSync(session.resultPath)) {
+      return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: "reviewer did not produce a trustworthy terminal result" };
+    }
+    try {
+      const bytes = readFileSync(session.resultPath);
+      if (bytes.byteLength > 1024 * 1024) {
+        throw new Error("review result exceeded the 1 MiB bound");
+      }
+      const raw: unknown = JSON.parse(bytes.toString("utf8"));
+      if (containsLikelySecret(raw)) {
+        writeFileSync(session.resultPath, `${JSON.stringify({ redacted: true, reason: "likely credential material rejected" })}\n`, { encoding: "utf8", mode: 0o600 });
+        throw new Error("review result contained likely credential material");
+      }
+      const result = parseSemanticReviewResult(raw);
+      assertReviewResultScope(result, session.request);
+      if (result.evidence.some((evidence) => evidence.classification !== "inspected")) {
+        throw new Error("reviewer attempted to inflate semantic opinion above inspected evidence");
+      }
+      return {
+        ...result,
+        reviewer: {
+          adapter: "codex",
+          adapterVersion: this.descriptor?.adapterVersion ?? "unknown",
+          provider: "openai",
+          model: session.request.model,
+          ...(session.request.reasoning === undefined ? {} : { reasoning: session.request.reasoning }),
+        },
+      } satisfies SemanticReviewResult;
+    } catch (error) {
+      return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: error instanceof Error ? error.message : "review result invalid" };
+    }
+  }
+
+  cancelReview(handle: SemanticReviewHandle, reason: string): CancelOutcome {
+    const session = this.reviewSessions.get(handle.reviewAttemptId);
+    if (session === undefined) {
+      return { outcome: "unknown", summary: `no live reviewer exists for ${handle.reviewAttemptId}: ${reason}` };
+    }
+    const outcome = session.process.cancel();
+    return outcome.outcome === "already_terminal"
+      ? { outcome: "already_terminal", summary: outcome.summary }
+      : { outcome: "unknown", summary: `${outcome.summary}; reviewer termination requires reconciliation` };
   }
 
   probe(): AdapterDescriptor {
@@ -372,10 +548,27 @@ export class CodexAdapter implements ExecutorAdapter {
     return session.processResult;
   }
 
+  private async awaitReviewProcess(session: CodexReviewSession): Promise<ProcessResult> {
+    const completed = await session.process.completion;
+    if (session.processResult === undefined) {
+      session.processResult = completed;
+      writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    }
+    return session.processResult;
+  }
+
   private requiredSession(attemptId: AttemptId): CodexSession {
     const session = this.sessions.get(attemptId);
     if (session === undefined) {
       throw new KerbsFlowError("ATTEMPT_HANDLE_MISSING", `no live Codex session exists for ${attemptId}`);
+    }
+    return session;
+  }
+
+  private requiredReviewSession(reviewAttemptId: SemanticReviewHandle["reviewAttemptId"]): CodexReviewSession {
+    const session = this.reviewSessions.get(reviewAttemptId);
+    if (session === undefined) {
+      throw new KerbsFlowError("REVIEW_HANDLE_MISSING", `no live Codex review session exists for ${reviewAttemptId}`);
     }
     return session;
   }
@@ -406,14 +599,14 @@ export class CodexAdapter implements ExecutorAdapter {
     try {
       writeFileSync(outsideSentinel, "synthetic outside sentinel\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
       writeFileSync(envSentinel, "SYNTHETIC_ONLY=1\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
-      this.runSandboxProbe(probeRoot, [process.execPath, "-e", "process.exit(0)"], true, "workspace command execution");
-      this.runSandboxProbe(probeRoot, [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1])", outsideSentinel, "KERBSFLOW_DENY_PROBE"], false, "outside-worktree read denial");
-      this.runSandboxProbe(probeRoot, [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1])", envSentinel, "KERBSFLOW_DENY_PROBE"], false, ".env read denial");
-      this.runSandboxProbe(probeRoot, [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", slashTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "/tmp write denial");
+      this.runSandboxProbe(probeRoot, CODEX_PERMISSION_PROFILE, codexPermissionArguments(), [process.execPath, "-e", "process.exit(0)"], true, "workspace command execution");
+      this.runSandboxProbe(probeRoot, CODEX_PERMISSION_PROFILE, codexPermissionArguments(), [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1])", outsideSentinel, "KERBSFLOW_DENY_PROBE"], false, "outside-worktree read denial");
+      this.runSandboxProbe(probeRoot, CODEX_PERMISSION_PROFILE, codexPermissionArguments(), [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1])", envSentinel, "KERBSFLOW_DENY_PROBE"], false, ".env read denial");
+      this.runSandboxProbe(probeRoot, CODEX_PERMISSION_PROFILE, codexPermissionArguments(), [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", slashTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "/tmp write denial");
       if (inheritedTmpTarget !== slashTmpTarget) {
-        this.runSandboxProbe(probeRoot, [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", inheritedTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "$TMPDIR write denial");
+        this.runSandboxProbe(probeRoot, CODEX_PERMISSION_PROFILE, codexPermissionArguments(), [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", inheritedTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "$TMPDIR write denial");
       }
-      this.runSandboxProbe(probeRoot, [process.execPath, "-e", "const s=require('node:net').createServer();s.once('error',()=>process.exit(1));s.listen(0,'127.0.0.1',()=>s.close(()=>process.exit(0)))", "KERBSFLOW_DENY_PROBE"], false, "local-command network denial");
+      this.runSandboxProbe(probeRoot, CODEX_PERMISSION_PROFILE, codexPermissionArguments(), [process.execPath, "-e", "const s=require('node:net').createServer();s.once('error',()=>process.exit(1));s.listen(0,'127.0.0.1',()=>s.close(()=>process.exit(0)))", "KERBSFLOW_DENY_PROBE"], false, "local-command network denial");
       if (existsSync(slashTmpTarget) || existsSync(inheritedTmpTarget)) {
         throw new KerbsFlowError("CODEX_ISOLATION_UNPROVEN", "Codex permission probe created a file in a denied temporary directory");
       }
@@ -427,12 +620,52 @@ export class CodexAdapter implements ExecutorAdapter {
     }
   }
 
-  private runSandboxProbe(cwd: string, command: string[], shouldSucceed: boolean, label: string): void {
+  private probeReviewerIsolationBoundary(): void {
+    const probeRoot = mkdtempSync(join(this.reviewsRoot, "permission-probe-"));
+    const nonce = randomUUID();
+    const readable = join(probeRoot, "review-input.txt");
+    const envSentinel = join(probeRoot, ".env");
+    const outsideSentinel = join(this.reviewsRoot, `review-outside-${nonce}.txt`);
+    const deniedWrite = join(probeRoot, "reviewer-write.txt");
+    const slashTmpTarget = join("/tmp", `kerbsflow-review-${nonce}.txt`);
+    const privateTmpTarget = join("/private/tmp", `kerbsflow-review-${nonce}.txt`);
+    const inheritedTmpTarget = join(tmpdir(), `kerbsflow-review-${nonce}.txt`);
+    const writeToken = `kerbsflow reviewer probe ${nonce}\n`;
+    try {
+      writeFileSync(readable, "synthetic review input\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+      writeFileSync(envSentinel, "SYNTHETIC_ONLY=1\n", { encoding: "utf8", mode: 0o600, flag: "wx" });
+      writeFileSync(outsideSentinel, writeToken, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      const args = codexReviewPermissionArguments();
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1]);", readable], true, "reviewer worktree read");
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1]);", outsideSentinel, "KERBSFLOW_DENY_PROBE"], false, "reviewer outside-worktree read denial");
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", deniedWrite, writeToken, "KERBSFLOW_DENY_PROBE"], false, "reviewer worktree write denial");
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').readFileSync(process.argv[1])", envSentinel, "KERBSFLOW_DENY_PROBE"], false, "reviewer .env read denial");
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", slashTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "reviewer /tmp write denial");
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", privateTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "reviewer /private/tmp write denial");
+      if (inheritedTmpTarget !== slashTmpTarget) {
+        this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "require('node:fs').writeFileSync(process.argv[1], process.argv[2], {flag:'wx'})", inheritedTmpTarget, writeToken, "KERBSFLOW_DENY_PROBE"], false, "reviewer $TMPDIR write denial");
+      }
+      this.runSandboxProbe(probeRoot, CODEX_REVIEW_PERMISSION_PROFILE, args, [process.execPath, "-e", "const s=require('node:net').createServer();s.once('error',()=>process.exit(1));s.listen(0,'127.0.0.1',()=>s.close(()=>process.exit(0)))", "KERBSFLOW_DENY_PROBE"], false, "reviewer local network denial");
+      if (existsSync(deniedWrite) || existsSync(slashTmpTarget) || existsSync(privateTmpTarget) || existsSync(inheritedTmpTarget)) {
+        throw new KerbsFlowError("CODEX_ISOLATION_UNPROVEN", "Codex reviewer probe created a file through its read-only profile");
+      }
+    } finally {
+      rmSync(probeRoot, { recursive: true, force: true });
+      removeSyntheticProbeFile(outsideSentinel, writeToken);
+      removeSyntheticProbeFile(slashTmpTarget, writeToken);
+      removeSyntheticProbeFile(privateTmpTarget, writeToken);
+      if (inheritedTmpTarget !== slashTmpTarget) {
+        removeSyntheticProbeFile(inheritedTmpTarget, writeToken);
+      }
+    }
+  }
+
+  private runSandboxProbe(cwd: string, profile: string, permissionArguments: string[], command: string[], shouldSucceed: boolean, label: string): void {
     const result = spawnSync(this.options.cliPath, [
       "sandbox",
       "--cd", cwd,
-      "--permission-profile", CODEX_PERMISSION_PROFILE,
-      ...codexPermissionArguments(),
+      "--permission-profile", profile,
+      ...permissionArguments,
       ...command,
     ], {
       encoding: "utf8",
@@ -760,9 +993,40 @@ function normalized(request: ExecutionRequest, sequence: number, kind: Normalize
   };
 }
 
+function normalizeReviewEvent(request: SemanticReviewRequest, event: RawProcessEvent): NormalizedEvent {
+  if (event.malformed || typeof event.value !== "object" || event.value === null) {
+    return normalizedReview(request, event.sequence, "warning", "Codex reviewer emitted malformed JSONL");
+  }
+  const type = typeof (event.value as Record<string, unknown>).type === "string" ? String((event.value as Record<string, unknown>).type) : "unknown";
+  const kind: NormalizedEvent["kind"] = type === "thread.started" ? "started"
+    : type === "turn.completed" ? "completed"
+      : type === "turn.failed" || type === "error" ? "failed"
+        : type.startsWith("item.") ? "tool"
+          : "progress";
+  return normalizedReview(request, event.sequence, kind, `Codex reviewer event: ${type}`);
+}
+
+function normalizedReview(request: SemanticReviewRequest, sequence: number, kind: NormalizedEvent["kind"], summary: string): NormalizedEvent {
+  return {
+    schemaVersion: CONTRACT_VERSIONS.normalizedEvent,
+    runId: request.runId,
+    attemptId: request.attemptId,
+    sequence,
+    providerTimestamp: new Date().toISOString(),
+    kind,
+    summary,
+  };
+}
+
 function assertResultScope(result: ExecutorResult, request: ExecutionRequest): void {
   if (result.runId !== request.runId || result.taskId !== request.taskId || result.attemptId !== request.attemptId) {
     throw new KerbsFlowError("RESULT_SCOPE_MISMATCH", "Codex result IDs do not match the supervised request");
+  }
+}
+
+function assertReviewResultScope(result: SemanticReviewResult, request: SemanticReviewRequest): void {
+  if (result.reviewAttemptId !== request.reviewAttemptId || result.runId !== request.runId || result.taskId !== request.taskId || result.attemptId !== request.attemptId) {
+    throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "Codex reviewer result IDs do not match the supervised request");
   }
 }
 
@@ -880,6 +1144,7 @@ export const EXECUTOR_RESULT_JSON_SCHEMA = {
             reasonCode: { type: "string" },
             summary: { type: "string" },
             evidenceRefs: emptyArtifactIdArray,
+            evidence: { type: "array", items: evidence },
             options: {
               type: "array",
               minItems: 2,
@@ -911,5 +1176,58 @@ export const EXECUTOR_RESULT_JSON_SCHEMA = {
     },
   },
   required: ["schemaVersion", "runId", "taskId", "attemptId", "executor", "outcome", "failureClass", "scopeClaim", "summary", "filesChanged", "checks", "evidence", "invariantViolations", "risks", "warnings", "artifacts", "humanGate", "recommendedNext", "exit"],
+  additionalProperties: false,
+} as const;
+
+export const SEMANTIC_REVIEW_RESULT_JSON_SCHEMA = {
+  type: "object",
+  properties: {
+    schemaVersion: { type: "string", const: CONTRACT_VERSIONS.semanticReviewResult },
+    reviewAttemptId: { type: "string", pattern: "^review_" },
+    runId: { type: "string", pattern: "^run_" },
+    taskId: { type: "string", pattern: "^task_" },
+    attemptId: { type: "string", pattern: "^attempt_" },
+    reviewer: {
+      type: "object",
+      properties: {
+        adapter: { type: "string" },
+        adapterVersion: { type: "string" },
+        provider: { type: "string" },
+        model: { type: "string" },
+        reasoning: { type: "string" },
+      },
+      required: ["adapter", "adapterVersion", "provider", "model"],
+      additionalProperties: false,
+    },
+    outcome: { type: "string", enum: ["supports_continuation", "rework_required", "escalation_required", "human_gate_required", "evidence_insufficient"] },
+    summary: { type: "string" },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          code: { type: "string" },
+          severity: { type: "string", enum: ["info", "warning", "blocking"] },
+          summary: { type: "string" },
+          path: { type: "string" },
+        },
+        required: ["code", "severity", "summary"],
+        additionalProperties: false,
+      },
+    },
+    evidence: {
+      type: "array",
+      items: {
+        ...evidence,
+        properties: {
+          ...evidence.properties,
+          classification: { type: "string", const: "inspected" },
+        },
+      },
+    },
+    scopeConcerns: stringArray,
+    invariantViolations: stringArray,
+  },
+  required: ["schemaVersion", "reviewAttemptId", "runId", "taskId", "attemptId", "reviewer", "outcome", "summary", "findings", "evidence", "scopeConcerns", "invariantViolations"],
   additionalProperties: false,
 } as const;

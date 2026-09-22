@@ -47,6 +47,7 @@ if (args[0] === "sandbox") {
 
 const valueAfter = (name) => args[args.indexOf(name) + 1];
 const resultPath = valueAfter("--output-last-message");
+const schemaPath = valueAfter("--output-schema");
 const model = valueAfter("--model");
 const prompt = args.at(-1) ?? "";
 const match = (name) => prompt.match(new RegExp("- " + name + ": ([^\\n]+)"))?.[1] ?? "missing_" + name;
@@ -54,6 +55,25 @@ const runId = match("runId");
 const taskId = match("taskId");
 const attemptId = match("attemptId");
 const scenario = prompt.match(/SCENARIO=([a-z0-9-]+)/)?.[1] ?? "success";
+if (schemaPath.includes("semantic-review-result.schema.json")) {
+  writeFileSync(resultPath, JSON.stringify({
+    schemaVersion: "kerbsflow.semantic-review-result/v1",
+    reviewAttemptId: match("reviewAttemptId"),
+    runId,
+    taskId,
+    attemptId,
+    reviewer: { adapter: "codex", adapterVersion: "fixture", provider: "openai", model },
+    outcome: "supports_continuation",
+    summary: "synthetic independent review",
+    findings: [],
+    evidence: [{ schemaVersion: "kerbsflow.validation/v1", id: "validation_fixture_review", kind: "review", classification: "inspected", summary: "synthetic semantic inspection" }],
+    scopeConcerns: [],
+    invariantViolations: [],
+  }));
+  console.log(JSON.stringify({ type: "thread.started", thread_id: "fixture-review-thread" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+  process.exit(0);
+}
 const base = {
   schemaVersion: "kerbsflow.executor-result/v1",
   runId,

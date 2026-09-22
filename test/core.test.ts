@@ -10,6 +10,7 @@ import {
   asCommandId,
   asGateId,
   asRunId,
+  asValidationId,
   parseCommand,
 } from "../src/contracts.js";
 import { IdempotencyConflictError, StateVersionConflictError } from "../src/errors.js";
@@ -377,6 +378,32 @@ test("executor gates accept unique REWORK and CANCELLED options", async () => {
     const accepted = await fixture.core.completeFakeAttempt(fixture.runId, 4, "valid-options", result);
     assert.equal(accepted.to, "HUMAN_GATE");
     assert.deepEqual(fixture.core.readModel(fixture.runId)?.currentGate?.gate.options.map((option) => option.target), ["REWORK", "CANCELLED"]);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("executor gate evidence is persisted as an untrusted claim", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const result = blockedResult(fixture, [
+      { id: "rework", label: "Rework", consequence: "Return to bounded rework.", target: "REWORK" },
+      { id: "cancel", label: "Cancel", consequence: "Cancel and preserve evidence.", target: "CANCELLED" },
+    ]);
+    assert.ok(result.humanGate);
+    result.humanGate.evidence = [{
+      schemaVersion: CONTRACT_VERSIONS.validation,
+      id: asValidationId("validation_executor_gate_claim"),
+      kind: "result",
+      classification: "automatically_tested",
+      summary: "executor claimed automatic proof",
+    }];
+    result.humanGate.recommendation = "Choose rework.";
+    await fixture.core.completeFakeAttempt(fixture.runId, 4, "normalize-gate-evidence", result);
+    const stored = fixture.core.readModel(fixture.runId)?.currentGate?.gate;
+    assert.equal(stored?.evidence?.[0]?.classification, "not_tested");
+    assert.match(stored?.evidence?.[0]?.summary ?? "", /not independently validated/i);
   } finally {
     fixture.close();
   }

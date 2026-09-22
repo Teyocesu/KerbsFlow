@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- **Current state:** The Phase 2 compatibility blocker is resolved on branch HEAD: official standalone Codex CLI `0.157.0-alpha.1` passes deterministic gates, pre/post isolation probes, and one disposable live smoke.
-- **Unresolved:** The ChatGPT.app-bundled `0.155.0-alpha.9.2` remains incompatible and must not be selected; independent re-audit is pending.
-- **Next action:** Independently re-audit the pushed `phase2/codex-vertical-loop` HEAD; Phase 3 has not started.
+- **Current state:** Phase 3 implementation and deterministic validation are complete at the HEAD containing this handoff on `phase3/verification-recovery`; Phase 4 has not started.
+- **Residual risks:** Independent audit and a live semantic-review smoke remain unperformed; anti-greenwashing is intentionally conservative rather than complete; bundled Codex `0.155.0-alpha.9.2` remains isolation-incompatible and fails closed.
+- **Next action:** Perform an independent ChatGPT/GitHub Phase 3 audit of `phase3/verification-recovery` HEAD.
