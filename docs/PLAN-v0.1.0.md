@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 4 implementation and deterministic validation complete; independent audit pending**
+Status: **Phase 4 implementation, deterministic validation, and independent audit complete at approved baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -137,7 +137,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 4 — OpenCode adapter and policy routing
 
-**Status:** implementation and deterministic integration, including the final dispatch-boundary routing-authority correction, are complete in the `phase4/opencode-routing` working tree; independent confirmation pending.
+**Status:** implementation, deterministic integration, and all targeted independent-audit corrections are complete and independently confirmed **PASS** at approved baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`.
 
 **Objective:** Add the preferred normal-work route and evidence-based escalation without changing the core lifecycle.
 
@@ -168,7 +168,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Fake embedded V2 host/in-memory-router fixtures; explicit host ownership/close tests; `AsyncIterable` loss/termination/duplication/order tests; request abort; schema/permission/version capability tests; shared-environment credential non-copy/non-persistence checks; provider-versus-workload network reporting; routing/escalation tests; opt-in synthetic live smoke run. If loopback fallback is implemented, additionally test listener binding/auth, SSE reconciliation, teardown, and equivalence to the same adapter/core contract.
 
-**Exit condition:** Satisfied for implementation and deterministic integration. `@opencode/sdk` and the isolated official CLI were tested at `2.0.13`; the selected transport is an explicitly owned embedded host with no listener. Both adapters retain the v1 contract, and routing/escalation is deterministic, bounded, inspectable, and provider-agnostic at the core boundary. The opt-in live OpenCode smoke was not run because the provider readiness API reported no enabled provider or model; independent audit remains pending.
+**Exit condition:** Satisfied for implementation and deterministic integration, and independently confirmed **PASS**. `@opencode/sdk` and the isolated official CLI were tested at `2.0.13`; the selected transport is an explicitly owned embedded host with no listener. Both adapters retain the v1 contract, and routing/escalation is deterministic, bounded, inspectable, and provider-agnostic at the core boundary. The opt-in live OpenCode smoke remains **NOT RUN** because the provider readiness API reported no enabled provider or model; enforcement remains honestly `tool_policy_only`.
 
 **Expected route:** Codex/Sol Medium for embedded V2 SDK integration; Sol High for permission/auth/network/routing review; OpenCode/Muse may implement ordinary follow-up work after its adapter is verified.
 
@@ -262,4 +262,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. The final Phase 4 routing-authority correction is implemented in the `phase4/opencode-routing` working tree: core dispatch now requires durable trusted provenance, and prepared descriptors are hash-bound to authoritative discovery. Focused routing/OpenCode validation and the full deterministic gate are green; live OpenCode remains unavailable because readiness reports no enabled provider/model. Independent confirmation is next, and Phase 5 has not started.
+- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 implementation and all targeted independent-audit corrections are independently confirmed **PASS** at approved baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`: core dispatch requires durable trusted provenance, and prepared descriptors are hash-bound to authoritative discovery. Focused routing/OpenCode validation and the full deterministic gate are green; live OpenCode remains **NOT RUN** because readiness reports no enabled provider/model, with enforcement honestly `tool_policy_only`. Phase 5 has not started. Next action: begin Phase 5 from the approved Phase 4 baseline.
