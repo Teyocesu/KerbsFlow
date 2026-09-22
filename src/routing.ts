@@ -131,6 +131,14 @@ export type TrustedAttemptRoutingProvenance = AttemptRoutingProvenance & {
   readonly [ATTEMPT_ROUTING_AUTHORITY]: true;
 };
 
+export interface AttemptRoutingBinding {
+  provenance: AttemptRoutingProvenance;
+  routingDecision: RoutingDecision;
+  planningDecision: PlanningDecision;
+  preparedDescriptor: AdapterDescriptor;
+  attemptId: AttemptId;
+}
+
 export class RoutedExecutorAdapter implements ExecutorAdapter {
   private readonly adapters = new Map<string, ExecutorAdapter>();
   private readonly attempts = new Map<string, ExecutorAdapter>();
@@ -273,7 +281,7 @@ export class RoutingDiscovery {
         }
         readinessReason = actual.readiness.reason;
       }
-      const capabilityHash = actual?.descriptor === undefined ? undefined : sha256(stableJson(actual.descriptor));
+      const capabilityHash = actual?.descriptor === undefined ? undefined : adapterCapabilityHash(actual.descriptor);
       return deepFreeze({
         ...model,
         available: issues.length === 0 && actual?.descriptor !== undefined,
@@ -476,6 +484,52 @@ export function assertTrustedAttemptRoutingProvenance(value: AttemptRoutingProve
   assertAttemptRoutingProvenance(value);
   if (!TRUSTED_ATTEMPT_ROUTES.has(value)) throw new KerbsFlowError("ROUTING_AUTHORITY_REQUIRED", "attempt routing provenance must originate from a trusted routing decision");
   return value as TrustedAttemptRoutingProvenance;
+}
+
+export function adapterCapabilityHash(value: AdapterDescriptor): string {
+  return sha256(stableJson(parseAdapterDescriptor(value)));
+}
+
+export function assertAttemptRoutingBinding(input: AttemptRoutingBinding): AttemptRoutingProvenance {
+  const provenance = assertAttemptRoutingProvenance(input.provenance);
+  const routing = assertRoutingDecision(input.routingDecision);
+  const planning = parsePlanningDecision(input.planningDecision);
+  const descriptor = parseAdapterDescriptor(input.preparedDescriptor);
+  if (
+    provenance.attemptId !== input.attemptId
+    || provenance.runId !== planning.runId
+    || provenance.taskId !== planning.taskId
+    || provenance.planningDecisionId !== planning.decisionId
+    || routing.runId !== planning.runId
+    || routing.taskId !== planning.taskId
+    || routing.planningDecisionId !== planning.decisionId
+  ) {
+    throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing authority does not match the prepared attempt and persisted planning scope");
+  }
+  if (
+    provenance.selected.adapter !== planning.route.adapter
+    || provenance.selected.model !== planning.route.model
+    || provenance.selected.reasoning !== planning.route.reasoning
+  ) {
+    throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing authority does not match the persisted planning route");
+  }
+  if (provenance.capabilitySnapshotHash !== routing.capabilitySnapshotHash || provenance.discoveredAt !== routing.discoveredAt) {
+    throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing authority does not match the persisted discovery snapshot");
+  }
+  const candidate = routing.consideredRoutes.find((route) => (
+    route.adapter === provenance.selected.adapter
+    && route.provider === provenance.selected.provider
+    && route.model === provenance.selected.model
+    && route.family === provenance.selected.family
+    && route.reasoning === provenance.selected.reasoning
+  ));
+  if (candidate === undefined || !candidate.available || !candidate.suitable || candidate.capabilityHash !== provenance.capabilityHash) {
+    throw new KerbsFlowError("ROUTING_CAPABILITY_MISMATCH", "attempt route is not backed by the authoritative capability snapshot");
+  }
+  if (descriptor.adapter !== provenance.selected.adapter || adapterCapabilityHash(descriptor) !== provenance.capabilityHash) {
+    throw new KerbsFlowError("ROUTING_CAPABILITY_MISMATCH", "prepared adapter descriptor does not match the authoritative capability snapshot");
+  }
+  return provenance;
 }
 
 export function assertRoutingDiscoveryAuthority(value: RoutingDiscoveryAuthority): RoutingDiscoveryAuthority {

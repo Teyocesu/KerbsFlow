@@ -33,7 +33,7 @@ import { KerbsFlowCore } from "../src/core.js";
 import { FakeArtifactStore } from "../src/fake.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { StateStore } from "../src/persistence.js";
-import { RoutedExecutorAdapter } from "../src/routing.js";
+import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery, createAttemptRoutingProvenance, type RoutedPlanning } from "../src/routing.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 
 test("the official OpenCode V2 SDK is pinned and its embedded API enforces the tested tool policy without a listener", async () => {
@@ -164,7 +164,8 @@ test("the unchanged core lifecycle reaches focused verification through OpenCode
       model: "placeholder",
       canonicalContext: "opencode core lifecycle",
     });
-    const decision = parsePlanningDecision({ ...base, route: { adapter: "opencode", model: "opencode/muse-fixture" }, policyVersion: "kerbsflow.phase4-routing/v1" });
+    const routed = await trustedOpenCodeRoute(fixture.adapter, parsePlanningDecision({ ...base, route: { adapter: "opencode", model: "opencode/muse-fixture" }, policyVersion: "kerbsflow.phase4-routing/v1" }), fixture.root);
+    const decision = routed.planningDecision;
     const core = new KerbsFlowCore(store, fixture.adapter, new FakeArtifactStore(ids), {
       clock,
       ids,
@@ -178,7 +179,9 @@ test("the unchanged core lifecycle reaches focused verification through OpenCode
     let command = core.startRun(decision.runId, "synthetic OpenCode core run", "opencode-core:start");
     command = core.completeIntake(decision.runId, command.stateVersion, "opencode-core:intake");
     command = core.plan(decision.runId, command.stateVersion, "opencode-core:plan", decision);
+    store.recordRoutingDecision(routed.routingDecision);
     command = core.prepareExecution(decision.runId, command.stateVersion, "opencode-core:prepare");
+    recordPreparedRoute(store, routed);
     command = await core.beginAttempt(decision.runId, command.stateVersion, "opencode-core:begin", fixture.root, { timeoutMs: 5000 });
     command = await core.completeAttempt(decision.runId, command.stateVersion, "opencode-core:complete");
     assert.equal(command.to, "VERIFY_FOCUSED");
@@ -199,13 +202,16 @@ test("ambiguous OpenCode terminal output enters RECOVERY without dispatching a f
   try {
     fixture.host.contextScenario = "missing";
     fixture.host.logEvents = [event("event-terminal", 1, "session.execution.succeeded")];
-    const decision = openCodeDecision("ambiguous");
+    const routed = await trustedOpenCodeRoute(fixture.adapter, openCodeDecision("ambiguous"), fixture.root);
+    const decision = routed.planningDecision;
     let codexStarts = 0;
     const core = openCodeCore(store, new RoutedExecutorAdapter([fixture.adapter, trackingCodexAdapter(() => { codexStarts += 1; })]), clock, ids);
     let command = core.startRun(decision.runId, "ambiguous OpenCode output", "opencode-ambiguous:start");
     command = core.completeIntake(decision.runId, command.stateVersion, "opencode-ambiguous:intake");
     command = core.plan(decision.runId, command.stateVersion, "opencode-ambiguous:plan", decision);
+    store.recordRoutingDecision(routed.routingDecision);
     command = core.prepareExecution(decision.runId, command.stateVersion, "opencode-ambiguous:prepare");
+    recordPreparedRoute(store, routed);
     command = await core.beginAttempt(decision.runId, command.stateVersion, "opencode-ambiguous:begin", fixture.root, { timeoutMs: 5000 });
     command = await core.completeAttempt(decision.runId, command.stateVersion, "opencode-ambiguous:complete");
     assert.equal(command.to, "RECOVERY");
@@ -225,12 +231,15 @@ test("an accepted but nonterminal OpenCode interrupt remains RECOVERY through th
   const ids = new SequenceIdSource("opencode-uncertain-cancel");
   const store = StateStore.open(join(fixture.root, "state.sqlite"), { clock, ids });
   try {
-    const decision = openCodeDecision("uncertain_cancel");
+    const routed = await trustedOpenCodeRoute(fixture.adapter, openCodeDecision("uncertain_cancel"), fixture.root);
+    const decision = routed.planningDecision;
     const core = openCodeCore(store, fixture.adapter, clock, ids);
     let command = core.startRun(decision.runId, "uncertain OpenCode cancellation", "opencode-cancel:start");
     command = core.completeIntake(decision.runId, command.stateVersion, "opencode-cancel:intake");
     command = core.plan(decision.runId, command.stateVersion, "opencode-cancel:plan", decision);
+    store.recordRoutingDecision(routed.routingDecision);
     command = core.prepareExecution(decision.runId, command.stateVersion, "opencode-cancel:prepare");
+    recordPreparedRoute(store, routed);
     command = await core.beginAttempt(decision.runId, command.stateVersion, "opencode-cancel:begin", fixture.root, { timeoutMs: 5000 });
     await new Promise<void>((resolve) => setImmediate(resolve));
     const attemptId = core.readModel(decision.runId)?.run.activeAttemptId;
@@ -519,6 +528,25 @@ function openCodeDecision(suffix: string) {
     canonicalContext: `opencode ${suffix} lifecycle`,
   });
   return parsePlanningDecision({ ...base, route: { adapter: "opencode", model: "opencode/muse-fixture" }, policyVersion: "kerbsflow.phase4-routing/v1" });
+}
+
+async function trustedOpenCodeRoute(adapter: ExecutorAdapter, decision: ReturnType<typeof openCodeDecision>, workingDirectory: string): Promise<RoutedPlanning> {
+  const discovery = await new RoutingDiscovery([{ adapter: "opencode", implementation: adapter }], { now: () => "2026-09-22T12:00:00.000Z" }).discover({
+    workingDirectory,
+    models: [{ adapter: "opencode", provider: "opencode", model: "opencode/muse-fixture", family: "muse" }],
+  });
+  return new PolicyRouter().route({ planningDecision: decision, classification: "normal", discovery });
+}
+
+function recordPreparedRoute(store: StateStore, routed: RoutedPlanning): void {
+  const attemptId = store.readModel(routed.planningDecision.runId)?.run.activeAttemptId;
+  assert.ok(attemptId);
+  store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+    routingDecision: routed.routingDecision,
+    planningDecision: routed.planningDecision,
+    attemptId,
+    selectionReason: routed.routingDecision.selectionReason,
+  }));
 }
 
 function openCodeCore(store: StateStore, adapter: ExecutorAdapter, clock: FixedClock, ids: SequenceIdSource): KerbsFlowCore {

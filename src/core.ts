@@ -58,6 +58,14 @@ import { hashCanonicalDocuments } from "./canonical.js";
 import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
 import { bindingFor } from "./verifier.js";
 import {
+  PHASE4_ROUTING_POLICY,
+  assertAttemptRoutingBinding,
+  assertAttemptRoutingProvenance,
+  assertRoutingDecision,
+  type AttemptRoutingProvenance,
+  type RoutingDecision,
+} from "./routing.js";
+import {
   ConfigLayers,
   DEFAULT_HARD_INVARIANTS,
   DEFAULT_PROJECT_POLICY,
@@ -277,6 +285,7 @@ export class KerbsFlowCore {
         throw new KerbsFlowError("INVALID_COMMAND_STATE", `execution requires EXECUTE, found ${run.state}`);
       }
       const current = this.attemptInTransaction(tx, attempt.attemptId);
+      this.assertPhase4DispatchAuthority(tx, this.taskInTransaction(tx, current.taskId), current);
       if (current.lifecycle === "RUNNING") {
         return { details: { attemptId: attempt.attemptId, alreadyRunning: true } } satisfies CommandMutation;
       }
@@ -1363,6 +1372,31 @@ export class KerbsFlowCore {
       throw new NotFoundError("attempt", attemptId);
     }
     return this.attemptFromRow(row);
+  }
+
+  private assertPhase4DispatchAuthority(tx: SqlTransaction, task: StoredTask, attempt: StoredAttempt): void {
+    if (task.decision.policyVersion !== PHASE4_ROUTING_POLICY) return;
+    const routingRow = tx.get("SELECT decision_json FROM routing_decisions WHERE planning_decision_id = ?", task.decision.decisionId) as Record<string, unknown> | undefined;
+    if (routingRow === undefined) {
+      throw new KerbsFlowError("ROUTING_AUTHORITY_REQUIRED", "Phase 4 dispatch requires a persisted trusted routing decision");
+    }
+    const provenanceRow = tx.get("SELECT provenance_json FROM attempt_routing_provenance WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
+    if (provenanceRow === undefined) {
+      throw new KerbsFlowError("ROUTING_AUTHORITY_REQUIRED", "Phase 4 dispatch requires persisted attempt routing provenance");
+    }
+    if (attempt.adapterDescriptorJson === null) {
+      throw new KerbsFlowError("ROUTING_CAPABILITY_MISMATCH", "Phase 4 dispatch requires the prepared adapter descriptor");
+    }
+    const routing = assertRoutingDecision(JSON.parse(String(routingRow.decision_json)) as RoutingDecision);
+    const provenance = assertAttemptRoutingProvenance(JSON.parse(String(provenanceRow.provenance_json)) as AttemptRoutingProvenance);
+    const descriptor = parseAdapterDescriptor(JSON.parse(attempt.adapterDescriptorJson), "attempts.adapter_descriptor_json");
+    assertAttemptRoutingBinding({
+      provenance,
+      routingDecision: routing,
+      planningDecision: task.decision,
+      preparedDescriptor: descriptor,
+      attemptId: attempt.attemptId,
+    });
   }
 
   private gateInTransaction(tx: SqlTransaction, gateId: ReturnType<typeof asGateId>): StoredGate {

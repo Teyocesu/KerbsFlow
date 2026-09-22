@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import type { AdapterRoutingReadiness, ExecutorAdapter } from "../src/adapter.js";
 import {
@@ -30,6 +31,7 @@ import {
   createAttemptRoutingProvenance,
   type RouteModelPolicy,
   type RoutingDiscoveryAuthority,
+  type TrustedAttemptRoutingProvenance,
   type TrustedRoutingDecision,
 } from "../src/routing.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
@@ -91,6 +93,151 @@ test("missing probed capabilities make a route unsuitable and Codex requires enf
   assert.throws(() => new PolicyRouter().route({ planningDecision: baseDecision(), classification: "normal", discovery: noMuse.discovery }), /no Phase 4 route/i);
 });
 
+test("core Phase 4 dispatch rejects missing routing authority before adapter start", async () => {
+  const missingDecision = await preparedRoutingFixture("missing-decision");
+  try {
+    await assert.rejects(
+      missingDecision.core.beginAttempt(missingDecision.routed.planningDecision.runId, missingDecision.command.stateVersion, "missing-decision:begin", missingDecision.root),
+      /routing decision|routing authority/i,
+    );
+    assert.equal(missingDecision.starts.count, 0);
+  } finally {
+    missingDecision.close();
+  }
+
+  const missingProvenance = await preparedRoutingFixture("missing-provenance");
+  try {
+    missingProvenance.store.recordRoutingDecision(missingProvenance.routed.routingDecision);
+    await assert.rejects(
+      missingProvenance.core.beginAttempt(missingProvenance.routed.planningDecision.runId, missingProvenance.command.stateVersion, "missing-provenance:begin", missingProvenance.root),
+      /attempt routing provenance|routing authority/i,
+    );
+    assert.equal(missingProvenance.starts.count, 0);
+  } finally {
+    missingProvenance.close();
+  }
+});
+
+test("plain or cross-run attempt provenance cannot authorize Phase 4 dispatch", async () => {
+  const source = await preparedRoutingFixture("authority-source");
+  const target = await preparedRoutingFixture("authority-target");
+  try {
+    source.store.recordRoutingDecision(source.routed.routingDecision);
+    target.store.recordRoutingDecision(target.routed.routingDecision);
+    const sourceProvenance = createAttemptRoutingProvenance({
+      routingDecision: source.routed.routingDecision,
+      planningDecision: source.routed.planningDecision,
+      attemptId: source.attemptId,
+      selectionReason: source.routed.routingDecision.selectionReason,
+    });
+    const fabricated = { ...sourceProvenance } as TrustedAttemptRoutingProvenance;
+    assert.throws(() => source.store.recordAttemptRoutingProvenance(fabricated), /authority|trusted routing decision/i);
+    assert.throws(() => target.store.recordAttemptRoutingProvenance(sourceProvenance), /scope|persisted attempt/i);
+    await assert.rejects(
+      target.core.beginAttempt(target.routed.planningDecision.runId, target.command.stateVersion, "authority-target:begin", target.root),
+      /attempt routing provenance|routing authority/i,
+    );
+    assert.equal(source.starts.count, 0);
+    assert.equal(target.starts.count, 0);
+  } finally {
+    source.close();
+    target.close();
+  }
+});
+
+test("prepared OpenCode capability drift is rejected before dispatch", async () => {
+  const weaker = opencodeDescriptor();
+  weaker.capabilities.cancellation = "none";
+  const fixture = await preparedRoutingFixture("opencode-drift", { runtimeDescriptor: weaker });
+  try {
+    fixture.store.recordRoutingDecision(fixture.routed.routingDecision);
+    const provenance = createAttemptRoutingProvenance({
+      routingDecision: fixture.routed.routingDecision,
+      planningDecision: fixture.routed.planningDecision,
+      attemptId: fixture.attemptId,
+      selectionReason: fixture.routed.routingDecision.selectionReason,
+    });
+    assert.throws(() => fixture.store.recordAttemptRoutingProvenance(provenance), /descriptor|capability snapshot/i);
+    await assert.rejects(
+      fixture.core.beginAttempt(fixture.routed.planningDecision.runId, fixture.command.stateVersion, "opencode-drift:begin", fixture.root),
+      /attempt routing provenance|routing authority/i,
+    );
+    assert.equal(fixture.starts.count, 0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("prepared Codex without enforced workload network is rejected before dispatch", async () => {
+  const weaker = codexDescriptor();
+  weaker.capabilities.network.workload = "tool_policy_only";
+  const fixture = await preparedRoutingFixture("codex-drift", { classification: "high_impact", runtimeDescriptor: weaker });
+  try {
+    fixture.store.recordRoutingDecision(fixture.routed.routingDecision);
+    const provenance = createAttemptRoutingProvenance({
+      routingDecision: fixture.routed.routingDecision,
+      planningDecision: fixture.routed.planningDecision,
+      attemptId: fixture.attemptId,
+      selectionReason: fixture.routed.routingDecision.selectionReason,
+    });
+    assert.throws(() => fixture.store.recordAttemptRoutingProvenance(provenance), /descriptor|capability snapshot/i);
+    await assert.rejects(
+      fixture.core.beginAttempt(fixture.routed.planningDecision.runId, fixture.command.stateVersion, "codex-drift:begin", fixture.root),
+      /attempt routing provenance|routing authority/i,
+    );
+    assert.equal(fixture.starts.count, 0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("core revalidates durable descriptor capability identity immediately before dispatch", async () => {
+  const fixture = await preparedRoutingFixture("dispatch-recheck");
+  try {
+    fixture.store.recordRoutingDecision(fixture.routed.routingDecision);
+    fixture.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+      routingDecision: fixture.routed.routingDecision,
+      planningDecision: fixture.routed.planningDecision,
+      attemptId: fixture.attemptId,
+      selectionReason: fixture.routed.routingDecision.selectionReason,
+    }));
+    const weaker = opencodeDescriptor();
+    weaker.capabilities.resumableSession = false;
+    const database = new DatabaseSync(join(fixture.root, "state.sqlite"));
+    try {
+      database.prepare("UPDATE attempts SET adapter_descriptor_json = ? WHERE attempt_id = ?").run(JSON.stringify(weaker), fixture.attemptId);
+    } finally {
+      database.close();
+    }
+    await assert.rejects(
+      fixture.core.beginAttempt(fixture.routed.planningDecision.runId, fixture.command.stateVersion, "dispatch-recheck:begin", fixture.root),
+      /descriptor|capability snapshot/i,
+    );
+    assert.equal(fixture.starts.count, 0);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("capability-identical adapter instances authorize trusted OpenCode and Codex dispatch", async () => {
+  for (const [suffix, classification] of [["trusted-opencode", "normal"], ["trusted-codex", "high_impact"]] as const) {
+    const fixture = await preparedRoutingFixture(suffix, { classification });
+    try {
+      fixture.store.recordRoutingDecision(fixture.routed.routingDecision);
+      fixture.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+        routingDecision: fixture.routed.routingDecision,
+        planningDecision: fixture.routed.planningDecision,
+        attemptId: fixture.attemptId,
+        selectionReason: fixture.routed.routingDecision.selectionReason,
+      }));
+      await fixture.core.beginAttempt(fixture.routed.planningDecision.runId, fixture.command.stateVersion, `${suffix}:begin`, fixture.root);
+      assert.equal(fixture.starts.count, 1);
+    } finally {
+      fixture.close();
+    }
+  }
+});
+
 test("difficult/high-impact routes and Luna Medium remain frozen policy", async () => {
   const actual = await discover();
   const difficult = new PolicyRouter().route({ planningDecision: baseDecision(), classification: "difficult", discovery: actual.discovery });
@@ -113,7 +260,8 @@ test("routing decision and separate provenance for every attempt persist without
   try {
     const actual = await discover();
     const routed = new PolicyRouter().route({ planningDecision: baseDecision(), classification: "normal", discovery: actual.discovery });
-    const adapter = new RoutedExecutorAdapter([descriptorOnlyAdapter(opencodeDescriptor(), readiness()), descriptorOnlyAdapter(codexDescriptor())]);
+    const starts = { count: 0 };
+    const adapter = new RoutedExecutorAdapter([descriptorOnlyAdapter(opencodeDescriptor(), readiness(), undefined, undefined, () => { starts.count += 1; }), descriptorOnlyAdapter(codexDescriptor(), undefined, undefined, undefined, () => { starts.count += 1; })]);
     const core = configuredCore(store, adapter, clock, ids);
     let command = core.startRun(routed.planningDecision.runId, "synthetic route", "start-routing");
     command = core.completeIntake(routed.planningDecision.runId, command.stateVersion, "intake-routing");
@@ -139,9 +287,11 @@ test("routing decision and separate provenance for every attempt persist without
     });
     const escalated = escalatePlanningRoute(routed.planningDecision, { model: "openai/sol-current", reasoning: "high" });
     command = core.reworkToReady(routed.planningDecision.runId, command.stateVersion, "ready-routing-2", escalated);
-    core.prepareExecution(routed.planningDecision.runId, command.stateVersion, "prepare-routing-2");
+    command = core.prepareExecution(routed.planningDecision.runId, command.stateVersion, "prepare-routing-2");
     const secondAttempt = store.readModel(routed.planningDecision.runId)?.run.activeAttemptId;
     assert.ok(secondAttempt);
+    await assert.rejects(() => core.beginAttempt(routed.planningDecision.runId, command.stateVersion, "begin-routing-2-missing", root), /attempt routing provenance|routing authority/i);
+    assert.equal(starts.count, 1, "provenance from the first attempt cannot authorize the second attempt");
     store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
       routingDecision: routed.routingDecision,
       planningDecision: escalated,
@@ -149,6 +299,8 @@ test("routing decision and separate provenance for every attempt persist without
       selectionReason: "failure policy escalated",
       escalationReason: "first route failed independent verification",
     }));
+    await core.beginAttempt(routed.planningDecision.runId, command.stateVersion, "begin-routing-2", root);
+    assert.equal(starts.count, 2);
 
     const provenance = store.listAttemptRoutingProvenance(routed.planningDecision.runId, routed.planningDecision.taskId);
     assert.deepEqual(provenance.map((entry) => entry.provenance.selected.adapter), ["opencode", "codex"]);
@@ -191,8 +343,8 @@ test("core still selects the routed adapter for each prepared planning route", a
   }
 });
 
-function baseDecision() {
-  return createPhase2PlanningDecision({ decisionId: "decision_phase4_route", runId: asRunId("run_phase4_route"), taskId: asTaskId("task_phase4_route"), objective: "implement an ordinary synthetic feature", acceptance: ["the focused check passes"], positiveScope: ["src/example.ts"], negativeScope: ["secrets", "release"], model: "placeholder", canonicalContext: "phase4 route fixture" });
+function baseDecision(suffix = "route") {
+  return createPhase2PlanningDecision({ decisionId: `decision_phase4_${suffix}`, runId: asRunId(`run_phase4_${suffix}`), taskId: asTaskId(`task_phase4_${suffix}`), objective: "implement an ordinary synthetic feature", acceptance: ["the focused check passes"], positiveScope: ["src/example.ts"], negativeScope: ["secrets", "release"], model: "placeholder", canonicalContext: `phase4 ${suffix} fixture` });
 }
 
 function models(): RouteModelPolicy[] {
@@ -225,8 +377,40 @@ function codexDescriptor(): AdapterDescriptor {
   return { schemaVersion: CONTRACT_VERSIONS.adapterDescriptor, adapter: "codex", provider: "openai", adapterVersion: "fixture", capabilities: { eventTransport: "jsonl", finalJsonSchema: true, modelSelection: true, reasoningEffort: ["medium", "high", "max"], agentSelection: false, filesystemEnforcement: "enforced", network: { providerControlPlane: "provider_owned", workload: "enforced" }, cancellation: "process_only", resumableSession: true, authentication: { owner: "provider", mode: "provider-owned" }, healthProbe: true } };
 }
 
-function descriptorOnlyAdapter(descriptor: AdapterDescriptor, routing?: AdapterRoutingReadiness, onProbe?: () => void, onReadiness?: () => void): ExecutorAdapter {
-  return { probe: () => { onProbe?.(); return descriptor; }, ...(routing === undefined ? {} : { routingReadiness: async () => { onReadiness?.(); return routing; } }), start: (request: ExecutionRequest): AttemptHandle => ({ schemaVersion: CONTRACT_VERSIONS.attemptHandle, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId }), events: async function* () { /* no events needed */ }, wait: async () => ({ schemaVersion: "invalid" }), cancel: () => ({ outcome: "unknown", summary: "not used" }), reconcile: async () => ({ outcome: "unknown", summary: "not used" }) };
+function descriptorOnlyAdapter(descriptor: AdapterDescriptor, routing?: AdapterRoutingReadiness, onProbe?: () => void, onReadiness?: () => void, onStart?: () => void): ExecutorAdapter {
+  return { probe: () => { onProbe?.(); return descriptor; }, ...(routing === undefined ? {} : { routingReadiness: async () => { onReadiness?.(); return routing; } }), start: (request: ExecutionRequest): AttemptHandle => { onStart?.(); return { schemaVersion: CONTRACT_VERSIONS.attemptHandle, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId }; }, events: async function* () { /* no events needed */ }, wait: async () => ({ schemaVersion: "invalid" }), cancel: () => ({ outcome: "unknown", summary: "not used" }), reconcile: async () => ({ outcome: "unknown", summary: "not used" }) };
+}
+
+async function preparedRoutingFixture(
+  suffix: string,
+  options: { classification?: "normal" | "difficult" | "high_impact"; runtimeDescriptor?: AdapterDescriptor } = {},
+) {
+  const root = mkdtempSync(join(tmpdir(), `kerbsflow-routing-${suffix}-`));
+  const clock = new FixedClock("2026-09-22T12:00:00.000Z");
+  const ids = new SequenceIdSource(suffix);
+  const store = StateStore.open(join(root, "state.sqlite"), { clock, ids });
+  const discovery = await new RoutingDiscovery([
+    { adapter: "opencode", implementation: descriptorOnlyAdapter(opencodeDescriptor(), readiness()) },
+    { adapter: "codex", implementation: descriptorOnlyAdapter(codexDescriptor()) },
+  ], { now: () => "2026-09-22T12:00:00.000Z" }).discover({ workingDirectory: root, models: models() });
+  const routed = new PolicyRouter().route({ planningDecision: baseDecision(suffix), classification: options.classification ?? "normal", discovery });
+  const starts = { count: 0 };
+  const runtimeDescriptor = options.runtimeDescriptor ?? (routed.planningDecision.route.adapter === "opencode" ? opencodeDescriptor() : codexDescriptor());
+  const runtime = descriptorOnlyAdapter(runtimeDescriptor, routed.planningDecision.route.adapter === "opencode" ? readiness() : undefined, undefined, undefined, () => { starts.count += 1; });
+  const core = configuredCore(store, new RoutedExecutorAdapter([runtime]), clock, ids);
+  let command = core.startRun(routed.planningDecision.runId, "synthetic route", `${suffix}:start`);
+  command = core.completeIntake(routed.planningDecision.runId, command.stateVersion, `${suffix}:intake`);
+  command = core.plan(routed.planningDecision.runId, command.stateVersion, `${suffix}:plan`, routed.planningDecision);
+  command = core.prepareExecution(routed.planningDecision.runId, command.stateVersion, `${suffix}:prepare`);
+  const attemptId = store.readModel(routed.planningDecision.runId)?.run.activeAttemptId;
+  assert.ok(attemptId);
+  return {
+    root, store, core, routed, command, attemptId, starts,
+    close() {
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
 }
 
 function configuredCore(store: StateStore, adapter: ExecutorAdapter, clock: FixedClock, ids: SequenceIdSource): KerbsFlowCore {

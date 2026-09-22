@@ -53,6 +53,7 @@ import { containsLikelySecret, SENSITIVE_RESULT_REJECTION } from "./secrets.js";
 import { assertAuthoritativePhaseValidation, type AuthoritativePhaseValidation, type PhaseValidationBinding } from "./verifier.js";
 import { assertReviewDispatchAuthority, type ReviewDispatchAuthority } from "./reviewer.js";
 import {
+  assertAttemptRoutingBinding,
   assertAttemptRoutingProvenance,
   assertRoutingDecision,
   assertTrustedAttemptRoutingProvenance,
@@ -764,21 +765,15 @@ export class StateStore {
         throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the persisted attempt run/task");
       }
       const descriptorJson = nullableString(attempt.adapter_descriptor_json, "attempts.adapter_descriptor_json");
-      if (descriptorJson === null || parseAdapterDescriptorForRouting(descriptorJson).adapter !== provenance.selected.adapter) {
-        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the prepared adapter descriptor");
-      }
+      if (descriptorJson === null) throw new KerbsFlowError("ROUTING_CAPABILITY_MISMATCH", "prepared attempt has no adapter descriptor");
+      const descriptor = parseAdapterDescriptorForRouting(descriptorJson);
       const task = tx.get("SELECT decision_json FROM tasks WHERE task_id = ?", provenance.taskId) as Row | undefined;
       if (task === undefined) throw new NotFoundError("task", provenance.taskId);
       const planning = parsePlanningDecision(JSON.parse(stringValue(task.decision_json, "tasks.decision_json")));
-      if (planning.decisionId !== provenance.planningDecisionId || planning.route.adapter !== provenance.selected.adapter || planning.route.model !== provenance.selected.model || planning.route.reasoning !== provenance.selected.reasoning) {
-        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the current persisted planning route");
-      }
       const routing = tx.get("SELECT decision_json FROM routing_decisions WHERE planning_decision_id = ?", provenance.planningDecisionId) as Row | undefined;
       if (routing === undefined) throw new NotFoundError("routing decision", provenance.planningDecisionId);
       const decision = assertRoutingDecision(JSON.parse(stringValue(routing.decision_json, "routing_decisions.decision_json")) as RoutingDecision);
-      if (decision.capabilitySnapshotHash !== provenance.capabilitySnapshotHash) {
-        throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing provenance does not match the persisted discovery snapshot");
-      }
+      assertAttemptRoutingBinding({ provenance, routingDecision: decision, planningDecision: planning, preparedDescriptor: descriptor, attemptId: provenance.attemptId });
       const existing = tx.get("SELECT * FROM attempt_routing_provenance WHERE attempt_id = ?", provenance.attemptId) as Row | undefined;
       if (existing !== undefined) {
         const stored = parseAttemptRoutingProvenanceRow(existing);
