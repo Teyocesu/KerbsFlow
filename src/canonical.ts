@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import type { RunId } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
 import { StateStore, type StoredCanonicalSnapshot, type StoredPhaseBoundary } from "./persistence.js";
+import { pathIsWithin } from "./paths.js";
 
 export const CANONICAL_DOCUMENTS = ["AGENTS.md", "docs/SPEC-v0.1.0.md", "docs/PLAN-v0.1.0.md", "docs/HANDOFF.md"] as const;
 
@@ -64,8 +65,7 @@ export function hashCanonicalDocuments(repositoryPath: string): Record<(typeof C
       throw new KerbsFlowError("CANONICAL_PATH_INVALID", "canonical path must be repository-relative");
     }
     const candidate = realpathSync(resolve(root, path));
-    const rel = relative(root, candidate);
-    if (rel.startsWith("..") || isAbsolute(rel)) {
+    if (!pathIsWithin(root, candidate)) {
       throw new KerbsFlowError("CANONICAL_PATH_ESCAPE", `${path} resolves outside the repository`);
     }
     return [path, createHash("sha256").update(readFileSync(candidate)).digest("hex")];
