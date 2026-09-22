@@ -664,7 +664,7 @@ test("durable cancellation intent precedes signalling and dirty worktree evidenc
   }
 });
 
-for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch"] as const) {
+for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch", "filter-config"] as const) {
   test(`Phase 2 intake persists a human gate for ${intakeCase} checkout evidence without creating a worktree`, async () => {
     const repository = createGitRepository();
     const runtime = mkdtempSync(join(tmpdir(), `kerbsflow-intake-${intakeCase}-`));
@@ -678,6 +678,8 @@ for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch"] as 
         }
       } else if (intakeCase === "untracked") {
         writeFileSync(join(repository.root, "untracked.txt"), "untracked mutation\n", "utf8");
+      } else if (intakeCase === "filter-config") {
+        git(repository.root, ["config", "--local", "filter.synthetic.smudge", "true"]);
       }
       const statusBefore = git(repository.root, ["status", "--porcelain"]);
       const readmeBefore = readFileSync(join(repository.root, "README.md"), "utf8");
@@ -716,7 +718,7 @@ for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch"] as 
       const model = store.readModel(runId);
       assert.equal(model?.run.state, "HUMAN_GATE");
       assert.equal(model?.currentGate?.gate.status, "open");
-      assert.equal(model?.currentGate?.gate.reasonCode, intakeCase === "base-mismatch" ? "BASE_OID_MISMATCH" : "ORIGINAL_CHECKOUT_DIRTY");
+      assert.equal(model?.currentGate?.gate.reasonCode, intakeCase === "base-mismatch" ? "BASE_OID_MISMATCH" : intakeCase === "filter-config" ? "GIT_EXECUTABLE_CONFIG_GATE" : "ORIGINAL_CHECKOUT_DIRTY");
       assert.deepEqual(model?.currentGate?.gate.options.map((option) => option.target), ["CANCELLED", "FAILED"]);
       assert.equal(git(repository.root, ["status", "--porcelain"]), statusBefore);
       assert.equal(git(repository.root, ["rev-parse", "HEAD"]), repository.head);

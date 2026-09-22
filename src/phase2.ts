@@ -73,7 +73,8 @@ export class Phase2Loop {
       intake = this.git.intake(request.repositoryPath, request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid });
     } catch (error) {
       if (!(error instanceof KerbsFlowError)) throw error;
-      const gateable = error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH";
+      const gateable = error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH"
+        || error.code === "GIT_EXECUTABLE_CONFIG_GATE" || error.code === "GIT_CHECKOUT_FILTER_GATE";
       command = gateable
         ? this.core.gateIntake(request.runId, command.stateVersion, `${request.runId}:intake-gate`, error.code, error.message)
         : this.core.failIntake(request.runId, command.stateVersion, `${request.runId}:intake-failed`, error.code, error.message);
