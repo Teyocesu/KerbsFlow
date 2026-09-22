@@ -10,12 +10,14 @@ export function createGitRepository(): { root: string; head: string } {
   git(root, ["config", "user.email", "kerbsflow@example.invalid"]);
   writeFileSync(join(root, "README.md"), "synthetic repository\n", "utf8");
   writeFileSync(join(root, "check.mjs"), "import { readFileSync } from 'node:fs';\nif (readFileSync('result.txt', 'utf8') !== 'done\\n') process.exit(1);\n", "utf8");
+  mkdirSync(join(root, "test"));
+  writeFileSync(join(root, "test/example.test.ts"), "assert.equal(value, true);\n", "utf8");
   mkdirSync(join(root, "docs"));
   writeFileSync(join(root, "AGENTS.md"), "synthetic agent policy\n", "utf8");
   writeFileSync(join(root, "docs/SPEC-v0.1.0.md"), "synthetic frozen spec\n", "utf8");
   writeFileSync(join(root, "docs/PLAN-v0.1.0.md"), "synthetic plan\n", "utf8");
   writeFileSync(join(root, "docs/HANDOFF.md"), "synthetic handoff\n", "utf8");
-  git(root, ["add", "README.md", "check.mjs", "AGENTS.md", "docs"]);
+  git(root, ["add", "README.md", "check.mjs", "AGENTS.md", "docs", "test"]);
   git(root, ["commit", "--quiet", "-m", "initial"]);
   return { root, head: git(root, ["rev-parse", "HEAD"]) };
 }
@@ -61,14 +63,16 @@ const taskId = match("taskId");
 const attemptId = match("attemptId");
 const scenario = prompt.match(/SCENARIO=([a-z0-9-]+)/)?.[1] ?? "success";
 if (schemaPath.includes("semantic-review-result.schema.json")) {
+  const reviewOutcome = prompt.match(/REVIEW_OUTCOME=([a-z_]+)/)?.[1] ?? "supports_continuation";
+  const reviewIdentity = prompt.match(/Identity: run=(\S+) task=(\S+) attempt=(\S+) review=(\S+)/);
   writeFileSync(resultPath, JSON.stringify({
     schemaVersion: "kerbsflow.semantic-review-result/v1",
-    reviewAttemptId: match("reviewAttemptId"),
-    runId,
-    taskId,
-    attemptId,
+    reviewAttemptId: reviewIdentity?.[4] ?? match("reviewAttemptId"),
+    runId: reviewIdentity?.[1] ?? runId,
+    taskId: reviewIdentity?.[2] ?? taskId,
+    attemptId: reviewIdentity?.[3] ?? attemptId,
     reviewer: { adapter: "codex", adapterVersion: "fixture", provider: "openai", model },
-    outcome: "supports_continuation",
+    outcome: reviewOutcome,
     summary: "synthetic independent review",
     findings: [],
     evidence: [{ schemaVersion: "kerbsflow.validation/v1", id: "validation_fixture_review", kind: "review", classification: "inspected", summary: "synthetic semantic inspection" }],
@@ -89,7 +93,7 @@ const base = {
   failureClass: null,
   scopeClaim: "within_scope",
   summary: "synthetic Codex fixture completed",
-  filesChanged: scenario === "success" ? [{ path: "result.txt", change: "added" }] : [],
+  filesChanged: scenario === "success" ? [{ path: "result.txt", change: "added" }] : scenario === "semantic-review" || scenario === "deterministic-blocker" ? [{ path: "result.txt", change: "added" }, { path: "test/example.test.ts", change: "modified" }] : [],
   checks: [],
   evidence: [],
   invariantViolations: [],
@@ -125,12 +129,28 @@ if (scenario === "timeout" || scenario === "cancel-output") {
 } else if (scenario === "failure") {
   writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "implementation_failure", recommendedNext: "rework" }));
   console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "transient-failure") {
+  writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "executor_error", recommendedNext: "rework" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "invariant-failure") {
+  writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "invariant_violation", invariantViolations: ["synthetic invariant"], recommendedNext: "escalate" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
 } else if (scenario === "architecture-ambiguity") {
   writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "requirement_or_architecture_ambiguity", recommendedNext: "human_gate" }));
   console.log(JSON.stringify({ type: "turn.completed" }));
 } else if (scenario === "scope-violation") {
   writeFileSync("README.md", "out of scope\\n");
   writeFileSync(resultPath, JSON.stringify({ ...base, filesChanged: [{ path: "README.md", change: "modified" }], scopeClaim: "violated", outcome: "failed", failureClass: "scope_violation", recommendedNext: "human_gate" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "semantic-review") {
+  writeFileSync("result.txt", "done\\n");
+  writeFileSync("test/example.test.ts", "const value = true;\\n");
+  writeFileSync(resultPath, JSON.stringify(base));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "deterministic-blocker") {
+  writeFileSync("result.txt", "done\\n");
+  writeFileSync("test/example.test.ts", "test.skip('disabled', () => {});\\n");
+  writeFileSync(resultPath, JSON.stringify(base));
   console.log(JSON.stringify({ type: "turn.completed" }));
 } else if (scenario === "gate") {
   writeFileSync(resultPath, JSON.stringify({

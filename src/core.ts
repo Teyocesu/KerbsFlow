@@ -8,6 +8,7 @@ import {
   CommandResult,
   CONTRACT_VERSIONS,
   ExecutorResult,
+  FailureClassification,
   HumanGate,
   JsonValue,
   ReviewDecision,
@@ -700,6 +701,96 @@ export class KerbsFlowCore {
     });
   }
 
+  gateMissingPhaseValidation(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", { reasonCode: "phase_validation_plan_missing" });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (run.state !== "VERIFY_PHASE" || run.currentTaskId === null || run.activeAttemptId === null) {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", "missing phase validation can only gate a current VERIFY_PHASE attempt");
+      }
+      const gate: HumanGate = {
+        schemaVersion: CONTRACT_VERSIONS.humanGate,
+        gateId: asGateId(nextId("gate")),
+        runId,
+        taskId: run.currentTaskId,
+        attemptId: run.activeAttemptId,
+        reasonCode: "phase_validation_plan_missing",
+        summary: "an explicit phase-level validation command is required before phase closure",
+        evidenceRefs: [],
+        options: [
+          { id: "rework", label: "Provide phase validation", consequence: "Return to bounded rework without promoting focused evidence.", target: "REWORK" },
+          { id: "fail", label: "Fail conservatively", consequence: "Stop without closing the phase.", target: "FAILED" },
+        ],
+        status: "open",
+      };
+      this.insertGate(tx, gate, now);
+      return {
+        transition: { to: "HUMAN_GATE", actor: "verifier", reasonCode: gate.reasonCode, taskId: run.currentTaskId, attemptId: run.activeAttemptId, gateId: gate.gateId },
+        runPatch: { currentGateId: gate.gateId, recoveryRequired: false, recoveryReason: null },
+        details: { gateId: gate.gateId, reasonCode: gate.reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
+  applyPhaseFailurePolicy(runId: RunId, expectedStateVersion: number, idempotencyKey: string, fingerprint: string): CommandResult {
+    const model = this.store.readModel(runId);
+    if (model?.run.currentTaskId === null || model?.run.activeAttemptId === null || model?.run.currentTaskId === undefined || model.run.activeAttemptId === undefined) {
+      throw new KerbsFlowError("FAILURE_POLICY_SCOPE_MISMATCH", "phase failure policy requires a current task and attempt");
+    }
+    const policy = this.store.getFailureOccurrenceForAttempt(runId, model.run.currentTaskId, model.run.activeAttemptId, fingerprint);
+    if (policy === undefined || policy.attemptId === null) {
+      throw new KerbsFlowError("FAILURE_POLICY_REQUIRED", "phase failure transition requires the persisted policy decision for the current attempt");
+    }
+    const attemptId = policy.attemptId;
+    const target = policy.resultingAction === "retry_same_route" || policy.resultingAction === "rework" || policy.resultingAction === "escalate"
+      ? "REWORK"
+      : policy.resultingAction === "failed" ? "FAILED" : "HUMAN_GATE";
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", { fingerprint, action: policy.resultingAction });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (run.state !== "VERIFY_PHASE" || run.currentTaskId !== policy.taskId || run.activeAttemptId !== attemptId) {
+        throw new KerbsFlowError("FAILURE_POLICY_SCOPE_MISMATCH", "persisted phase failure policy is stale for the current run/task/attempt");
+      }
+      const reviewId = asReviewId(nextId("review"));
+      const reasonCode = policy.escalationReason ?? policy.resultingAction;
+      const decision: ReviewDecision = {
+        schemaVersion: CONTRACT_VERSIONS.reviewDecision,
+        reviewId,
+        runId,
+        taskId: policy.taskId,
+        outcome: target === "REWORK" ? "rework" : target === "FAILED" ? "failed" : "human_gate",
+        failureClass: policy.failureClass as FailureClassification,
+        summary: `phase failure policy selected ${policy.resultingAction}`,
+        evidenceRefs: [],
+        reasonCode,
+      };
+      tx.run("INSERT INTO reviews (review_id, run_id, task_id, outcome, decision_json, created_at) VALUES (?, ?, ?, ?, ?, ?)", reviewId, runId, policy.taskId, decision.outcome, JSON.stringify(decision), now);
+      let gate: HumanGate | undefined;
+      if (target === "HUMAN_GATE") {
+        const createdGate: HumanGate = {
+          schemaVersion: CONTRACT_VERSIONS.humanGate,
+          gateId: asGateId(nextId("gate")),
+          runId,
+          taskId: policy.taskId,
+          attemptId,
+          reasonCode,
+          summary: "phase failure policy requires human review",
+          evidenceRefs: [],
+          options: [
+            { id: "rework", label: "Bounded rework", consequence: "Continue only after human review without changing approved scope.", target: "REWORK" },
+            { id: "fail", label: "Fail", consequence: "Stop and preserve evidence.", target: "FAILED" },
+          ],
+          status: "open",
+        };
+        gate = createdGate;
+        this.insertGate(tx, createdGate, now);
+      }
+      return {
+        transition: { to: target, actor: "verifier", reasonCode, taskId: policy.taskId, attemptId, gateId: gate?.gateId ?? null, payload: { fingerprint, action: policy.resultingAction, reviewId } },
+        runPatch: { currentGateId: gate?.gateId ?? null, recoveryRequired: false, recoveryReason: null },
+        details: { action: policy.resultingAction, reviewId, ...(gate === undefined ? {} : { gateId: gate.gateId }) },
+      } satisfies CommandMutation;
+    });
+  }
+
   completePhase(runId: RunId, expectedStateVersion: number, idempotencyKey: string, target: "PLAN" | "FINAL_VERIFY"): CommandResult {
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", { target });
     return this.store.executeCommand(command, ({ run }) => {
@@ -719,13 +810,20 @@ export class KerbsFlowCore {
     });
   }
 
-  reworkToReady(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
-    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "READY", "core", "rework_action_ready", { target: "READY" });
+  reworkToReady(runId: RunId, expectedStateVersion: number, idempotencyKey: string, routeDecision?: unknown): CommandResult {
+    const decision = routeDecision === undefined ? undefined : parsePlanningDecision(routeDecision);
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "READY", "core", "rework_action_ready", { target: "READY", ...(decision === undefined ? {} : { route: decision.route }) });
     return this.store.executeCommand(command, ({ tx, run, now }) => {
       if (run.state !== "REWORK" || run.currentTaskId === null) {
         throw new KerbsFlowError("INVALID_COMMAND_STATE", "rework readiness requires REWORK with a current task");
       }
-      tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", "ready", now, run.currentTaskId);
+      const task = this.taskInTransaction(tx, run.currentTaskId);
+      if (decision !== undefined) {
+        if (decision.runId !== runId || decision.taskId !== task.taskId || canonicalJson({ ...decision, route: task.decision.route }) !== canonicalJson(task.decision)) {
+          throw new KerbsFlowError("ESCALATION_SCOPE_MISMATCH", "rework escalation may change only adapter/model/reasoning route metadata");
+        }
+      }
+      tx.run("UPDATE tasks SET status = ?, decision_json = ?, updated_at = ? WHERE task_id = ?", "ready", JSON.stringify(decision ?? task.decision), now, run.currentTaskId);
       return {
         transition: { to: "READY", actor: "core", reasonCode: "rework_action_ready", taskId: run.currentTaskId, payload: { target: "READY" } },
         runPatch: { recoveryRequired: false, recoveryReason: null },

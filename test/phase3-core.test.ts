@@ -1,6 +1,5 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,6 +12,8 @@ import {
   asTaskId,
   asValidationId,
   parseExecutorResult,
+  type SemanticReviewRequest,
+  type SemanticReviewHandle,
 } from "../src/contracts.js";
 import { FailurePolicyCoordinator } from "../src/phase3.js";
 import { StateStore } from "../src/persistence.js";
@@ -20,6 +21,8 @@ import { GitWorktreeManager } from "../src/git.js";
 import { FocusedVerifier } from "../src/verifier.js";
 import { ProcessSupervisor } from "../src/process.js";
 import { CanonicalIntentGuard } from "../src/canonical.js";
+import type { SemanticReviewAdapter } from "../src/adapter.js";
+import { IndependentSemanticReviewer } from "../src/reviewer.js";
 import { createFixture, primeExecute, reviewFor, validationFor } from "./helpers.js";
 
 test("trusted phase-close path requires current phase evidence and reaches NEXT_PHASE", async () => {
@@ -258,23 +261,6 @@ test("trusted phase close can consume the exact persisted independent review res
     assert.ok(attemptId);
     const reviewAttemptId = asReviewId("review_persisted");
     const reviewedDiff = authority.inspection.diff;
-    fixture.store.prepareSemanticReview({
-      schemaVersion: CONTRACT_VERSIONS.semanticReviewRequest,
-      reviewAttemptId,
-      runId: fixture.runId,
-      taskId: fixture.taskId,
-      attemptId,
-      role: "review",
-      workingDirectory: "/synthetic/worktree",
-      promptSummary: "inspect the assertion removal without changing files",
-      model: "review-model",
-      permissionPolicy: { filesystem: "read_only", network: "denied" },
-      canonicalContextHash: fixture.decision.canonicalContextHash,
-      diffHash: createHash("sha256").update(reviewedDiff).digest("hex"),
-      validationIds: [authority.validationId],
-      expectedResultSchema: CONTRACT_VERSIONS.semanticReviewResult,
-    });
-    fixture.store.markSemanticReviewRunning(reviewAttemptId, { providerSessionId: "fresh-review-session" });
     const semanticReview = {
       schemaVersion: CONTRACT_VERSIONS.semanticReviewResult,
       reviewAttemptId,
@@ -289,7 +275,26 @@ test("trusted phase close can consume the exact persisted independent review res
       scopeConcerns: [],
       invariantViolations: [],
     } as const;
-    fixture.store.completeSemanticReview(reviewAttemptId, semanticReview);
+    const adapter: SemanticReviewAdapter = {
+      probeReview: () => fixture.adapter.probe(),
+      startReview: (request: SemanticReviewRequest): SemanticReviewHandle => ({ schemaVersion: CONTRACT_VERSIONS.semanticReviewHandle, reviewAttemptId: request.reviewAttemptId, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId, providerSessionId: "fresh-review-session" }),
+      async *reviewEvents(_handle: SemanticReviewHandle) {},
+      waitReview: async (_handle: SemanticReviewHandle) => semanticReview,
+      cancelReview: (_handle: SemanticReviewHandle, reason: string) => ({ outcome: "cancelled", summary: reason }),
+    };
+    await new IndependentSemanticReviewer(fixture.store, adapter, authority.manager).review({
+      reviewAttemptId,
+      runId: fixture.runId,
+      taskId: fixture.taskId,
+      attemptId,
+      worktree: authority.worktree,
+      model: "review-model",
+      canonicalContextHash: fixture.decision.canonicalContextHash,
+      canonicalContract: "synthetic canonical contract",
+      diff: reviewedDiff,
+      validation: fixture.store.getValidation(authority.validationId)!.bundle,
+      evidenceRefs: [],
+    });
 
     const closed = fixture.core.completeTrustedPhaseValidation(fixture.runId, 7, "phase3:persisted-review", {
       validationId: authority.validationId,
@@ -316,7 +321,7 @@ async function reachVerifyPhase(fixture: ReturnType<typeof createFixture>): Prom
 async function recordAuthoritativePhase(
   fixture: ReturnType<typeof createFixture>,
   mutate?: (worktreePath: string) => void,
-): Promise<{ validationId: ReturnType<typeof asValidationId>; inspection: ReturnType<GitWorktreeManager["inspect"]>; repository: { root: string }; worktreePath: string }> {
+): Promise<{ validationId: ReturnType<typeof asValidationId>; inspection: ReturnType<GitWorktreeManager["inspect"]>; repository: { root: string }; worktreePath: string; worktree: ReturnType<GitWorktreeManager["create"]>; manager: GitWorktreeManager }> {
   const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
   assert.ok(attemptId);
   const repositoryPath = join(fixture.root, "canonical-repository");
@@ -354,8 +359,8 @@ async function recordAuthoritativePhase(
     worktree,
     fixture.decision,
     result,
-    { name: "phase gate", executable: process.execPath, args: ["-e", "process.exit(0)"], timeoutMs: 5000 },
+    { level: "phase", commandId: "phase-gate", name: "phase gate", executable: process.execPath, args: ["-e", "process.exit(0)"], timeoutMs: 5000 },
   );
   fixture.store.recordAuthoritativePhaseValidation(phase.authoritative);
-  return { validationId: phase.authoritative.bundle.validationId, inspection: phase.verification.inspection, repository: { root: repositoryPath }, worktreePath: worktree.path };
+  return { validationId: phase.authoritative.bundle.validationId, inspection: phase.verification.inspection, repository: { root: repositoryPath }, worktreePath: worktree.path, worktree, manager };
 }

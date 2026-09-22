@@ -9,13 +9,14 @@ import {
   type RunId,
   type SemanticReviewRequest,
   type SemanticReviewResult,
+  type SemanticReviewHandle,
   type TaskId,
   type ValidationBundle,
   parseSemanticReviewResult,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
 import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
-import { StateStore } from "./persistence.js";
+import type { StateStore } from "./persistence.js";
 import { containsLikelySecret } from "./secrets.js";
 
 export interface SemanticReviewInput {
@@ -38,6 +39,20 @@ export type ReviewerRecoveryDisposition =
   | { disposition: "exact_result"; result: SemanticReviewResult }
   | { disposition: "human_gate"; reason: string }
   | { disposition: "failed"; reason: string };
+
+const REVIEW_DISPATCH_AUTHORITY = Symbol("kerbsflow.review-dispatch-authority");
+const REVIEW_DISPATCHES = new WeakSet<object>();
+
+export type ReviewDispatchAuthority = {
+  handle: SemanticReviewHandle;
+  readonly [REVIEW_DISPATCH_AUTHORITY]: true;
+};
+
+export function assertReviewDispatchAuthority(value: unknown): asserts value is ReviewDispatchAuthority {
+  if (value === null || typeof value !== "object" || !REVIEW_DISPATCHES.has(value)) {
+    throw new KerbsFlowError("REVIEW_DISPATCH_AUTHORITY_REQUIRED", "semantic review RUNNING state requires authority minted by the trusted reviewer after dispatch");
+  }
+}
 
 export class IndependentSemanticReviewer {
   constructor(
@@ -74,7 +89,7 @@ export class IndependentSemanticReviewer {
       if (input.implementerProviderSessionId !== undefined && handle.providerSessionId === input.implementerProviderSessionId) {
         throw new KerbsFlowError("REVIEW_NOT_INDEPENDENT", "semantic reviewer reused the implementation provider session");
       }
-      this.store.markSemanticReviewRunning(input.reviewAttemptId, handle as unknown as Record<string, string>);
+      this.store.markSemanticReviewRunning(mintReviewDispatchAuthority(handle));
       for await (const _event of this.adapter.reviewEvents(handle)) {
         // Events are bounded adapter evidence; the structured terminal result remains authoritative input.
       }
@@ -115,6 +130,12 @@ export class IndependentSemanticReviewer {
     }
     return { disposition: "failed", reason: attempt.failureSummary ?? "semantic reviewer failed" };
   }
+}
+
+function mintReviewDispatchAuthority(handle: SemanticReviewHandle): ReviewDispatchAuthority {
+  const authority = Object.freeze({ handle: Object.freeze({ ...handle }), [REVIEW_DISPATCH_AUTHORITY]: true }) as ReviewDispatchAuthority;
+  REVIEW_DISPATCHES.add(authority);
+  return authority;
 }
 
 export function buildSemanticReviewPrompt(input: SemanticReviewInput): string {

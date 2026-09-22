@@ -50,6 +50,7 @@ import { assertLegalTransition } from "./state-machine.js";
 import { DatabaseIntegrityError, IdempotencyConflictError, KerbsFlowError, NotFoundError, StateVersionConflictError } from "./errors.js";
 import { containsLikelySecret, SENSITIVE_RESULT_REJECTION } from "./secrets.js";
 import { assertAuthoritativePhaseValidation, type AuthoritativePhaseValidation, type PhaseValidationBinding } from "./verifier.js";
+import { assertReviewDispatchAuthority, type ReviewDispatchAuthority } from "./reviewer.js";
 
 export type SqlValue = string | number | bigint | Uint8Array | null;
 
@@ -314,6 +315,14 @@ export const MIGRATIONS: readonly Migration[] = [
         changed_paths_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       ) STRICT;
+    `,
+  },
+  {
+    version: 6,
+    name: "phase3-phase-command-authority",
+    sql: `
+      ALTER TABLE phase_validation_authority ADD COLUMN command_id TEXT NOT NULL DEFAULT 'legacy_unbound';
+      ALTER TABLE phase_validation_authority ADD COLUMN command_hash TEXT NOT NULL DEFAULT 'legacy_unbound';
     `,
   },
 ];
@@ -660,7 +669,7 @@ export class StateStore {
       }
       const now = this.clock.now();
       tx.run("INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, bundle.runId, bundle.taskId, bundle.attemptId ?? null, bundle.level, bundle.outcome, JSON.stringify(bundle), now);
-      tx.run("INSERT INTO phase_validation_authority (validation_id, worktree_path, worktree_git_directory, base_oid, diff_hash, changed_paths_hash, changed_paths_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, value.binding.worktreePath, value.binding.worktreeGitDirectory, value.binding.baseOid, value.binding.diffHash, value.binding.changedPathsHash, JSON.stringify(value.binding.changedPaths), now);
+      tx.run("INSERT INTO phase_validation_authority (validation_id, worktree_path, worktree_git_directory, base_oid, diff_hash, changed_paths_hash, changed_paths_json, created_at, command_id, command_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, value.binding.worktreePath, value.binding.worktreeGitDirectory, value.binding.baseOid, value.binding.diffHash, value.binding.changedPathsHash, JSON.stringify(value.binding.changedPaths), now, value.binding.commandId, value.binding.commandHash);
       return parseValidationRow(tx.get("SELECT * FROM validations WHERE validation_id = ?", bundle.validationId)!);
     });
   }
@@ -741,25 +750,30 @@ export class StateStore {
     });
   }
 
-  markSemanticReviewRunning(reviewAttemptId: ReviewId, providerIdentity: JsonValue): StoredSemanticReviewAttempt {
+  markSemanticReviewRunning(authority: ReviewDispatchAuthority): StoredSemanticReviewAttempt {
     this.assertOpen();
-    if (!hasProviderIdentity(providerIdentity)) {
+    assertReviewDispatchAuthority(authority);
+    const { handle } = authority;
+    if (!hasProviderIdentity(handle)) {
       throw new KerbsFlowError("REVIEW_PROVIDER_IDENTITY_REQUIRED", "semantic review dispatch requires a persisted provider session or process identity");
     }
     return this.withTransaction((tx) => {
-      const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+      const review = this.requiredSemanticReviewInTransaction(tx, handle.reviewAttemptId);
       if (review.lifecycle !== "PREPARED") {
-        throw new KerbsFlowError("REVIEW_NOT_PREPARED", `review attempt ${reviewAttemptId} is ${review.lifecycle}`);
+        throw new KerbsFlowError("REVIEW_NOT_PREPARED", `review attempt ${handle.reviewAttemptId} is ${review.lifecycle}`);
+      }
+      if (handle.runId !== review.runId || handle.taskId !== review.taskId || handle.attemptId !== review.attemptId) {
+        throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "review dispatch authority does not match the persisted request scope");
       }
       const now = this.clock.now();
       tx.run(
         "UPDATE semantic_review_attempts SET lifecycle = 'RUNNING', provider_identity_json = ?, started_at = ?, updated_at = ? WHERE review_attempt_id = ?",
-        JSON.stringify(providerIdentity),
+        JSON.stringify(handle),
         now,
         now,
-        reviewAttemptId,
+        handle.reviewAttemptId,
       );
-      return this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
+      return this.requiredSemanticReviewInTransaction(tx, handle.reviewAttemptId);
     });
   }
 
@@ -823,6 +837,11 @@ export class StateStore {
     return row === undefined ? undefined : parseSemanticReviewAttemptRow(row);
   }
 
+  listSemanticReviewAttempts(runId: RunId): StoredSemanticReviewAttempt[] {
+    this.assertOpen();
+    return (this.db.prepare("SELECT * FROM semantic_review_attempts WHERE run_id = ? ORDER BY created_at, review_attempt_id").all(runId) as Row[]).map(parseSemanticReviewAttemptRow);
+  }
+
   recordFailureOccurrence(input: Omit<StoredFailureOccurrence, "occurrence" | "createdAt">): StoredFailureOccurrence {
     this.assertOpen();
     return this.withTransaction((tx) => {
@@ -868,6 +887,18 @@ export class StateStore {
     this.assertOpen();
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE run_id = ? AND task_id = ?").get(runId, taskId) as Row | undefined;
     return numberValue(row?.count ?? 0, "attempts.count");
+  }
+
+  listTaskAttempts(runId: RunId, taskId: TaskId): StoredAttempt[] {
+    this.assertOpen();
+    const rows = this.db.prepare("SELECT * FROM attempts WHERE run_id = ? AND task_id = ? ORDER BY created_at, attempt_id").all(runId, taskId) as Row[];
+    return rows.map(parseAttemptRow);
+  }
+
+  listTransitions(runId: RunId): StoredTransition[] {
+    this.assertOpen();
+    const rows = this.db.prepare("SELECT * FROM transitions WHERE run_id = ? ORDER BY sequence").all(runId) as Row[];
+    return rows.map(parseTransitionRow);
   }
 
   hasFailureEscalation(runId: RunId, taskId: TaskId): boolean {
@@ -1574,6 +1605,8 @@ function parsePhaseValidationAuthorityRow(row: Row): StoredPhaseValidationAuthor
     diffHash: stringValue(row.diff_hash, "phase_validation_authority.diff_hash"),
     changedPathsHash: stringValue(row.changed_paths_hash, "phase_validation_authority.changed_paths_hash"),
     changedPaths,
+    commandId: stringValue(row.command_id, "phase_validation_authority.command_id"),
+    commandHash: stringValue(row.command_hash, "phase_validation_authority.command_hash"),
     createdAt: stringValue(row.created_at, "phase_validation_authority.created_at"),
   };
 }

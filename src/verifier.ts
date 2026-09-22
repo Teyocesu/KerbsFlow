@@ -6,12 +6,18 @@ import { GitWorktreeManager, type RepositoryIntake, type RepositorySnapshot, typ
 import { ProcessSupervisor, codexEnvironment, type ProcessResult } from "./process.js";
 import type { IdSource } from "./runtime.js";
 import { detectAntiGreenwashing, type AntiGreenwashingSignal } from "./anti-greenwashing.js";
+import { KerbsFlowError } from "./errors.js";
 
 export interface FocusedCheckCommand {
   name: string;
   executable: string;
   args: string[];
   timeoutMs: number;
+}
+
+export interface PhaseCheckCommand extends FocusedCheckCommand {
+  level: "phase";
+  commandId: string;
 }
 
 export interface FocusedVerificationResult {
@@ -32,6 +38,8 @@ export interface PhaseValidationBinding {
   diffHash: string;
   changedPathsHash: string;
   changedPaths: string[];
+  commandId: string;
+  commandHash: string;
 }
 
 const PHASE_AUTHORITY = Symbol("kerbsflow.phase-verifier-authority");
@@ -71,12 +79,15 @@ export class FocusedVerifier {
     worktree: WorktreeRecord,
     decision: PlanningDecision,
     executorResult: ExecutorResult,
-    command: FocusedCheckCommand,
+    command: PhaseCheckCommand,
   ): Promise<{ verification: FocusedVerificationResult; authoritative: AuthoritativePhaseValidation }> {
+    if (command.level !== "phase" || typeof command.commandId !== "string" || command.commandId.trim().length === 0) {
+      throw new KerbsFlowError("PHASE_CHECK_AUTHORITY_REQUIRED", "phase verification requires an explicit phase command identity; focused check configuration cannot be promoted");
+    }
     const verification = await this.verifyAtLevel("phase", intake, worktree, decision, executorResult, command);
     const authoritative = deepFreeze({
       bundle: verification.bundle,
-      binding: bindingFor(worktree, verification.inspection),
+      binding: phaseBindingFor(worktree, verification.inspection, command),
       [PHASE_AUTHORITY]: true,
     }) as AuthoritativePhaseValidation;
     AUTHORITATIVE_PHASE_RECORDS.add(authoritative);
@@ -107,6 +118,7 @@ export class FocusedVerifier {
     const originalUnchanged = originalMatchesIntake(originalAfter, intake);
     const scopeViolations = inspection.changedPaths.filter((path) => !isWithinPositiveScope(path, decision.action.positiveScope) || isWithinNegativeScope(path, decision.action.negativeScope));
     const suspiciousSignals = detectAntiGreenwashing(inspection.diff, inspection.changedPaths);
+    const blockingSignals = suspiciousSignals.filter((signal) => signal.blocksPass);
     const executorDisagreements = compareExecutorClaims(executorResult, preCheckInspection.changedPaths, checkResult);
     const verifierMutations = compareVerificationSnapshots(originalBefore, originalAfter, preCheckInspection, inspection);
     const checkPassed = checkResult.exitKind === "normal" && checkResult.exitCode === 0;
@@ -114,12 +126,12 @@ export class FocusedVerifier {
       && inspection.baseOid === intake.baseOid
       && checkPassed
       && scopeViolations.length === 0
-      && suspiciousSignals.length === 0
+      && blockingSignals.length === 0
       && executorDisagreements.length === 0
       && verifierMutations.length === 0;
     const evidence: ValidationEvidence[] = [
       this.evidence("diff", "inspected", `Git independently reported ${inspection.changedPaths.length} changed path(s) from base ${intake.baseOid}`),
-      this.evidence("check", "automatically_tested", `${command.name} exited as ${checkResult.exitKind} code ${String(checkResult.exitCode)}`),
+      this.evidence("command", "automatically_tested", `${level === "phase" ? `${(command as PhaseCheckCommand).commandId}: ` : ""}${command.name} exited as ${checkResult.exitKind} code ${String(checkResult.exitCode)}`),
       this.evidence("review", "inspected", suspiciousSignals.length === 0 ? "anti-greenwashing scan found no suspicious signal" : `anti-greenwashing signals: ${suspiciousSignals.map((signal) => signal.code).join("; ")}`),
       this.evidence("other", "inspected", originalUnchanged ? "original checkout remains clean at the recorded base" : "original checkout no longer matches the clean recorded base"),
       this.evidence("other", "inspected", verifierMutations.length === 0 ? "focused check did not mutate managed Git evidence" : `focused-check mutations: ${verifierMutations.join("; ")}`),
@@ -127,8 +139,8 @@ export class FocusedVerifier {
     const checks: ValidationCheck[] = [
       { name: "original checkout invariant", outcome: originalUnchanged ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[3]!.id] },
       { name: "Git base and scope", outcome: inspection.baseOid === intake.baseOid && scopeViolations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[0]!.id] },
-      { name: command.name, outcome: checkPassed ? "passed" : "failed", evidenceClass: "automatically_tested", evidenceRefs: [], evidenceIds: [evidence[1]!.id] },
-      { name: "anti-greenwashing heuristic", outcome: suspiciousSignals.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[2]!.id] },
+      { name: level === "phase" ? `${(command as PhaseCheckCommand).commandId}: ${command.name}` : command.name, outcome: checkPassed ? "passed" : "failed", evidenceClass: "automatically_tested", evidenceRefs: [], evidenceIds: [evidence[1]!.id] },
+      { name: "anti-greenwashing deterministic blockers", outcome: blockingSignals.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[2]!.id] },
       { name: "executor claim comparison", outcome: executorDisagreements.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[0]!.id] },
       { name: "focused-check evidence integrity", outcome: verifierMutations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[4]!.id] },
     ];
@@ -167,7 +179,7 @@ export class FocusedVerifier {
   }
 }
 
-export function bindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection): PhaseValidationBinding {
+export function bindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection): Omit<PhaseValidationBinding, "commandId" | "commandHash"> {
   return {
     worktreePath: worktree.path,
     worktreeGitDirectory: worktree.worktreeGitDirectory,
@@ -175,6 +187,14 @@ export function bindingFor(worktree: WorktreeRecord, inspection: WorktreeInspect
     diffHash: createHash("sha256").update(inspection.diff).digest("hex"),
     changedPathsHash: createHash("sha256").update(JSON.stringify(inspection.changedPaths)).digest("hex"),
     changedPaths: inspection.changedPaths,
+  };
+}
+
+function phaseBindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection, command: PhaseCheckCommand): PhaseValidationBinding {
+  return {
+    ...bindingFor(worktree, inspection),
+    commandId: command.commandId,
+    commandHash: createHash("sha256").update(JSON.stringify(command)).digest("hex"),
   };
 }
 

@@ -12,18 +12,23 @@ import {
   DEFAULT_RUN_OVERRIDE,
   DEFAULT_USER_PREFERENCES,
   type ExecutorResult,
+  type SemanticReviewHandle,
+  type SemanticReviewRequest,
   asAttemptId,
   asRunId,
   asTaskId,
+  asValidationId,
 } from "../src/contracts.js";
+import type { SemanticReviewAdapter } from "../src/adapter.js";
 import { KerbsFlowCore } from "../src/core.js";
 import { GitWorktreeManager } from "../src/git.js";
-import { Phase2Loop } from "../src/phase2.js";
+import { Phase2Loop, type Phase2LoopRequest } from "../src/phase2.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { StateStore } from "../src/persistence.js";
 import { ProcessSupervisor } from "../src/process.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { FocusedVerifier } from "../src/verifier.js";
+import { IndependentSemanticReviewer } from "../src/reviewer.js";
 import { createFakeCodex, createGitRepository, git } from "./phase2-helpers.js";
 import { createFixture, primeExecute } from "./helpers.js";
 
@@ -163,6 +168,21 @@ test("focused verification fails closed when the check mutates the original chec
   }
 });
 
+test("a focused command cannot be promoted by calling the phase verifier", async () => {
+  const fixture = verificationFixture("focused_promotion");
+  try {
+    await assert.rejects(() => fixture.verifier.verifyPhase(
+      fixture.intake,
+      fixture.worktree,
+      fixture.decision,
+      fixture.executorResult,
+      { name: "focused only", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 } as never,
+    ), /explicit phase command identity/);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("synthetic real vertical loop writes only the owned worktree and passes independent verification", async () => {
   const repository = createGitRepository();
   const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-phase2-"));
@@ -204,6 +224,7 @@ test("synthetic real vertical loop writes only the owned worktree and passes ind
       expectedBaseOid: repository.head,
       planningDecision: decision,
       focusedCheck: { name: "synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      phaseCheck: { level: "phase", commandId: "phase-synthetic-content", name: "phase synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
       executionTimeoutMs: 5000,
     });
     assert.equal(result.verdict, "PASS");
@@ -216,11 +237,267 @@ test("synthetic real vertical loop writes only the owned worktree and passes ind
     assert.deepEqual(result.verification?.inspection.changedPaths, ["result.txt"]);
     assert.ok(result.worktree);
     assert.equal(store.getWorktree(runId)?.worktreePath, result.worktree.path);
+    const authority = store.getPhaseValidationAuthority(result.verification!.bundle.validationId);
+    assert.equal(authority?.commandId, "phase-synthetic-content");
+    assert.match(authority?.commandHash ?? "", /^[a-f0-9]{64}$/);
+    assert.match(result.verification?.bundle.evidence.find((evidence) => evidence.kind === "command")?.summary ?? "", /phase-synthetic-content/);
     assert.match(store.readModel(runId)?.activeAttempt?.providerIdentityJson ?? "", /process:.*:thread:fixture-thread/);
   } finally {
     store.close();
     rmSync(runtime, { recursive: true, force: true });
     rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
+test("focused evidence alone cannot close a phase without an explicit phase command", async () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-missing-phase-"));
+  const ids = new SequenceIdSource("missing_phase");
+  const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
+  try {
+    const adapter = new CodexAdapter({ cliPath: createFakeCodex(runtime), runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+    const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+    const runId = asRunId("run_missing_phase");
+    const taskId = asTaskId("task_missing_phase");
+    const decision = createPhase2PlanningDecision({ decisionId: "decision_missing_phase", runId, taskId, objective: "SCENARIO=success", acceptance: ["explicit phase gate required"], positiveScope: ["result.txt"], negativeScope: ["README.md"], model: "fixture-model", canonicalContext: "missing phase" });
+    const result = await new Phase2Loop(codexCore(store, adapter, ids), store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids).run({
+      runId,
+      taskId,
+      objective: "missing phase validation",
+      repositoryPath: repository.root,
+      planningDecision: decision,
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      executionTimeoutMs: 5000,
+    });
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(store.getRun(runId)?.state, "HUMAN_GATE");
+    assert.equal(store.readModel(runId)?.currentGate?.gate.reasonCode, "phase_validation_plan_missing");
+    assert.equal(store.readModel(runId)?.latestValidation?.level, "focused");
+  } finally {
+    store.close();
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
+test("phase-command failure stays phase-scoped and cannot inherit focused success", async () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-phase-failure-"));
+  const ids = new SequenceIdSource("phase_failure");
+  const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
+  try {
+    const adapter = new CodexAdapter({ cliPath: createFakeCodex(runtime), runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+    const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+    const runId = asRunId("run_phase_failure");
+    const taskId = asTaskId("task_phase_failure");
+    const decision = createPhase2PlanningDecision({ decisionId: "decision_phase_failure", runId, taskId, objective: "SCENARIO=success", acceptance: ["phase command must pass"], positiveScope: ["result.txt"], negativeScope: ["README.md"], model: "fixture-model", canonicalContext: "phase failure" });
+    const result = await new Phase2Loop(codexCore(store, adapter, ids), store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids).run({
+      runId,
+      taskId,
+      objective: "phase command failure",
+      repositoryPath: repository.root,
+      planningDecision: decision,
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      phaseCheck: { level: "phase", commandId: "phase-always-fails", name: "phase failure", executable: process.execPath, args: ["-e", "process.exit(7)"], timeoutMs: 5000 },
+      executionTimeoutMs: 5000,
+    });
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(result.attempts, 2);
+    const failures = store.listFailureOccurrences(runId, taskId);
+    assert.equal(failures.length, 2);
+    assert.ok(failures.every((entry) => JSON.parse(entry.normalizedJson).category === "phase_verification"));
+    assert.match(store.readModel(runId)?.latestValidation?.bundle.checks.find((check) => check.name.includes("phase-always-fails"))?.name ?? "", /phase-always-fails/);
+  } finally {
+    store.close();
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
+for (const semantic of [
+  { outcome: "supports_continuation", verdict: "PASS", state: "NEXT_PHASE" },
+  { outcome: "rework_required", verdict: "REWORK", state: "REWORK" },
+  { outcome: "evidence_insufficient", verdict: "HUMAN_GATE", state: "HUMAN_GATE" },
+] as const) {
+  test(`real semantic-review path maps ${semantic.outcome} to ${semantic.state}`, async () => {
+    const repository = createGitRepository();
+    const runtime = mkdtempSync(join(tmpdir(), `kerbsflow-semantic-${semantic.outcome}-`));
+    const ids = new SequenceIdSource(`semantic_${semantic.outcome}`);
+    const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
+    try {
+      const adapter = new CodexAdapter({ cliPath: createFakeCodex(runtime), runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+      const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+      const core = codexCore(store, adapter, ids);
+      const runId = asRunId(`run_semantic_${semantic.outcome}`);
+      const taskId = asTaskId(`task_semantic_${semantic.outcome}`);
+      const decision = createPhase2PlanningDecision({
+        decisionId: `decision_semantic_${semantic.outcome}`,
+        runId,
+        taskId,
+        objective: "SCENARIO=semantic-review exercise semantic review",
+        acceptance: ["result remains independently reviewable"],
+        positiveScope: ["result.txt", "test/example.test.ts"],
+        negativeScope: ["README.md"],
+        model: "fixture-model",
+        canonicalContext: `semantic-${semantic.outcome}`,
+      });
+      let reviewRequest: SemanticReviewRequest | undefined;
+      const reviewAdapter: SemanticReviewAdapter = {
+        probeReview: () => adapter.probe(),
+        startReview: (request) => {
+          reviewRequest = request;
+          return { schemaVersion: CONTRACT_VERSIONS.semanticReviewHandle, reviewAttemptId: request.reviewAttemptId, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId, providerSessionId: `review-${semantic.outcome}` };
+        },
+        async *reviewEvents(_handle: SemanticReviewHandle) {},
+        waitReview: async (_handle) => {
+          assert.ok(reviewRequest);
+          return {
+            schemaVersion: CONTRACT_VERSIONS.semanticReviewResult,
+            reviewAttemptId: reviewRequest.reviewAttemptId,
+            runId: reviewRequest.runId,
+            taskId: reviewRequest.taskId,
+            attemptId: reviewRequest.attemptId,
+            reviewer: { adapter: "fake-review", adapterVersion: "1", provider: "synthetic", model: reviewRequest.model },
+            outcome: semantic.outcome,
+            summary: `synthetic ${semantic.outcome}`,
+            findings: [],
+            evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(`validation_review_${semantic.outcome}`), kind: "review", classification: "inspected", summary: "semantic inspection" }],
+            scopeConcerns: [],
+            invariantViolations: [],
+          };
+        },
+        cancelReview: (_handle, reason) => ({ outcome: "cancelled", summary: reason }),
+      };
+      const reviewer = new IndependentSemanticReviewer(store, reviewAdapter, gitManager);
+      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids, reviewer);
+      const result = await loop.run({
+        runId,
+        taskId,
+        objective: `semantic ${semantic.outcome}`,
+        repositoryPath: repository.root,
+        planningDecision: decision,
+        focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+        phaseCheck: { level: "phase", commandId: "phase-semantic", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+        executionTimeoutMs: 5000,
+        semanticReview: { model: "fixture-review", canonicalContract: "synthetic canonical contract" },
+      });
+      assert.equal(result.verdict, semantic.verdict);
+      assert.equal(store.getRun(runId)?.state, semantic.state);
+      const reviews = store.listSemanticReviewAttempts(runId);
+      assert.equal(reviews.length, 1);
+      assert.equal(reviews[0]?.lifecycle, "SUCCEEDED", reviews[0]?.failureSummary ?? "semantic reviewer did not succeed");
+      const validationId = reviews[0]!.request.validationIds[0]!;
+      const authority = store.getPhaseValidationAuthority(validationId);
+      assert.ok(authority);
+      assert.equal(reviews[0]!.request.diffHash, authority.diffHash);
+      assert.equal(authority.commandId, "phase-semantic");
+    } finally {
+      store.close();
+      rmSync(runtime, { recursive: true, force: true });
+      rmSync(repository.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("deterministic anti-greenwashing blockers never dispatch the semantic reviewer", async () => {
+  const fixture = await integratedLoopFixture("deterministic-blocker");
+  let dispatches = 0;
+  const reviewAdapter: SemanticReviewAdapter = {
+    probeReview: () => fixture.adapter.probe(),
+    startReview: (request) => {
+      dispatches += 1;
+      return { schemaVersion: CONTRACT_VERSIONS.semanticReviewHandle, reviewAttemptId: request.reviewAttemptId, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId, providerSessionId: "must-not-dispatch" };
+    },
+    async *reviewEvents(_handle) {},
+    waitReview: async () => { throw new Error("must not wait"); },
+    cancelReview: (_handle, reason) => ({ outcome: "cancelled", summary: reason }),
+  };
+  try {
+    const reviewer = new IndependentSemanticReviewer(fixture.store, reviewAdapter, fixture.gitManager);
+    const result = await fixture.run({ reviewer });
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(dispatches, 0);
+    assert.equal(fixture.store.listSemanticReviewAttempts(fixture.runId).length, 0);
+    assert.ok(result.verification?.suspiciousSignals.some((signal) => signal.blocksPass));
+  } finally {
+    fixture.close();
+  }
+});
+
+test("semantic-review ambiguity becomes UNKNOWN and gates the real loop", async () => {
+  const fixture = await integratedLoopFixture("semantic-review");
+  const reviewAdapter: SemanticReviewAdapter = {
+    probeReview: () => fixture.adapter.probe(),
+    startReview: (request) => ({ schemaVersion: CONTRACT_VERSIONS.semanticReviewHandle, reviewAttemptId: request.reviewAttemptId, runId: request.runId, taskId: request.taskId, attemptId: request.attemptId, providerSessionId: "ambiguous-review-session" }),
+    async *reviewEvents(_handle) {},
+    waitReview: async () => { throw new Error("synthetic reviewer transport ambiguity"); },
+    cancelReview: (_handle, reason) => ({ outcome: "cancelled", summary: reason }),
+  };
+  try {
+    const result = await fixture.run({ reviewer: new IndependentSemanticReviewer(fixture.store, reviewAdapter, fixture.gitManager) });
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(fixture.store.getRun(fixture.runId)?.state, "HUMAN_GATE");
+    const reviews = fixture.store.listSemanticReviewAttempts(fixture.runId);
+    assert.equal(reviews.length, 1);
+    assert.equal(reviews[0]?.lifecycle, "UNKNOWN");
+    assert.match(reviews[0]?.providerIdentityJson ?? "", /ambiguous-review-session/);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("semantic-required phase evidence cannot close when no reviewer result exists", async () => {
+  const fixture = await integratedLoopFixture("semantic-review");
+  try {
+    const result = await fixture.run({});
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(fixture.store.getRun(fixture.runId)?.state, "HUMAN_GATE");
+    assert.equal(fixture.store.listSemanticReviewAttempts(fixture.runId).length, 0);
+    assert.equal(fixture.store.readModel(fixture.runId)?.latestReview?.decision.reasonCode, "semantic_review_required");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("transient execution failure performs exactly one same-route retry in one run", async () => {
+  const fixture = await integratedLoopFixture("transient-failure", { transientFailureClasses: ["executor_error"] });
+  try {
+    const result = await fixture.run({});
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(result.attempts, 2);
+    const attempts = fixture.store.listTaskAttempts(fixture.runId, fixture.taskId);
+    assert.equal(attempts.length, 2);
+    assert.ok(attempts.every((attempt) => attempt.runId === fixture.runId && attempt.taskId === fixture.taskId));
+    assert.deepEqual(attempts.map((attempt) => JSON.parse(attempt.outcomeJson!).executor.model), ["fixture-model", "fixture-model"]);
+    const failures = fixture.store.listFailureOccurrences(fixture.runId, fixture.taskId);
+    assert.deepEqual(failures.map((failure) => failure.resultingAction), ["retry_same_route", "human_gate"]);
+    assert.equal(failures[0]?.fingerprint, failures[1]?.fingerprint);
+    assert.equal(fixture.store.listTransitions(fixture.runId).filter((transition) => transition.from === "IDLE" && transition.to === "INTAKE").length, 1);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("invariant failure escalates only the Codex route once, then gates at the attempt ceiling", async () => {
+  const higherRoute = { model: "fixture-high", reasoning: "high" };
+  const fixture = await integratedLoopFixture("invariant-failure", { higherCodexRoute: higherRoute });
+  try {
+    const result = await fixture.run({});
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(result.attempts, 2);
+    const attempts = fixture.store.listTaskAttempts(fixture.runId, fixture.taskId);
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts.map((attempt) => JSON.parse(attempt.outcomeJson!).executor.model), ["fixture-model", "fixture-high"]);
+    const failures = fixture.store.listFailureOccurrences(fixture.runId, fixture.taskId);
+    assert.deepEqual(failures.map((failure) => failure.resultingAction), ["escalate", "human_gate"]);
+    assert.equal(failures[0]?.fingerprint, failures[1]?.fingerprint);
+    const escalated = fixture.store.getTask(fixture.taskId)?.decision;
+    assert.ok(escalated);
+    assert.deepEqual({ ...escalated, route: fixture.decision.route }, fixture.decision);
+    assert.deepEqual(escalated.route, { ...fixture.decision.route, ...higherRoute });
+    assert.equal(fixture.store.listTransitions(fixture.runId).filter((transition) => transition.from === "IDLE" && transition.to === "INTAKE").length, 1);
+  } finally {
+    fixture.close();
   }
 });
 
@@ -341,7 +618,7 @@ for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch"] as 
 }
 
 for (const expected of [
-  { scenario: "failure", state: "REWORK", verdict: "REWORK" },
+  { scenario: "failure", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
   { scenario: "architecture-ambiguity", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
   { scenario: "scope-violation", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
   { scenario: "gate", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
@@ -381,8 +658,12 @@ for (const expected of [
       });
       assert.equal(result.verdict, expected.verdict);
       assert.equal(store.readModel(runId)?.run.state, expected.state);
+      if (expected.scenario === "failure") {
+        assert.equal(result.attempts, 2);
+        assert.equal(store.countTaskAttempts(runId, taskId), 2);
+      }
       if (expected.scenario === "failure" || expected.scenario === "architecture-ambiguity" || expected.scenario === "scope-violation") {
-        assert.equal(store.listFailureOccurrences(runId, taskId).length, 1);
+        assert.equal(store.listFailureOccurrences(runId, taskId).length, expected.scenario === "failure" ? 2 : 1);
       }
       assert.equal(git(repository.root, ["status", "--porcelain"]), "");
     } finally {
@@ -474,6 +755,65 @@ async function waitForFile(path: string): Promise<void> {
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+}
+
+function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopRequest["failurePolicy"]) {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), `kerbsflow-integrated-${scenario}-`));
+  const ids = new SequenceIdSource(`integrated_${scenario}`);
+  const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
+  const adapter = new CodexAdapter({ cliPath: createFakeCodex(runtime), runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+  const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+  const runId = asRunId(`run_integrated_${scenario.replaceAll("-", "_")}`);
+  const taskId = asTaskId(`task_integrated_${scenario.replaceAll("-", "_")}`);
+  const decision = createPhase2PlanningDecision({
+    decisionId: `decision_integrated_${scenario.replaceAll("-", "_")}`,
+    runId,
+    taskId,
+    objective: `SCENARIO=${scenario} exercise the integrated Phase 3 path`,
+    acceptance: ["the bounded policy outcome is durably persisted"],
+    positiveScope: ["result.txt", "test/example.test.ts"],
+    negativeScope: ["README.md"],
+    model: "fixture-model",
+    reasoning: "medium",
+    canonicalContext: `integrated-${scenario}`,
+  });
+  return {
+    repository,
+    runtime,
+    ids,
+    store,
+    adapter,
+    gitManager,
+    runId,
+    taskId,
+    decision,
+    run: ({ reviewer }: { reviewer?: IndependentSemanticReviewer }) => new Phase2Loop(
+      codexCore(store, adapter, ids),
+      store,
+      gitManager,
+      new FocusedVerifier(gitManager, new ProcessSupervisor(), ids),
+      ids,
+      reviewer,
+    ).run({
+      runId,
+      taskId,
+      objective: `integrated ${scenario}`,
+      repositoryPath: repository.root,
+      expectedBaseOid: repository.head,
+      planningDecision: decision,
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      phaseCheck: { level: "phase", commandId: `phase-${scenario}`, name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      executionTimeoutMs: 5000,
+      ...(failurePolicy === undefined ? {} : { failurePolicy }),
+      semanticReview: { model: "fixture-review", canonicalContract: "synthetic canonical contract" },
+    }),
+    close() {
+      store.close();
+      rmSync(runtime, { recursive: true, force: true });
+      rmSync(repository.root, { recursive: true, force: true });
+    },
+  };
 }
 
 function verificationFixture(suffix: string): {

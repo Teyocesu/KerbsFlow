@@ -120,9 +120,8 @@ test("semantic review lifecycle cannot manufacture authority from PREPARED or mi
   try {
     fixture.fixture.store.prepareSemanticReview(semanticRequest(fixture.input));
     assert.throws(() => fixture.fixture.store.completeSemanticReview(fixture.input.reviewAttemptId, validReview(fixture)), /RUNNING/i);
-    assert.throws(() => fixture.fixture.store.markSemanticReviewRunning(fixture.input.reviewAttemptId, {}), /identity/i);
-    fixture.fixture.store.markSemanticReviewRunning(fixture.input.reviewAttemptId, { providerSessionId: "process:fixture:42" });
-    assert.equal(fixture.fixture.store.completeSemanticReview(fixture.input.reviewAttemptId, validReview(fixture)).lifecycle, "SUCCEEDED");
+    assert.throws(() => fixture.fixture.store.markSemanticReviewRunning({ handle: { providerSessionId: "process:fixture:42" } } as never), /authority/i);
+    assert.equal(fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId)?.lifecycle, "PREPARED");
   } finally {
     fixture.close();
   }
@@ -132,7 +131,6 @@ test("direct semantic result persistence rejects secrets without retaining their
   const fixture = reviewerFixture("direct_secret");
   try {
     fixture.fixture.store.prepareSemanticReview(semanticRequest(fixture.input));
-    fixture.fixture.store.markSemanticReviewRunning(fixture.input.reviewAttemptId, { providerSessionId: "process:fixture:43" });
     const secret = "Bearer direct-boundary-secret";
     assert.throws(() => fixture.fixture.store.completeSemanticReview(fixture.input.reviewAttemptId, { ...validReview(fixture), summary: secret }), /credential|sensitive/i);
     const stored = fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId);

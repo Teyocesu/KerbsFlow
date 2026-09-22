@@ -105,7 +105,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 3 — Verification, review, and conservative recovery
 
-**Status:** implementation complete on `phase3/verification-recovery` from the independently approved Phase 2 baseline `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`; independent review pending.
+**Status:** implementation and deterministic integration complete on `phase3/verification-recovery` from the independently approved Phase 2 baseline `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`; independent re-audit pending.
 
 **Objective:** Make pass/rework/escalation/phase closure trustworthy under failures and validation manipulation.
 
@@ -129,9 +129,9 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 - Crash injection after intent/spawn/identity/result/verification reaches a proven state or human gate without duplicate execution.
 - A fresh reviewer cannot write to the worktree.
 
-**Focused validation:** Mutation-style fixtures for weakened gates; failure-fingerprint table tests; crash matrix; gate option/consequence tests; read-only reviewer enforcement tests.
+**Focused validation:** Mutation-style fixtures for weakened gates; explicit focused-versus-phase command authority tests; reachable read-only semantic-review outcomes and ambiguity tests; real same-run retry/rework/escalation and attempt-ceiling tests; failure-fingerprint table tests; crash matrix; gate option/consequence tests.
 
-**Exit condition:** Satisfied for implementation and deterministic validation; independent review is pending. The Codex vertical loop closes a phase only through independently supported classified evidence, canonical intent is checked from the repository by the core, and ambiguous executor/reviewer crash windows recover conservatively without redispatch.
+**Exit condition:** Satisfied for implementation and deterministic integration; independent re-audit is pending. The Codex vertical loop requires a separately declared phase command, dispatches semantic review only for nonblocking semantic signals, consumes exact persisted reviewer authority, and executes bounded retry/rework/escalation within one run. Canonical intent is checked from the repository by the core, and ambiguous executor/reviewer crash windows recover conservatively without redispatch.
 
 **Expected route:** Codex/Sol High for verification, recovery, security, and independent phase review.
 
@@ -260,4 +260,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 2 is independently confirmed at `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. Phase 3 implementation and the targeted authority/integration corrections pass the deterministic gate on `phase3/verification-recovery`; independent re-audit is pending. Phase 4 has not started.
+- Phase 2 is independently confirmed at `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. Phase 3 implementation and the final targeted authority/integration corrections pass the deterministic gate on `phase3/verification-recovery`; independent re-audit is next. Phase 4 has not started.

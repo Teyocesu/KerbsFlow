@@ -105,7 +105,9 @@ test("cancellation escalates to a forced process-group kill after the grace peri
       timeoutMs: 5000,
       gracePeriodMs: 20,
     });
-    await new Promise((resolve) => setTimeout(resolve, 80));
+    const ready = await process.events()[Symbol.asyncIterator]().next();
+    assert.equal(ready.done, false);
+    assert.equal((ready.value?.value as { type?: string }).type, "ready");
     const cancelEvidence = process.cancel();
     assert.equal(cancelEvidence.outcome, "signal_sent");
     const result = await process.completion;
