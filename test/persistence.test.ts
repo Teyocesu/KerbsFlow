@@ -1,14 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { DatabaseSync } from "node:sqlite";
-import { mkdtempSync, rmSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 import { applyMigrations, MIGRATIONS, StateStore } from "../src/persistence.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { KerbsFlowError } from "../src/errors.js";
-import { CONTRACT_VERSIONS, asAttemptId, asReviewId, asRunId, asTaskId, requestHash, type SemanticReviewRequest } from "../src/contracts.js";
+import { CONTRACT_VERSIONS, asAttemptId, asCommandId, asReviewId, asRunId, asTaskId, requestHash, type SemanticReviewRequest } from "../src/contracts.js";
 
 test("migration application records checksums and uses rollback journaling", () => {
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-migration-"));
@@ -35,13 +35,121 @@ test("failed migration rolls back its DDL and preserves the prior schema", () =>
   try {
     const brokenMigrations = [
       ...MIGRATIONS,
-      { version: 9, name: "broken", sql: "CREATE TABLE should_rollback (id INTEGER); INSERT INTO missing_table VALUES (1);" },
+      { version: 10, name: "broken", sql: "CREATE TABLE should_rollback (id INTEGER); INSERT INTO missing_table VALUES (1);" },
     ];
     assert.throws(() => applyMigrations(db, brokenMigrations, clock));
     assert.equal((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'").get() as unknown), undefined);
-    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count, 8);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count, 9);
   } finally {
     db.close();
+  }
+});
+
+test("forward migration creates and verifies an owner-only bounded backup", { skip: process.platform === "win32" }, () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-backup-"));
+  const dbPath = join(root, "state.sqlite");
+  const clock = new FixedClock("2026-09-22T12:34:56.789Z");
+  const legacy = new DatabaseSync(dbPath);
+  applyMigrations(legacy, MIGRATIONS.slice(0, 8), clock);
+  legacy.close();
+  const store = StateStore.open(dbPath, { clock });
+  store.close();
+  try {
+    const backups = readdirSync(join(root, "backups")).sort();
+    assert.equal(backups.length, 2);
+    const databaseBackup = backups.find((path) => path.endsWith(".sqlite"));
+    const metadataBackup = backups.find((path) => path.endsWith(".json"));
+    assert.ok(databaseBackup && metadataBackup);
+    assert.match(databaseBackup, /v8-to-v9/);
+    assert.equal(lstatSync(dbPath).mode & 0o777, 0o600);
+    assert.equal(lstatSync(join(root, "backups")).mode & 0o777, 0o700);
+    assert.equal(lstatSync(join(root, "backups", databaseBackup)).mode & 0o777, 0o600);
+    assert.equal(lstatSync(join(root, "backups", metadataBackup)).mode & 0o777, 0o600);
+    const metadata = JSON.parse(readFileSync(join(root, "backups", metadataBackup), "utf8")) as { sourceVersion: number; targetVersion: number; sha256: string };
+    assert.deepEqual({ sourceVersion: metadata.sourceVersion, targetVersion: metadata.targetVersion, hashLength: metadata.sha256.length }, { sourceVersion: 8, targetVersion: 9, hashLength: 64 });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("backup collision fails closed before retrying a failed migration", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-backup-failure-"));
+  const dbPath = join(root, "state.sqlite");
+  const clock = new FixedClock("2026-09-22T12:34:56.789Z");
+  const base = new DatabaseSync(dbPath);
+  applyMigrations(base, MIGRATIONS.slice(0, 8), clock);
+  base.close();
+  const broken = [...MIGRATIONS.slice(0, 8), { version: 9, name: "broken", sql: "CREATE TABLE rollback_me (id INTEGER); INSERT INTO absent VALUES (1);" }];
+  assert.throws(() => StateStore.open(dbPath, { clock, migrations: broken }));
+  assert.throws(() => StateStore.open(dbPath, { clock, migrations: broken }), (error: unknown) => error instanceof KerbsFlowError && error.code === "DATABASE_BACKUP_FAILED");
+  const check = new DatabaseSync(dbPath);
+  try {
+    assert.equal(check.prepare("SELECT name FROM sqlite_master WHERE name = 'rollback_me'").get(), undefined);
+    assert.equal((check.prepare("SELECT MAX(version) AS version FROM schema_migrations").get() as { version: number }).version, 8);
+  } finally {
+    check.close();
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("corrupt and truncated databases fail closed without automatic reset", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-corrupt-"));
+  const corruptPath = join(root, "corrupt.sqlite");
+  const truncatedPath = join(root, "truncated.sqlite");
+  writeFileSync(corruptPath, "not a sqlite database and must be retained", "utf8");
+  const valid = StateStore.open(truncatedPath);
+  valid.close();
+  truncateSync(truncatedPath, 128);
+  try {
+    assert.throws(() => StateStore.open(corruptPath), /integrity|automatic reset|could not be opened/i);
+    assert.equal(readFileSync(corruptPath, "utf8"), "not a sqlite database and must be retained");
+    assert.throws(() => StateStore.open(truncatedPath), /integrity|automatic reset|could not be opened/i);
+    assert.equal(lstatSync(truncatedPath).size, 128);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("incompatible schema and simultaneous duplicate ownership fail closed", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-schema-"));
+  const dbPath = join(root, "state.sqlite");
+  const store = StateStore.open(dbPath);
+  try {
+    assert.throws(() => StateStore.open(dbPath), (error: unknown) => error instanceof KerbsFlowError && error.code === "DATABASE_OWNER_EXISTS");
+  } finally {
+    store.close();
+  }
+  try {
+    assert.throws(() => StateStore.open(dbPath, { migrations: MIGRATIONS.slice(0, 8) }), (error: unknown) => error instanceof KerbsFlowError && error.code === "INCOMPATIBLE_SCHEMA_VERSION");
+    const reopened = StateStore.open(dbPath);
+    reopened.close();
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("credential-shaped command data is rejected before SQLite persistence", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-persistence-secret-"));
+  const dbPath = join(root, "state.sqlite");
+  const store = StateStore.open(dbPath);
+  const syntheticCredential = "AWS_SECRET_ACCESS_KEY=synthetic-credential-value";
+  try {
+    assert.throws(() => store.createRun({
+      schemaVersion: CONTRACT_VERSIONS.command,
+      commandId: asCommandId("command_secret_rejection"),
+      idempotencyKey: "secret-rejection",
+      runId: asRunId("run_secret_rejection"),
+      expectedStateVersion: 0,
+      kind: "start",
+      objective: syntheticCredential,
+    }), /sensitive credential material/i);
+  } finally {
+    store.close();
+  }
+  try {
+    assert.equal(readFileSync(dbPath).includes(Buffer.from(syntheticCredential)), false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

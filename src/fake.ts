@@ -31,6 +31,7 @@ export interface ArtifactReference {
   contentHash: string;
   sizeBytes: number;
   redactionState: "not_applicable" | "redacted";
+  retentionCategory: "active_run" | "retained_failure_recovery" | "terminal_clean_eligible" | "public_synthetic_fixture";
 }
 
 export class FakeArtifactStore {
@@ -50,6 +51,7 @@ export class FakeArtifactStore {
       contentHash,
       sizeBytes: Buffer.byteLength(content),
       redactionState: "not_applicable",
+      retentionCategory: "active_run",
     };
     this.contents.set(artifactId, content);
     return reference;

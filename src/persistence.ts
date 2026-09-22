@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { dirname } from "node:path";
-import { mkdirSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { chmodSync, closeSync, constants, existsSync, lstatSync, openSync, readSync, realpathSync, rmSync, statSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -63,6 +63,7 @@ import {
   type TrustedAttemptRoutingProvenance,
   type TrustedRoutingDecision,
 } from "./routing.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, pathIsWithin } from "./paths.js";
 
 export type SqlValue = string | number | bigint | Uint8Array | null;
 
@@ -372,6 +373,14 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE INDEX attempt_routing_provenance_run_task_idx ON attempt_routing_provenance(run_id, task_id);
     `,
   },
+  {
+    version: 9,
+    name: "phase5-artifact-retention",
+    sql: `
+      ALTER TABLE artifacts ADD COLUMN retention_category TEXT NOT NULL DEFAULT 'active_run'
+        CHECK (retention_category IN ('active_run', 'retained_failure_recovery', 'terminal_clean_eligible', 'public_synthetic_fixture'));
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -616,6 +625,7 @@ export interface StateStoreOptions {
 }
 
 export class StateStore {
+  private static readonly openFiles = new Set<string>();
   readonly databasePath: string;
   readonly startupRecovery: readonly RecoveryNotice[];
 
@@ -623,13 +633,15 @@ export class StateStore {
   private readonly clock: Clock;
   private readonly ids: IdSource;
   private closed = false;
+  private readonly ownershipKey: string | undefined;
   private readonly recoveryNotices: RecoveryNotice[] = [];
 
-  private constructor(databasePath: string, db: DatabaseSync, clock: Clock, ids: IdSource) {
+  private constructor(databasePath: string, db: DatabaseSync, clock: Clock, ids: IdSource, ownershipKey?: string) {
     this.databasePath = databasePath;
     this.db = db;
     this.clock = clock;
     this.ids = ids;
+    this.ownershipKey = ownershipKey;
     this.startupRecovery = this.recoveryNotices;
   }
 
@@ -637,21 +649,39 @@ export class StateStore {
     const clock = options.clock ?? new SystemClock();
     const ids = options.ids ?? new RandomIdSource();
     const busyTimeoutMs = options.busyTimeoutMs ?? 5000;
-    if (databasePath !== ":memory:") {
-      mkdirSync(dirname(databasePath), { recursive: true });
+    const migrations = options.migrations ?? MIGRATIONS;
+    const targetVersion = migrations.at(-1)?.version ?? 0;
+    const file = databasePath === ":memory:" ? undefined : prepareDatabasePath(databasePath);
+    if (file !== undefined && StateStore.openFiles.has(file.path)) throw new KerbsFlowError("DATABASE_OWNER_EXISTS", "database already has an active KerbsFlow owner in this process");
+    if (file !== undefined) StateStore.openFiles.add(file.path);
+    let db: DatabaseSync;
+    try {
+      db = new DatabaseSync(file?.path ?? databasePath, { timeout: busyTimeoutMs });
+    } catch {
+      if (file !== undefined) StateStore.openFiles.delete(file.path);
+      throw new DatabaseIntegrityError("SQLite database could not be opened; automatic reset is prohibited");
     }
-    const db = new DatabaseSync(databasePath, { timeout: busyTimeoutMs });
     try {
       configureDatabase(db, busyTimeoutMs);
-      applyMigrations(db, options.migrations ?? MIGRATIONS, clock);
+      assertIntegrity(db);
+      const applied = readAppliedMigrations(db);
+      assertCompatibleSchema(applied, migrations);
+      const sourceVersion = applied.size === 0 ? 0 : Math.max(...applied.keys());
+      if (file !== undefined && sourceVersion > 0 && sourceVersion < targetVersion) {
+        createMigrationBackup(db, file, sourceVersion, targetVersion, clock.now());
+      }
+      applyMigrations(db, migrations, clock);
       sanitizePersistedSemanticReviewContext(db);
       assertIntegrity(db);
-      const store = new StateStore(databasePath, db, clock, ids);
+      if (file !== undefined && process.platform !== "win32") chmodSync(file.path, 0o600);
+      const store = new StateStore(file?.path ?? databasePath, db, clock, ids, file?.path);
       store.detectStartupRecovery();
       return store;
     } catch (error) {
       db.close();
-      throw error;
+      if (file !== undefined) StateStore.openFiles.delete(file.path);
+      if (error instanceof KerbsFlowError || !isSqliteFailure(error)) throw error;
+      throw new DatabaseIntegrityError("SQLite startup, integrity, backup, or migration failed; automatic reset is prohibited");
     }
   }
 
@@ -659,6 +689,7 @@ export class StateStore {
     if (!this.closed) {
       this.db.close();
       this.closed = true;
+      if (this.ownershipKey !== undefined) StateStore.openFiles.delete(this.ownershipKey);
     }
   }
 
@@ -1481,6 +1512,91 @@ function configureDatabase(db: DatabaseSync, busyTimeoutMs: number): void {
   db.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
 }
 
+interface PreparedDatabasePath {
+  path: string;
+  parent: string;
+}
+
+function prepareDatabasePath(databasePath: string): PreparedDatabasePath {
+  if (!isAbsolute(databasePath)) throw new KerbsFlowError("DATABASE_PATH_INVALID", "database path must be absolute");
+  const requested = resolve(databasePath);
+  const parent = ensurePrivateDirectory(dirname(requested));
+  let path = join(parent, basename(requested));
+  if (existsSync(path)) {
+    if (lstatSync(path).isSymbolicLink()) throw new KerbsFlowError("DATABASE_PATH_INVALID", "database path cannot be a symbolic link");
+    path = realpathSync(path);
+    if (!pathIsWithin(parent, path) || !lstatSync(path).isFile()) throw new KerbsFlowError("DATABASE_PATH_INVALID", "database path is not a regular file inside its owned parent");
+  } else {
+    const descriptor = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_RDWR, 0o600);
+    closeSync(descriptor);
+  }
+  if (process.platform !== "win32") chmodSync(path, 0o600);
+  return { path, parent };
+}
+
+function assertCompatibleSchema(applied: ReadonlyMap<number, string>, migrations: readonly Migration[]): void {
+  const supported = new Set(migrations.map((migration) => migration.version));
+  const incompatible = [...applied.keys()].filter((version) => !supported.has(version));
+  if (incompatible.length > 0) {
+    throw new KerbsFlowError("INCOMPATIBLE_SCHEMA_VERSION", `database schema version ${Math.max(...incompatible)} is newer than or absent from this KerbsFlow migration set`);
+  }
+}
+
+function createMigrationBackup(db: DatabaseSync, file: PreparedDatabasePath, sourceVersion: number, targetVersion: number, now: string): void {
+  const backupRoot = ensurePrivateDirectory(join(file.parent, "backups"));
+  const timestamp = now.replace(/[^0-9]/gu, "").slice(0, 17);
+  const stem = basename(file.path).replace(/[^A-Za-z0-9._-]/gu, "-").slice(0, 80);
+  const backupName = `${stem}.v${sourceVersion}-to-v${targetVersion}.${timestamp}.sqlite`;
+  const backupPath = join(backupRoot, backupName);
+  if (existsSync(backupPath) || existsSync(`${backupPath}.json`)) {
+    throw new KerbsFlowError("DATABASE_BACKUP_FAILED", "migration backup target already exists; it will not be overwritten");
+  }
+  try {
+    db.prepare("VACUUM INTO ?").run(backupPath);
+    if (process.platform !== "win32") chmodSync(backupPath, 0o600);
+    const verification = new DatabaseSync(backupPath, { readOnly: true });
+    try {
+      assertIntegrity(verification);
+      const copied = readAppliedMigrations(verification);
+      if ((copied.size === 0 ? 0 : Math.max(...copied.keys())) !== sourceVersion) {
+        throw new KerbsFlowError("DATABASE_BACKUP_FAILED", "migration backup schema version does not match its source");
+      }
+    } finally {
+      verification.close();
+    }
+    const metadata = {
+      schemaVersion: "kerbsflow.sqlite-backup/v1",
+      sourceDatabase: basename(file.path),
+      sourceVersion,
+      targetVersion,
+      createdAt: now,
+      sizeBytes: statSync(backupPath).size,
+      sha256: hashFile(backupPath),
+    };
+    atomicWritePrivateFile(backupRoot, `${backupName}.json`, `${JSON.stringify(metadata)}\n`);
+  } catch (error) {
+    if (!existsSync(`${backupPath}.json`)) rmSync(backupPath, { force: true });
+    if (error instanceof KerbsFlowError) throw error;
+    throw new KerbsFlowError("DATABASE_BACKUP_FAILED", "migration backup failed and no migration was attempted");
+  }
+}
+
+function hashFile(path: string): string {
+  const descriptor = openSync(path, "r");
+  const hash = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  try {
+    while (true) {
+      const count = readSync(descriptor, buffer, 0, buffer.length, null);
+      if (count === 0) break;
+      hash.update(buffer.subarray(0, count));
+    }
+    return hash.digest("hex");
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
 export function applyMigrations(db: DatabaseSync, migrations: readonly Migration[], clock: Clock = new SystemClock()): void {
   validateMigrationList(migrations);
   const applied = readAppliedMigrations(db);
@@ -1542,15 +1658,18 @@ function readAppliedMigrations(db: DatabaseSync): Map<number, string> {
 }
 
 function assertIntegrity(db: DatabaseSync): void {
-  const row = db.prepare("PRAGMA integrity_check").get() as Row | undefined;
-  if (row === undefined || row.integrity_check !== "ok") {
-    throw new DatabaseIntegrityError(`SQLite integrity check failed: ${String(row?.integrity_check ?? "no result")}`);
-  }
+  const rows = db.prepare("PRAGMA integrity_check").all() as Row[];
+  if (rows.length !== 1 || rows[0]?.integrity_check !== "ok") throw new DatabaseIntegrityError("SQLite integrity check failed; automatic repair is prohibited");
+  const foreignKeyErrors = db.prepare("PRAGMA foreign_key_check").all() as Row[];
+  if (foreignKeyErrors.length > 0) throw new DatabaseIntegrityError("SQLite foreign-key integrity check failed; automatic repair is prohibited");
 }
 
 function makeTransaction(db: DatabaseSync): SqlTransaction {
   return {
     run(sql, ...parameters) {
+      if (parameters.some((parameter) => containsLikelySecret(parameter))) {
+        throw new KerbsFlowError("PERSISTENCE_SECRET_REJECTED", SENSITIVE_RESULT_REJECTION);
+      }
       const result = db.prepare(sql).run(...parameters);
       return { changes: result.changes, lastInsertRowid: result.lastInsertRowid };
     },
@@ -1988,6 +2107,11 @@ function isAttemptLifecycle(value: string): value is AttemptLifecycle {
 
 function isTerminalAttempt(value: AttemptLifecycle): boolean {
   return value === "SUCCEEDED" || value === "FAILED" || value === "BLOCKED" || value === "PARTIAL" || value === "CANCELLED";
+}
+
+function isSqliteFailure(error: unknown): boolean {
+  if (!(error instanceof Error) || !("code" in error)) return false;
+  return typeof error.code === "string" && error.code.startsWith("ERR_SQLITE");
 }
 
 function stringValue(value: unknown, path: string): string {

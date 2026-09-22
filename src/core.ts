@@ -1447,7 +1447,7 @@ export class KerbsFlowCore {
 
   private insertArtifact(tx: SqlTransaction, artifact: ReturnType<ArtifactStore["put"]>, now: string): void {
     tx.run(
-      "INSERT INTO artifacts (artifact_id, run_id, attempt_id, kind, relative_path, content_hash, size_bytes, redaction_state, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO artifacts (artifact_id, run_id, attempt_id, kind, relative_path, content_hash, size_bytes, redaction_state, retention_category, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       artifact.artifactId,
       artifact.runId,
       artifact.attemptId ?? null,
@@ -1456,6 +1456,7 @@ export class KerbsFlowCore {
       artifact.contentHash,
       artifact.sizeBytes,
       artifact.redactionState,
+      artifact.retentionCategory,
       now,
     );
   }
