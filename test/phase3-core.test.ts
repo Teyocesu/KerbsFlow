@@ -7,8 +7,10 @@ import { join } from "node:path";
 
 import {
   CONTRACT_VERSIONS,
+  asDecisionId,
   asGateId,
   asReviewId,
+  asTaskId,
   asValidationId,
   parseExecutorResult,
 } from "../src/contracts.js";
@@ -64,6 +66,56 @@ test("trusted phase close rejects stale worktree diff after authoritative valida
       validationId: authority.validationId,
     }), /stale|changed/i);
     assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "VERIFY_PHASE");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("persisted phase validation from a previous attempt cannot close the current attempt", async () => {
+  const fixture = createFixture();
+  try {
+    await reachVerifyPhase(fixture);
+    const authority = await recordAuthoritativePhase(fixture);
+    writeFileSync(join(authority.repository.root, "docs/HANDOFF.md"), "drift to enter a human gate\n", "utf8");
+    let command = fixture.core.completeTrustedPhaseValidation(fixture.runId, 7, "phase3:old-attempt-gate", { validationId: authority.validationId });
+    const gate = fixture.core.readModel(fixture.runId)?.currentGate;
+    assert.ok(gate);
+    command = fixture.core.resolveGateScoped(fixture.runId, command.stateVersion, "phase3:old-attempt-resolve", gate.gateId, "rework");
+    writeFileSync(join(authority.repository.root, "docs/HANDOFF.md"), "synthetic handoff\n", "utf8");
+    command = fixture.core.reworkToReady(fixture.runId, command.stateVersion, "phase3:old-attempt-ready");
+    command = fixture.core.prepareExecution(fixture.runId, command.stateVersion, "phase3:old-attempt-prepare");
+    fixture.adapter.script(fixture.taskId, "success");
+    await fixture.core.beginFakeAttempt(fixture.runId, command.stateVersion, "phase3:old-attempt-begin");
+    command = await fixture.core.completeFakeAttempt(fixture.runId, command.stateVersion, "phase3:old-attempt-complete");
+    const focused = { ...validationFor(fixture, "passed"), validationId: asValidationId("validation_second_attempt") };
+    command = fixture.core.recordFocusedValidation(fixture.runId, command.stateVersion, "phase3:old-attempt-focused", focused);
+    command = fixture.core.review(fixture.runId, command.stateVersion, "phase3:old-attempt-review", reviewFor(fixture, "verify_phase", "second-attempt"));
+    assert.throws(() => fixture.core.completeTrustedPhaseValidation(fixture.runId, command.stateVersion, "phase3:old-attempt-close", { validationId: authority.validationId }), /attempt|scope/i);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("persisted phase validation from another task cannot close the current task", async () => {
+  const fixture = createFixture();
+  try {
+    await reachVerifyPhase(fixture);
+    const authority = await recordAuthoritativePhase(fixture);
+    let command = fixture.core.completeTrustedPhaseValidation(fixture.runId, 7, "phase3:first-task-close", { validationId: authority.validationId });
+    command = fixture.core.completePhase(fixture.runId, command.stateVersion, "phase3:next-task-plan", "PLAN");
+    const taskId = asTaskId("task_second");
+    const decision = { ...fixture.decision, decisionId: asDecisionId("decision_second"), taskId };
+    command = fixture.core.plan(fixture.runId, command.stateVersion, "phase3:second-task-plan", decision);
+    command = fixture.core.prepareExecution(fixture.runId, command.stateVersion, "phase3:second-task-prepare");
+    fixture.adapter.script(taskId, "success");
+    await fixture.core.beginFakeAttempt(fixture.runId, command.stateVersion, "phase3:second-task-begin");
+    command = await fixture.core.completeFakeAttempt(fixture.runId, command.stateVersion, "phase3:second-task-complete");
+    const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+    assert.ok(attemptId);
+    const focused = { ...validationFor(fixture, "passed"), validationId: asValidationId("validation_second_task"), taskId, attemptId };
+    command = fixture.core.recordFocusedValidation(fixture.runId, command.stateVersion, "phase3:second-task-focused", focused);
+    command = fixture.core.review(fixture.runId, command.stateVersion, "phase3:second-task-review", { ...reviewFor(fixture, "verify_phase", "second-task"), reviewId: asReviewId("review_second_task"), taskId });
+    assert.throws(() => fixture.core.completeTrustedPhaseValidation(fixture.runId, command.stateVersion, "phase3:other-task-close", { validationId: authority.validationId }), /task|scope/i);
   } finally {
     fixture.close();
   }
