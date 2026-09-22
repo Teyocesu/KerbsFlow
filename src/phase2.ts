@@ -15,6 +15,8 @@ import { buildCodexPrompt } from "./planning.js";
 import { StateStore } from "./persistence.js";
 import type { IdSource } from "./runtime.js";
 import { FocusedVerifier, type FocusedCheckCommand, type FocusedVerificationResult } from "./verifier.js";
+import { CanonicalIntentGuard } from "./canonical.js";
+import { FailurePolicyCoordinator } from "./phase3.js";
 
 export interface Phase2LoopRequest {
   runId: RunId;
@@ -73,6 +75,7 @@ export class Phase2Loop {
         stateVersion: command.stateVersion,
       };
     }
+    new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
     command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     const worktree = this.git.create(intake, request.runId);
     this.store.recordWorktree({
@@ -113,20 +116,55 @@ export class Phase2Loop {
     const verification = await this.verifier.verify(intake, worktree, request.planningDecision, executorResult, request.focusedCheck);
     command = this.core.recordFocusedValidation(request.runId, command.stateVersion, `${request.runId}:verify`, verification.bundle);
     const passed = verification.bundle.outcome === "passed";
+    const failureClass = verification.scopeViolations.length > 0 ? "scope_violation" : executorResult.failureClass ?? "validation_failure";
+    const policy = passed ? undefined : new FailurePolicyCoordinator(this.store, this.core.configuration.effectiveMaxImplementationAttempts).recordAndDecide({
+      runId: request.runId,
+      taskId: request.taskId,
+      attemptId: executorResult.attemptId,
+      failureClass,
+      transient: false,
+      causalDiagnosis: verification.scopeViolations.length === 0 && executorResult.failureClass !== "requirement_or_architecture_ambiguity",
+      scopeUnchanged: verification.scopeViolations.length === 0,
+      eligibleHigherRoute: false,
+      fingerprintInput: {
+        failureClass,
+        reasonCode: verification.scopeViolations.length > 0 ? "focused_scope_violation" : "focused_validation_failed",
+        diagnostic: verification.bundle.summary,
+        category: "focused_verification",
+        checkIdentity: request.focusedCheck.name,
+      },
+      route: request.planningDecision.route,
+    });
+    const failureOutcome = policy?.resultingAction === "rework" ? "rework" : policy?.resultingAction === "failed" ? "failed" : "human_gate";
     const review: ReviewDecision = {
       schemaVersion: CONTRACT_VERSIONS.reviewDecision,
       reviewId: asReviewId(this.ids.next("review")),
       runId: request.runId,
       taskId: request.taskId,
-      outcome: passed ? "verify_phase" : "rework",
-      ...(passed ? {} : { failureClass: verification.scopeViolations.length > 0 ? "scope_violation" : "validation_failure" }),
+      outcome: passed ? "verify_phase" : failureOutcome,
+      ...(passed ? {} : { failureClass }),
       summary: passed ? "independent focused verification passed" : verification.bundle.summary,
       evidenceRefs: [],
-      reasonCode: passed ? "phase2_focused_pass" : "phase2_focused_rework",
+      reasonCode: passed ? "phase2_focused_pass" : policy!.reasonCode,
     };
     command = this.core.review(request.runId, command.stateVersion, `${request.runId}:review`, review);
+    if (passed) {
+      const phase = await this.verifier.verifyPhase(intake, worktree, request.planningDecision, executorResult, request.focusedCheck);
+      this.store.recordAuthoritativePhaseValidation(phase.authoritative);
+      command = this.core.completeTrustedPhaseValidation(request.runId, command.stateVersion, `${request.runId}:phase-close`, {
+        validationId: phase.authoritative.bundle.validationId,
+      });
+      return {
+        verdict: command.to === "NEXT_PHASE" ? "PASS" : command.to === "REWORK" ? "REWORK" : "HUMAN_GATE",
+        intake,
+        worktree,
+        executorResult,
+        verification: phase.verification,
+        stateVersion: command.stateVersion,
+      };
+    }
     return {
-      verdict: passed ? "PASS" : "REWORK",
+      verdict: failureOutcome === "rework" ? "REWORK" : failureOutcome === "failed" ? "FAILED" : "HUMAN_GATE",
       intake,
       worktree,
       executorResult,

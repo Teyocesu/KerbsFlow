@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { ExecutorResult, PlanningDecision, ValidationBundle, ValidationCheck, ValidationEvidence } from "./contracts.js";
 import { CONTRACT_VERSIONS, asValidationId } from "./contracts.js";
 import { GitWorktreeManager, type RepositoryIntake, type RepositorySnapshot, type WorktreeInspection, type WorktreeRecord } from "./git.js";
@@ -23,6 +25,30 @@ export interface FocusedVerificationResult {
   verifierMutations: string[];
 }
 
+export interface PhaseValidationBinding {
+  worktreePath: string;
+  worktreeGitDirectory: string;
+  baseOid: string;
+  diffHash: string;
+  changedPathsHash: string;
+  changedPaths: string[];
+}
+
+const PHASE_AUTHORITY = Symbol("kerbsflow.phase-verifier-authority");
+const AUTHORITATIVE_PHASE_RECORDS = new WeakSet<object>();
+
+export type AuthoritativePhaseValidation = {
+  bundle: ValidationBundle;
+  binding: PhaseValidationBinding;
+  readonly [PHASE_AUTHORITY]: true;
+};
+
+export function assertAuthoritativePhaseValidation(value: unknown): asserts value is AuthoritativePhaseValidation {
+  if (value === null || typeof value !== "object" || !AUTHORITATIVE_PHASE_RECORDS.has(value)) {
+    throw new Error("phase validation was not produced by the independent phase verifier");
+  }
+}
+
 export class FocusedVerifier {
   constructor(
     private readonly git: GitWorktreeManager,
@@ -31,6 +57,34 @@ export class FocusedVerifier {
   ) {}
 
   async verify(
+    intake: RepositoryIntake,
+    worktree: WorktreeRecord,
+    decision: PlanningDecision,
+    executorResult: ExecutorResult,
+    command: FocusedCheckCommand,
+  ): Promise<FocusedVerificationResult> {
+    return this.verifyAtLevel("focused", intake, worktree, decision, executorResult, command);
+  }
+
+  async verifyPhase(
+    intake: RepositoryIntake,
+    worktree: WorktreeRecord,
+    decision: PlanningDecision,
+    executorResult: ExecutorResult,
+    command: FocusedCheckCommand,
+  ): Promise<{ verification: FocusedVerificationResult; authoritative: AuthoritativePhaseValidation }> {
+    const verification = await this.verifyAtLevel("phase", intake, worktree, decision, executorResult, command);
+    const authoritative = deepFreeze({
+      bundle: verification.bundle,
+      binding: bindingFor(worktree, verification.inspection),
+      [PHASE_AUTHORITY]: true,
+    }) as AuthoritativePhaseValidation;
+    AUTHORITATIVE_PHASE_RECORDS.add(authoritative);
+    return { verification, authoritative };
+  }
+
+  private async verifyAtLevel(
+    level: "focused" | "phase",
     intake: RepositoryIntake,
     worktree: WorktreeRecord,
     decision: PlanningDecision,
@@ -71,12 +125,12 @@ export class FocusedVerifier {
       this.evidence("other", "inspected", verifierMutations.length === 0 ? "focused check did not mutate managed Git evidence" : `focused-check mutations: ${verifierMutations.join("; ")}`),
     ];
     const checks: ValidationCheck[] = [
-      { name: "original checkout invariant", outcome: originalUnchanged ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
-      { name: "Git base and scope", outcome: inspection.baseOid === intake.baseOid && scopeViolations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
-      { name: command.name, outcome: checkPassed ? "passed" : "failed", evidenceClass: "automatically_tested", evidenceRefs: [] },
-      { name: "anti-greenwashing heuristic", outcome: suspiciousSignals.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
-      { name: "executor claim comparison", outcome: executorDisagreements.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
-      { name: "focused-check evidence integrity", outcome: verifierMutations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [] },
+      { name: "original checkout invariant", outcome: originalUnchanged ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[3]!.id] },
+      { name: "Git base and scope", outcome: inspection.baseOid === intake.baseOid && scopeViolations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[0]!.id] },
+      { name: command.name, outcome: checkPassed ? "passed" : "failed", evidenceClass: "automatically_tested", evidenceRefs: [], evidenceIds: [evidence[1]!.id] },
+      { name: "anti-greenwashing heuristic", outcome: suspiciousSignals.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[2]!.id] },
+      { name: "executor claim comparison", outcome: executorDisagreements.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[0]!.id] },
+      { name: "focused-check evidence integrity", outcome: verifierMutations.length === 0 ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[4]!.id] },
     ];
     const bundle: ValidationBundle = {
       schemaVersion: CONTRACT_VERSIONS.validation,
@@ -84,7 +138,7 @@ export class FocusedVerifier {
       runId: decision.runId,
       taskId: decision.taskId,
       attemptId: executorResult.attemptId,
-      level: "focused",
+      level,
       outcome: passed ? "passed" : "failed",
       summary: passed
         ? "independent Git, scope, anti-greenwashing, and focused-check evidence passed"
@@ -111,6 +165,27 @@ export class FocusedVerifier {
       summary,
     };
   }
+}
+
+export function bindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection): PhaseValidationBinding {
+  return {
+    worktreePath: worktree.path,
+    worktreeGitDirectory: worktree.worktreeGitDirectory,
+    baseOid: worktree.baseOid,
+    diffHash: createHash("sha256").update(inspection.diff).digest("hex"),
+    changedPathsHash: createHash("sha256").update(JSON.stringify(inspection.changedPaths)).digest("hex"),
+    changedPaths: inspection.changedPaths,
+  };
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      deepFreeze(nested);
+    }
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function originalMatchesIntake(snapshot: RepositorySnapshot, intake: RepositoryIntake): boolean {

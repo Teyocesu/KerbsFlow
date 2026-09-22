@@ -236,19 +236,29 @@ export function decideTrustedReview(input: TrustedReviewInput): TrustedReviewOut
     return { outcome: "rework", reasonCode: "validation_evidence_missing", failureClass: "validation_failure", evidence: [] };
   }
   const independentProof = input.validation.evidence.some((evidence) => evidence.classification === "automatically_tested" || evidence.classification === "manually_validated");
-  const checkAuthoritySupported = input.validation.checks.every((check) =>
-    check.outcome !== "passed"
-    || (check.evidenceClass !== "automatically_tested" && check.evidenceClass !== "manually_validated")
-    || input.validation.evidence.some((evidence) => evidence.classification === check.evidenceClass));
+  const checkAuthoritySupported = input.validation.checks.every((check) => {
+    if (check.outcome !== "passed" || (check.evidenceClass !== "automatically_tested" && check.evidenceClass !== "manually_validated")) {
+      return true;
+    }
+    const byId = check.evidenceIds ?? [];
+    const linked = input.validation.evidence.filter((evidence) =>
+      byId.includes(evidence.id) || (evidence.artifactRef !== undefined && check.evidenceRefs.includes(evidence.artifactRef)));
+    const everyIdResolves = byId.every((id) => input.validation.evidence.some((evidence) => evidence.id === id));
+    const everyArtifactResolves = check.evidenceRefs.every((artifactId) => input.validation.evidence.some((evidence) => evidence.artifactRef === artifactId));
+    return (byId.length > 0 || check.evidenceRefs.length > 0)
+      && everyIdResolves
+      && everyArtifactResolves
+      && linked.some((evidence) => evidence.classification === check.evidenceClass);
+  });
   if (!independentProof || !checkAuthoritySupported) {
     return { outcome: "rework", reasonCode: "validation_proof_insufficient", failureClass: "validation_failure", evidence: input.validation.evidence };
-  }
-  if (input.validation.outcome !== "passed" || input.validation.checks.some((check) => check.outcome !== "passed")) {
-    return { outcome: "rework", reasonCode: "validation_not_passed", failureClass: "validation_failure", evidence: input.validation.evidence };
   }
   const blocking = input.antiGreenwashing.filter((signal) => signal.blocksPass);
   if (blocking.length > 0) {
     return { outcome: "rework", reasonCode: `anti_greenwashing_${blocking[0]!.code}`, failureClass: "validation_failure", evidence: input.validation.evidence };
+  }
+  if (input.validation.outcome !== "passed" || input.validation.checks.some((check) => check.outcome !== "passed")) {
+    return { outcome: "rework", reasonCode: "validation_not_passed", failureClass: "validation_failure", evidence: input.validation.evidence };
   }
   const semanticRequired = input.antiGreenwashing.some((signal) => signal.semanticReviewRequired);
   if (semanticRequired && input.semanticReview === undefined) {

@@ -260,4 +260,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 2 is independently confirmed at `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. Phase 3 implementation and deterministic validation are complete on `phase3/verification-recovery`; independent review is pending. Phase 4 has not started.
+- Phase 2 is independently confirmed at `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. Phase 3 implementation and the targeted authority/integration corrections pass the deterministic gate on `phase3/verification-recovery`; independent re-audit is pending. Phase 4 has not started.

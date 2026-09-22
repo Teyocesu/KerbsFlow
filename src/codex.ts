@@ -25,6 +25,7 @@ import {
   parseSemanticReviewResult,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
+import { containsLikelySecret } from "./secrets.js";
 import {
   ProcessSupervisor,
   type ProcessIdentity,
@@ -1049,22 +1050,6 @@ function safeConfigToken(value: string): string {
     throw new KerbsFlowError("CODEX_CONFIG_INVALID", "reasoning effort contains unsupported characters");
   }
   return value;
-}
-
-function containsLikelySecret(value: unknown, key = ""): boolean {
-  if (/token|secret|password|authorization|api[_-]?key/iu.test(key)) {
-    return typeof value === "string" && value.length > 0;
-  }
-  if (typeof value === "string") {
-    return /\b(?:sk|sess)-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[^\s]+/iu.test(value);
-  }
-  if (Array.isArray(value)) {
-    return value.some((item) => containsLikelySecret(item));
-  }
-  if (typeof value === "object" && value !== null) {
-    return Object.entries(value).some(([entryKey, entryValue]) => containsLikelySecret(entryValue, entryKey));
-  }
-  return false;
 }
 
 const stringArray = { type: "array", items: { type: "string" } } as const;

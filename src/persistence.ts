@@ -18,6 +18,7 @@ import {
   GateId,
   TransitionId,
   ValidationBundle,
+  ValidationId,
   HumanGate,
   ReviewDecision,
   ReviewId,
@@ -30,6 +31,7 @@ import {
   asRunId,
   asTaskId,
   asTransitionId,
+  asValidationId,
   canonicalJson,
   parseHumanGate,
   parseCommand,
@@ -46,6 +48,8 @@ import {
 import { Clock, IdSource, RandomIdSource, SystemClock } from "./runtime.js";
 import { assertLegalTransition } from "./state-machine.js";
 import { DatabaseIntegrityError, IdempotencyConflictError, KerbsFlowError, NotFoundError, StateVersionConflictError } from "./errors.js";
+import { containsLikelySecret, SENSITIVE_RESULT_REJECTION } from "./secrets.js";
+import { assertAuthoritativePhaseValidation, type AuthoritativePhaseValidation, type PhaseValidationBinding } from "./verifier.js";
 
 export type SqlValue = string | number | bigint | Uint8Array | null;
 
@@ -296,6 +300,22 @@ export const MIGRATIONS: readonly Migration[] = [
       ALTER TABLE semantic_review_attempts ADD COLUMN stored_request_hash TEXT;
     `,
   },
+  {
+    version: 5,
+    name: "phase3-authoritative-validation",
+    sql: `
+      CREATE TABLE phase_validation_authority (
+        validation_id TEXT PRIMARY KEY REFERENCES validations(validation_id),
+        worktree_path TEXT NOT NULL,
+        worktree_git_directory TEXT NOT NULL,
+        base_oid TEXT NOT NULL,
+        diff_hash TEXT NOT NULL,
+        changed_paths_hash TEXT NOT NULL,
+        changed_paths_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -442,6 +462,11 @@ export interface StoredValidation {
   level: string;
   outcome: string;
   bundle: ValidationBundle;
+  createdAt: string;
+}
+
+export interface StoredPhaseValidationAuthority extends PhaseValidationBinding {
+  validationId: ValidationId;
   createdAt: string;
 }
 
@@ -596,6 +621,50 @@ export class StateStore {
     return row === undefined ? undefined : parseWorktreeRow(row);
   }
 
+  getValidation(validationId: ValidationId): StoredValidation | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM validations WHERE validation_id = ?").get(validationId) as Row | undefined;
+    return row === undefined ? undefined : parseValidationRow(row);
+  }
+
+  getPhaseValidationAuthority(validationId: ValidationId): StoredPhaseValidationAuthority | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM phase_validation_authority WHERE validation_id = ?").get(validationId) as Row | undefined;
+    return row === undefined ? undefined : parsePhaseValidationAuthorityRow(row);
+  }
+
+  recordAuthoritativePhaseValidation(value: AuthoritativePhaseValidation): StoredValidation {
+    this.assertOpen();
+    assertAuthoritativePhaseValidation(value);
+    const bundle = parseValidationBundle(value.bundle);
+    if (bundle.level !== "phase") {
+      throw new KerbsFlowError("VALIDATION_LEVEL_MISMATCH", "authoritative phase recording requires phase-level evidence");
+    }
+    return this.withTransaction((tx) => {
+      const run = tx.get("SELECT state, current_task_id, active_attempt_id FROM runs WHERE run_id = ?", bundle.runId) as Row | undefined;
+      if (run?.state !== "VERIFY_PHASE" || run.current_task_id !== bundle.taskId || run.active_attempt_id !== bundle.attemptId) {
+        throw new KerbsFlowError("VALIDATION_SCOPE_MISMATCH", "phase validation does not match the current VERIFY_PHASE run/task/attempt");
+      }
+      const worktree = tx.get("SELECT worktree_path, worktree_git_directory, base_oid FROM worktrees WHERE run_id = ?", bundle.runId) as Row | undefined;
+      if (worktree?.worktree_path !== value.binding.worktreePath || worktree.worktree_git_directory !== value.binding.worktreeGitDirectory || worktree.base_oid !== value.binding.baseOid) {
+        throw new KerbsFlowError("VALIDATION_WORKTREE_MISMATCH", "phase validation is not bound to the persisted owned worktree identity");
+      }
+      const existing = tx.get("SELECT * FROM validations WHERE validation_id = ?", bundle.validationId) as Row | undefined;
+      if (existing !== undefined) {
+        const parsed = parseValidationRow(existing);
+        const authority = tx.get("SELECT * FROM phase_validation_authority WHERE validation_id = ?", bundle.validationId) as Row | undefined;
+        if (canonicalJson(parsed.bundle) !== canonicalJson(bundle) || authority === undefined || canonicalJson(parsePhaseValidationAuthorityRow(authority)) !== canonicalJson({ validationId: bundle.validationId, ...value.binding, createdAt: parsed.createdAt })) {
+          throw new KerbsFlowError("VALIDATION_RECORD_CONFLICT", `validation ${bundle.validationId} was reused with different evidence`);
+        }
+        return parsed;
+      }
+      const now = this.clock.now();
+      tx.run("INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, bundle.runId, bundle.taskId, bundle.attemptId ?? null, bundle.level, bundle.outcome, JSON.stringify(bundle), now);
+      tx.run("INSERT INTO phase_validation_authority (validation_id, worktree_path, worktree_git_directory, base_oid, diff_hash, changed_paths_hash, changed_paths_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, value.binding.worktreePath, value.binding.worktreeGitDirectory, value.binding.baseOid, value.binding.diffHash, value.binding.changedPathsHash, JSON.stringify(value.binding.changedPaths), now);
+      return parseValidationRow(tx.get("SELECT * FROM validations WHERE validation_id = ?", bundle.validationId)!);
+    });
+  }
+
   recordWorktree(record: StoredWorktree): StoredWorktree {
     this.assertOpen();
     return this.withTransaction((tx) => {
@@ -674,6 +743,9 @@ export class StateStore {
 
   markSemanticReviewRunning(reviewAttemptId: ReviewId, providerIdentity: JsonValue): StoredSemanticReviewAttempt {
     this.assertOpen();
+    if (!hasProviderIdentity(providerIdentity)) {
+      throw new KerbsFlowError("REVIEW_PROVIDER_IDENTITY_REQUIRED", "semantic review dispatch requires a persisted provider session or process identity");
+    }
     return this.withTransaction((tx) => {
       const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
       if (review.lifecycle !== "PREPARED") {
@@ -693,11 +765,21 @@ export class StateStore {
 
   completeSemanticReview(reviewAttemptId: ReviewId, resultValue: unknown): StoredSemanticReviewAttempt {
     this.assertOpen();
+    if (containsLikelySecret(resultValue)) {
+      const current = this.getSemanticReviewAttempt(reviewAttemptId);
+      if (current?.lifecycle === "PREPARED" || current?.lifecycle === "RUNNING") {
+        this.failSemanticReview(reviewAttemptId, SENSITIVE_RESULT_REJECTION, false);
+      }
+      throw new KerbsFlowError("REVIEW_RESULT_SENSITIVE", SENSITIVE_RESULT_REJECTION);
+    }
     const result = parseSemanticReviewResult(resultValue);
     return this.withTransaction((tx) => {
       const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
-      if (review.lifecycle !== "RUNNING" && review.lifecycle !== "PREPARED") {
-        throw new KerbsFlowError("REVIEW_NOT_ACTIVE", `review attempt ${reviewAttemptId} is ${review.lifecycle}`);
+      if (review.lifecycle !== "RUNNING") {
+        throw new KerbsFlowError("REVIEW_NOT_RUNNING", `review attempt ${reviewAttemptId} is ${review.lifecycle}; only RUNNING review work can succeed`);
+      }
+      if (review.providerIdentityJson === null || !hasProviderIdentity(JSON.parse(review.providerIdentityJson))) {
+        throw new KerbsFlowError("REVIEW_PROVIDER_IDENTITY_REQUIRED", "semantic review completion requires persisted provider session or process identity");
       }
       if (result.reviewAttemptId !== review.reviewAttemptId || result.runId !== review.runId || result.taskId !== review.taskId || result.attemptId !== review.attemptId) {
         throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "semantic review result identity does not match its persisted request");
@@ -716,6 +798,7 @@ export class StateStore {
 
   failSemanticReview(reviewAttemptId: ReviewId, summary: string, uncertain = false): StoredSemanticReviewAttempt {
     this.assertOpen();
+    const safeSummary = containsLikelySecret(summary) ? "semantic review failure contained likely credential material and was redacted" : summary;
     return this.withTransaction((tx) => {
       const review = this.requiredSemanticReviewInTransaction(tx, reviewAttemptId);
       if (review.lifecycle !== "PREPARED" && review.lifecycle !== "RUNNING") {
@@ -725,7 +808,7 @@ export class StateStore {
       tx.run(
         "UPDATE semantic_review_attempts SET lifecycle = ?, failure_summary = ?, ended_at = ?, updated_at = ? WHERE review_attempt_id = ?",
         uncertain ? "UNKNOWN" : "FAILED",
-        summary.slice(0, 4000),
+        safeSummary.slice(0, 4000),
         now,
         now,
         reviewAttemptId,
@@ -1188,6 +1271,14 @@ export class StateStore {
   }
 }
 
+function hasProviderIdentity(value: unknown): boolean {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const providerSessionId = (value as Record<string, unknown>).providerSessionId;
+  return typeof providerSessionId === "string" && providerSessionId.trim().length > 0;
+}
+
 interface StoredCommand {
   idempotencyKey: string;
   requestHash: string;
@@ -1467,6 +1558,23 @@ function parseValidationRow(row: Row): StoredValidation {
     outcome: stringValue(row.outcome, "validations.outcome"),
     bundle: parseValidationBundle(JSON.parse(stringValue(row.bundle_json, "validations.bundle_json")), "validations.bundle_json"),
     createdAt: stringValue(row.created_at, "validations.created_at"),
+  };
+}
+
+function parsePhaseValidationAuthorityRow(row: Row): StoredPhaseValidationAuthority {
+  const changedPaths = JSON.parse(stringValue(row.changed_paths_json, "phase_validation_authority.changed_paths_json")) as unknown;
+  if (!Array.isArray(changedPaths) || changedPaths.some((path) => typeof path !== "string")) {
+    throw new KerbsFlowError("PERSISTED_ROW_INVALID", "phase_validation_authority.changed_paths_json must be a string array");
+  }
+  return {
+    validationId: asValidationId(stringValue(row.validation_id, "phase_validation_authority.validation_id")),
+    worktreePath: stringValue(row.worktree_path, "phase_validation_authority.worktree_path"),
+    worktreeGitDirectory: stringValue(row.worktree_git_directory, "phase_validation_authority.worktree_git_directory"),
+    baseOid: stringValue(row.base_oid, "phase_validation_authority.base_oid"),
+    diffHash: stringValue(row.diff_hash, "phase_validation_authority.diff_hash"),
+    changedPathsHash: stringValue(row.changed_paths_hash, "phase_validation_authority.changed_paths_hash"),
+    changedPaths,
+    createdAt: stringValue(row.created_at, "phase_validation_authority.created_at"),
   };
 }
 

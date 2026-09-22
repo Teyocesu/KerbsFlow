@@ -96,6 +96,54 @@ test("likely credentials are rejected before reviewer dispatch or persistence", 
   }
 });
 
+for (const sensitiveResult of [
+  { label: "Bearer token", apply: (result: Record<string, unknown>) => ({ ...result, summary: "Bearer super-secret-fixture-token" }) },
+  { label: "API key finding", apply: (result: Record<string, unknown>) => ({ ...result, findings: [{ code: "secret", severity: "warning", summary: "api_key=fixture-secret-value" }] }) },
+] as const) {
+  test(`semantic reviewer ${sensitiveResult.label} is rejected at the persistence boundary`, async () => {
+    const fixture = reviewerFixture(`sensitive_result_${sensitiveResult.label.replaceAll(" ", "_")}`);
+    try {
+      fixture.adapter.result = sensitiveResult.apply(validReview(fixture));
+      await assert.rejects(() => fixture.reviewer.review(fixture.input), /credential|sensitive/i);
+      const stored = fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId);
+      assert.equal(stored?.lifecycle, "FAILED");
+      assert.equal(stored?.result, null);
+      assert.doesNotMatch(stored?.failureSummary ?? "", /super-secret|fixture-secret-value/i);
+    } finally {
+      fixture.close();
+    }
+  });
+}
+
+test("semantic review lifecycle cannot manufacture authority from PREPARED or missing identity", () => {
+  const fixture = reviewerFixture("lifecycle_authority");
+  try {
+    fixture.fixture.store.prepareSemanticReview(semanticRequest(fixture.input));
+    assert.throws(() => fixture.fixture.store.completeSemanticReview(fixture.input.reviewAttemptId, validReview(fixture)), /RUNNING/i);
+    assert.throws(() => fixture.fixture.store.markSemanticReviewRunning(fixture.input.reviewAttemptId, {}), /identity/i);
+    fixture.fixture.store.markSemanticReviewRunning(fixture.input.reviewAttemptId, { providerSessionId: "process:fixture:42" });
+    assert.equal(fixture.fixture.store.completeSemanticReview(fixture.input.reviewAttemptId, validReview(fixture)).lifecycle, "SUCCEEDED");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("direct semantic result persistence rejects secrets without retaining their value", () => {
+  const fixture = reviewerFixture("direct_secret");
+  try {
+    fixture.fixture.store.prepareSemanticReview(semanticRequest(fixture.input));
+    fixture.fixture.store.markSemanticReviewRunning(fixture.input.reviewAttemptId, { providerSessionId: "process:fixture:43" });
+    const secret = "Bearer direct-boundary-secret";
+    assert.throws(() => fixture.fixture.store.completeSemanticReview(fixture.input.reviewAttemptId, { ...validReview(fixture), summary: secret }), /credential|sensitive/i);
+    const stored = fixture.fixture.store.getSemanticReviewAttempt(fixture.input.reviewAttemptId);
+    assert.equal(stored?.result, null);
+    assert.equal(stored?.lifecycle, "FAILED");
+    assert.doesNotMatch(JSON.stringify(stored), /direct-boundary-secret/);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("malformed reviewer output fails closed and restart disposition forbids duplicate review", async () => {
   const fixture = reviewerFixture("malformed");
   try {

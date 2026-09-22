@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { dirname } from "node:path";
 
 import {
   AttemptHandle,
@@ -11,10 +11,12 @@ import {
   HumanGate,
   JsonValue,
   ReviewDecision,
+  ReviewId,
   RunId,
   RunState,
   TaskId,
   ValidationBundle,
+  ValidationId,
   asAttemptId,
   asCommandId,
   asGateId,
@@ -33,7 +35,6 @@ import {
   parseReviewDecision,
   parseValidationBundle,
   parseCommand,
-  parseSemanticReviewResult,
   canonicalJson,
 } from "./contracts.js";
 import type { ExecutorAdapter } from "./adapter.js";
@@ -53,6 +54,8 @@ import { assertLegalTransition, assertResumeTarget, choosePauseContract, isLegal
 import { detectAntiGreenwashing } from "./anti-greenwashing.js";
 import { decideTrustedReview } from "./phase3.js";
 import { hashCanonicalDocuments } from "./canonical.js";
+import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
+import { bindingFor } from "./verifier.js";
 import {
   ConfigLayers,
   DEFAULT_HARD_INVARIANTS,
@@ -555,30 +558,60 @@ export class KerbsFlowCore {
     expectedStateVersion: number,
     idempotencyKey: string,
     input: {
-      validation: unknown;
-      diff: string;
-      changedPaths: string[];
-      semanticReview?: unknown;
+      validationId: ValidationId;
+      semanticReviewId?: ReviewId;
     },
   ): CommandResult {
-    const validation = parseValidationBundle(input.validation);
-    const semanticReview = input.semanticReview === undefined ? undefined : parseSemanticReviewResult(input.semanticReview);
-    const diffHash = createHash("sha256").update(input.diff).digest("hex");
-    if (semanticReview !== undefined) {
-      const persistedReview = this.store.getSemanticReviewAttempt(semanticReview.reviewAttemptId);
-      if (persistedReview?.lifecycle !== "SUCCEEDED" || persistedReview.result === null || canonicalJson(persistedReview.result) !== canonicalJson(semanticReview)) {
+    const persistedValidation = this.store.getValidation(input.validationId);
+    const authority = this.store.getPhaseValidationAuthority(input.validationId);
+    if (persistedValidation === undefined || authority === undefined) {
+      throw new KerbsFlowError("PHASE_VALIDATION_UNPERSISTED", "trusted phase closure requires a previously persisted authoritative phase validation");
+    }
+    const validation = persistedValidation.bundle;
+    const storedWorktree = this.store.getWorktree(runId);
+    if (storedWorktree === undefined) {
+      throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "trusted phase closure requires the persisted owned worktree");
+    }
+    const worktree: WorktreeRecord = {
+      schemaVersion: "kerbsflow.worktree/v1",
+      runKey: runId,
+      repositoryPath: storedWorktree.repositoryPath,
+      gitCommonDirectory: storedWorktree.gitCommonDirectory,
+      worktreeGitDirectory: storedWorktree.worktreeGitDirectory,
+      baseOid: storedWorktree.baseOid,
+      branch: storedWorktree.branch,
+      path: storedWorktree.worktreePath,
+      markerPath: storedWorktree.markerPath,
+      createdAt: storedWorktree.createdAt,
+    };
+    const inspection = new GitWorktreeManager(dirname(dirname(storedWorktree.markerPath))).inspect(worktree);
+    const currentBinding = bindingFor(worktree, inspection);
+    if (canonicalJson(currentBinding) !== canonicalJson({
+      worktreePath: authority.worktreePath,
+      worktreeGitDirectory: authority.worktreeGitDirectory,
+      baseOid: authority.baseOid,
+      diffHash: authority.diffHash,
+      changedPathsHash: authority.changedPathsHash,
+      changedPaths: authority.changedPaths,
+    })) {
+      throw new KerbsFlowError("PHASE_VALIDATION_STALE", "owned worktree diff or changed-path evidence changed after phase validation");
+    }
+    const persistedReview = input.semanticReviewId === undefined ? undefined : this.store.getSemanticReviewAttempt(input.semanticReviewId);
+    const semanticReview = persistedReview?.result ?? undefined;
+    if (input.semanticReviewId !== undefined) {
+      if (persistedReview?.lifecycle !== "SUCCEEDED" || semanticReview === undefined) {
         throw new KerbsFlowError("REVIEW_EVIDENCE_UNPERSISTED", "trusted phase closure requires the exact persisted terminal semantic review result");
       }
       const reviewedTask = this.store.getTask(persistedReview.taskId);
       if (
-        persistedReview.request.diffHash !== diffHash
+        persistedReview.request.diffHash !== authority.diffHash
         || !persistedReview.request.validationIds.includes(validation.validationId)
         || reviewedTask?.decision.canonicalContextHash !== persistedReview.request.canonicalContextHash
       ) {
         throw new KerbsFlowError("REVIEW_EVIDENCE_STALE", "semantic review evidence does not match the canonical context, diff, and validation used for phase closure");
       }
     }
-    const antiGreenwashing = detectAntiGreenwashing(input.diff, input.changedPaths);
+    const antiGreenwashing = detectAntiGreenwashing(inspection.diff, inspection.changedPaths);
     const canonicalSnapshot = this.store.getCanonicalSnapshot(runId);
     let canonicalIntentCurrent = false;
     if (canonicalSnapshot !== undefined) {
@@ -599,7 +632,7 @@ export class KerbsFlowCore {
     });
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", {
       validationId: validation.validationId,
-      diffHash,
+      diffHash: authority.diffHash,
       ...(semanticReview === undefined ? {} : { semanticReviewId: semanticReview.reviewAttemptId }),
     });
     return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
@@ -612,17 +645,6 @@ export class KerbsFlowCore {
       if (semanticReview !== undefined && (semanticReview.runId !== runId || semanticReview.taskId !== run.currentTaskId || semanticReview.attemptId !== run.activeAttemptId)) {
         throw new KerbsFlowError("REVIEW_SCOPE_MISMATCH", "semantic review is stale or belongs to another run/task/attempt");
       }
-      tx.run(
-        "INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        validation.validationId,
-        runId,
-        validation.taskId,
-        validation.attemptId,
-        validation.level,
-        validation.outcome,
-        JSON.stringify(validation),
-        now,
-      );
       const reviewId = asReviewId(nextId("review"));
       const reviewDecision: ReviewDecision = {
         schemaVersion: CONTRACT_VERSIONS.reviewDecision,

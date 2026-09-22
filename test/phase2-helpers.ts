@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -10,7 +10,12 @@ export function createGitRepository(): { root: string; head: string } {
   git(root, ["config", "user.email", "kerbsflow@example.invalid"]);
   writeFileSync(join(root, "README.md"), "synthetic repository\n", "utf8");
   writeFileSync(join(root, "check.mjs"), "import { readFileSync } from 'node:fs';\nif (readFileSync('result.txt', 'utf8') !== 'done\\n') process.exit(1);\n", "utf8");
-  git(root, ["add", "README.md", "check.mjs"]);
+  mkdirSync(join(root, "docs"));
+  writeFileSync(join(root, "AGENTS.md"), "synthetic agent policy\n", "utf8");
+  writeFileSync(join(root, "docs/SPEC-v0.1.0.md"), "synthetic frozen spec\n", "utf8");
+  writeFileSync(join(root, "docs/PLAN-v0.1.0.md"), "synthetic plan\n", "utf8");
+  writeFileSync(join(root, "docs/HANDOFF.md"), "synthetic handoff\n", "utf8");
+  git(root, ["add", "README.md", "check.mjs", "AGENTS.md", "docs"]);
   git(root, ["commit", "--quiet", "-m", "initial"]);
   return { root, head: git(root, ["rev-parse", "HEAD"]) };
 }
@@ -119,6 +124,13 @@ if (scenario === "timeout" || scenario === "cancel-output") {
   process.exit(7);
 } else if (scenario === "failure") {
   writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "implementation_failure", recommendedNext: "rework" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "architecture-ambiguity") {
+  writeFileSync(resultPath, JSON.stringify({ ...base, outcome: "failed", failureClass: "requirement_or_architecture_ambiguity", recommendedNext: "human_gate" }));
+  console.log(JSON.stringify({ type: "turn.completed" }));
+} else if (scenario === "scope-violation") {
+  writeFileSync("README.md", "out of scope\\n");
+  writeFileSync(resultPath, JSON.stringify({ ...base, filesChanged: [{ path: "README.md", change: "modified" }], scopeClaim: "violated", outcome: "failed", failureClass: "scope_violation", recommendedNext: "human_gate" }));
   console.log(JSON.stringify({ type: "turn.completed" }));
 } else if (scenario === "gate") {
   writeFileSync(resultPath, JSON.stringify({

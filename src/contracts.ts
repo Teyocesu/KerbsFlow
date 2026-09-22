@@ -323,6 +323,7 @@ export interface ValidationCheck {
   outcome: "passed" | "failed" | "skipped" | "not_run" | "unknown";
   evidenceClass: EvidenceClassification;
   evidenceRefs: ArtifactId[];
+  evidenceIds?: ValidationId[];
 }
 
 export interface ValidationBundle {
@@ -1286,7 +1287,7 @@ function parseFilesChanged(value: unknown, path: string): ExecutorResult["filesC
 function parseChecks(value: unknown, path: string): ValidationCheck[] {
   return array(value, path).map((entry, index) => {
     const object = record(entry, `${path}[${index}]`);
-    assertKeys(object, ["name", "outcome", "evidenceClass", "evidenceRefs"], `${path}[${index}]`);
+    assertKeys(object, ["name", "outcome", "evidenceClass", "evidenceRefs", "evidenceIds"], `${path}[${index}]`);
     const outcome = object.outcome;
     if (outcome !== "passed" && outcome !== "failed" && outcome !== "skipped" && outcome !== "not_run" && outcome !== "unknown") {
       throw new ContractValidationError(`${path}[${index}].outcome`, "unknown check outcome");
@@ -1296,6 +1297,7 @@ function parseChecks(value: unknown, path: string): ValidationCheck[] {
       outcome,
       evidenceClass: parseEvidenceClass(object.evidenceClass, `${path}[${index}].evidenceClass`),
       evidenceRefs: parseIdArray(object.evidenceRefs, `${path}[${index}].evidenceRefs`, asArtifactId),
+      ...(object.evidenceIds === undefined ? {} : { evidenceIds: parseIdArray(object.evidenceIds, `${path}[${index}].evidenceIds`, asValidationId) }),
     };
   });
 }

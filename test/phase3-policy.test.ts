@@ -107,6 +107,16 @@ test("trusted phase close rejects lower evidence and accepts a passing phase bun
   assert.equal(decideTrustedReview({ requiredLevel: "phase", validation: bundle("phase"), antiGreenwashing: [], canonicalIntentCurrent: false, phaseCloseRequested: true }).outcome, "human_gate");
 });
 
+test("each passing automatic check requires its own explicit matching evidence linkage", () => {
+  const missing = bundle("phase");
+  missing.checks[0] = { ...missing.checks[0]!, evidenceIds: [] };
+  assert.equal(decideTrustedReview({ requiredLevel: "phase", validation: missing, antiGreenwashing: [], canonicalIntentCurrent: true, phaseCloseRequested: true }).reasonCode, "validation_proof_insufficient");
+
+  const unrelated = bundle("phase");
+  unrelated.checks.push({ name: "second gate", outcome: "passed", evidenceClass: "automatically_tested", evidenceRefs: [], evidenceIds: [asValidationId("validation_unrelated")] });
+  assert.equal(decideTrustedReview({ requiredLevel: "phase", validation: unrelated, antiGreenwashing: [], canonicalIntentCurrent: true, phaseCloseRequested: true }).reasonCode, "validation_proof_insufficient");
+});
+
 function bundle(level: "focused" | "phase" | "full"): ValidationBundle {
   return {
     schemaVersion: CONTRACT_VERSIONS.validation,
@@ -117,7 +127,7 @@ function bundle(level: "focused" | "phase" | "full"): ValidationBundle {
     level,
     outcome: "passed",
     summary: "independent validation passed",
-    checks: [{ name: "gate", outcome: "passed", evidenceClass: "automatically_tested", evidenceRefs: [] }],
+    checks: [{ name: "gate", outcome: "passed", evidenceClass: "automatically_tested", evidenceRefs: [], evidenceIds: [asValidationId(`validation_evidence_${level}`)] }],
     evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(`validation_evidence_${level}`), kind: "check", classification: "automatically_tested", summary: "command ran" }],
   };
 }

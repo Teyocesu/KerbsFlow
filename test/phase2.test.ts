@@ -207,7 +207,8 @@ test("synthetic real vertical loop writes only the owned worktree and passes ind
       executionTimeoutMs: 5000,
     });
     assert.equal(result.verdict, "PASS");
-    assert.equal(store.readModel(runId)?.run.state, "VERIFY_PHASE");
+    assert.equal(store.readModel(runId)?.run.state, "NEXT_PHASE");
+    assert.ok(store.getCanonicalSnapshot(runId));
     assert.equal(result.verification?.bundle.outcome, "passed");
     assert.deepEqual(result.verification?.verifierMutations, []);
     assert.equal(git(repository.root, ["status", "--porcelain"]), "");
@@ -341,6 +342,8 @@ for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch"] as 
 
 for (const expected of [
   { scenario: "failure", state: "REWORK", verdict: "REWORK" },
+  { scenario: "architecture-ambiguity", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
+  { scenario: "scope-violation", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
   { scenario: "gate", state: "HUMAN_GATE", verdict: "HUMAN_GATE" },
   { scenario: "malformed-result", state: "RECOVERY", verdict: "RECOVERY" },
 ] as const) {
@@ -378,6 +381,9 @@ for (const expected of [
       });
       assert.equal(result.verdict, expected.verdict);
       assert.equal(store.readModel(runId)?.run.state, expected.state);
+      if (expected.scenario === "failure" || expected.scenario === "architecture-ambiguity" || expected.scenario === "scope-violation") {
+        assert.equal(store.listFailureOccurrences(runId, taskId).length, 1);
+      }
       assert.equal(git(repository.root, ["status", "--porcelain"]), "");
     } finally {
       store.close();

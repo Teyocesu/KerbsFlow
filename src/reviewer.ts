@@ -16,6 +16,7 @@ import {
 import { KerbsFlowError } from "./errors.js";
 import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
 import { StateStore } from "./persistence.js";
+import { containsLikelySecret } from "./secrets.js";
 
 export interface SemanticReviewInput {
   reviewAttemptId: ReviewId;
@@ -153,10 +154,7 @@ function bounded(value: string, maximum: number, label: string): string {
 
 function assertReviewContextContainsNoLikelySecret(input: SemanticReviewInput): void {
   const context = [input.canonicalContract, input.diff, JSON.stringify(input.validation), JSON.stringify(input.evidenceRefs)].join("\n");
-  if (
-    /\b(?:sk|sess)-[A-Za-z0-9_-]{8,}\b|\bBearer\s+[^\s"']+|\bAKIA[0-9A-Z]{16}\b/iu.test(context)
-    || /\b(?:token|secret|password|authorization|api[_-]?key)\s*[:=]\s*["']?[^\s"',;}]{8,}/iu.test(context)
-  ) {
+  if (containsLikelySecret(context)) {
     throw new KerbsFlowError("REVIEW_CONTEXT_SENSITIVE", "semantic review context contains likely credential material and cannot be dispatched or persisted");
   }
 }
