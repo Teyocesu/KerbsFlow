@@ -16,6 +16,8 @@ import {
 } from "./contracts.js";
 import type { AdapterRoutingReadiness, ExecutorAdapter } from "./adapter.js";
 import { KerbsFlowError } from "./errors.js";
+import { isolationIssues, type IsolationRequirement } from "./isolation.js";
+import { redactDiagnostic } from "./secrets.js";
 
 export const ROUTING_DECISION_VERSION = "kerbsflow.routing-decision/v1" as const;
 export const ATTEMPT_ROUTING_VERSION = "kerbsflow.attempt-routing/v1" as const;
@@ -101,6 +103,7 @@ export interface RoutingRequest {
   classification: WorkClassification;
   discovery: RoutingDiscoveryAuthority;
   requiresShell?: boolean;
+  requiredIsolation?: IsolationRequirement;
 }
 
 export interface RoutedPlanning {
@@ -193,7 +196,7 @@ export class RoutedExecutorAdapter implements ExecutorAdapter {
       try {
         return { name, result: await adapter.reconcile(identity) };
       } catch (error) {
-        return { name, result: { outcome: "unknown" as const, summary: `${name} reconciliation failed: ${error instanceof Error ? error.message : String(error)}` } };
+        return { name, result: { outcome: "unknown" as const, summary: `${name} reconciliation failed: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}` } };
       }
     }));
     const evidence = outcomes.filter(({ result }) => result.outcome === "running" || result.outcome === "terminal");
@@ -256,7 +259,7 @@ export class RoutingDiscovery {
         discovered.set(registration.adapter, { descriptor, ...(readiness === undefined ? {} : { readiness }) });
       } catch (error) {
         if (error instanceof KerbsFlowError && error.code === "ADAPTER_IDENTITY_MISMATCH") throw error;
-        discovered.set(registration.adapter, { issue: `capability/readiness probe failed: ${error instanceof Error ? error.message : String(error)}` });
+        discovered.set(registration.adapter, { issue: `capability/readiness probe failed: ${redactDiagnostic(error instanceof Error ? error.message : String(error))}` });
       }
     }
 
@@ -308,7 +311,8 @@ export class PolicyRouter {
     const decision = parsePlanningDecision(request.planningDecision);
     const discovery = assertRoutingDiscoveryAuthority(request.discovery);
     const candidates = [...discovery.candidates];
-    const considered = candidates.map((candidate) => this.consider(candidate, request.classification, request.requiresShell ?? false));
+    const requiredIsolation = request.requiredIsolation ?? { filesystem: "tool_policy_only", workloadNetwork: "tool_policy_only" };
+    const considered = candidates.map((candidate) => this.consider(candidate, request.classification, request.requiresShell ?? false, requiredIsolation));
     const selected = this.select(considered, request.classification);
     if (selected === undefined) {
       throw new KerbsFlowError("ROUTE_UNAVAILABLE", `no Phase 4 route satisfies ${request.classification} work and its required capabilities`);
@@ -350,7 +354,7 @@ export class PolicyRouter {
     };
   }
 
-  private consider(candidate: RouteCandidate, classification: WorkClassification, requiresShell: boolean): ConsideredRoute {
+  private consider(candidate: RouteCandidate, classification: WorkClassification, requiresShell: boolean, requiredIsolation: IsolationRequirement): ConsideredRoute {
     const reasons: string[] = [];
     let suitable = true;
     if (!candidate.available) {
@@ -362,7 +366,7 @@ export class PolicyRouter {
       suitable = false;
       reasons.push("no validated adapter capability descriptor is available");
     } else {
-      const issues = capabilityIssues(candidate.adapter, descriptor);
+      const issues = capabilityIssues(candidate.adapter, descriptor, requiredIsolation);
       reasons.push(...issues);
       if (issues.length > 0) suitable = false;
     }
@@ -486,8 +490,8 @@ export function assertTrustedAttemptRoutingProvenance(value: AttemptRoutingProve
   return value as TrustedAttemptRoutingProvenance;
 }
 
-export function adapterCapabilityHash(value: AdapterDescriptor): string {
-  return sha256(stableJson(parseAdapterDescriptor(value)));
+export function adapterCapabilityHash(value: AdapterDescriptor, platform: NodeJS.Platform = process.platform): string {
+  return sha256(stableJson({ platform, descriptor: parseAdapterDescriptor(value) }));
 }
 
 export function assertAttemptRoutingBinding(input: AttemptRoutingBinding): AttemptRoutingProvenance {
@@ -562,8 +566,8 @@ function assertModelPolicy(models: readonly RouteModelPolicy[]): void {
   }
 }
 
-function capabilityIssues(adapter: RouteModelPolicy["adapter"], descriptor: AdapterDescriptor): string[] {
-  const issues: string[] = [];
+function capabilityIssues(adapter: RouteModelPolicy["adapter"], descriptor: AdapterDescriptor, requiredIsolation: IsolationRequirement): string[] {
+  const issues: string[] = isolationIssues(descriptor, requiredIsolation);
   if (!descriptor.capabilities.modelSelection) issues.push("adapter lacks authoritative model selection");
   if (!descriptor.capabilities.resumableSession) issues.push("adapter lacks resumable-session support");
   if (!descriptor.capabilities.healthProbe) issues.push("adapter lacks a health probe");

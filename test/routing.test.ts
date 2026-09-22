@@ -93,6 +93,26 @@ test("missing probed capabilities make a route unsuitable and Codex requires enf
   assert.throws(() => new PolicyRouter().route({ planningDecision: baseDecision(), classification: "normal", discovery: noMuse.discovery }), /no Phase 4 route/i);
 });
 
+test("a task requiring OS-enforced isolation cannot use a tool-policy-only route", async () => {
+  const available = await discover();
+  const routed = new PolicyRouter().route({
+    planningDecision: baseDecision(),
+    classification: "normal",
+    discovery: available.discovery,
+    requiredIsolation: { filesystem: "enforced", workloadNetwork: "enforced" },
+  });
+  assert.equal(routed.routingDecision.selected.adapter, "codex");
+  assert.match(routed.routingDecision.fallbackReason ?? "", /weaker than required/i);
+
+  const unavailable = await discover({ codexProbeError: new Error("Codex unavailable") });
+  assert.throws(() => new PolicyRouter().route({
+    planningDecision: baseDecision(),
+    classification: "normal",
+    discovery: unavailable.discovery,
+    requiredIsolation: { filesystem: "enforced", workloadNetwork: "enforced" },
+  }), /route.*unavailable|no Phase 4 route/i);
+});
+
 test("core Phase 4 dispatch rejects missing routing authority before adapter start", async () => {
   const missingDecision = await preparedRoutingFixture("missing-decision");
   try {

@@ -11,12 +11,12 @@ test("process supervisor uses explicit cwd/env and bounds output and JSONL", asy
   try {
     const process = new ProcessSupervisor().start({
       executable: processExecPath(),
-      args: ["-e", "console.log(JSON.stringify({type:'ok',cwd:process.cwd(),visible:process.env.VISIBLE,secret:'sk-fixture123456'})); process.stdout.write('x'.repeat(5000)); process.stderr.write('password=fixture-secret ' + 'e'.repeat(5000));"],
+      args: ["-e", "console.log(JSON.stringify({type:'ok',cwd:process.cwd(),visible:process.env.VISIBLE,secret:'sk-fixture123456'})); process.stdout.write('x'.repeat(5000)); process.stderr.write('ghp_synthetic123456 npm_synthetic123456 Cookie: session=synthetic-value postgres://user:pass@localhost/db ' + 'e'.repeat(5000));"],
       cwd: root,
       environment: { VISIBLE: "yes" },
       timeoutMs: 5000,
       maxStdoutBytes: 256,
-      maxStderrBytes: 128,
+      maxStderrBytes: 512,
       maxEventBytes: 256,
     });
     const result = await process.completion;
@@ -31,7 +31,10 @@ test("process supervisor uses explicit cwd/env and bounds output and JSONL", asy
     assert.equal((result.events[0]?.value as { visible?: string }).visible, "yes");
     assert.equal((result.events[0]?.value as { secret?: string }).secret, "<redacted>");
     assert.equal(result.stdout.includes("sk-fixture123456"), false);
-    assert.equal(result.stderr.includes("fixture-secret"), false);
+    assert.equal(result.stderr.includes("ghp_synthetic123456"), false);
+    assert.equal(result.stderr.includes("npm_synthetic123456"), false);
+    assert.equal(result.stderr.includes("session=synthetic-value"), false);
+    assert.equal(result.stderr.includes("user:pass"), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -121,6 +124,35 @@ test("cancellation escalates to a forced process-group kill after the grace peri
   }
 });
 
+test("cancellation terminates an owned grandchild even after the child exits", { skip: process.platform === "win32" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-process-tree-"));
+  try {
+    const supervised = new ProcessSupervisor().start({
+      executable: processExecPath(),
+      args: ["-e", `
+        const { spawn } = require('node:child_process');
+        const grandchild = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"], {stdio:['ignore','pipe','ignore']});
+        grandchild.stdout.once('data', () => console.log(JSON.stringify({type:'ready', grandchildPid: grandchild.pid})));
+        setInterval(() => {}, 1000);
+      `],
+      cwd: root,
+      environment: {},
+      timeoutMs: 5000,
+      gracePeriodMs: 30,
+    });
+    const ready = await supervised.events()[Symbol.asyncIterator]().next();
+    const grandchildPid = Number((ready.value?.value as { grandchildPid?: number }).grandchildPid);
+    assert.ok(Number.isSafeInteger(grandchildPid) && grandchildPid > 0);
+    assert.equal(supervised.cancel().outcome, "signal_sent");
+    const result = await supervised.completion;
+    assert.equal(result.forcedSignalSent, true);
+    assert.equal(result.processTreeEvidence, "group_absent_after_exit");
+    assert.throws(() => process.kill(grandchildPid, 0), (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex environment allowlist excludes common secret variables", () => {
   const environment = codexEnvironment({
     PATH: "/bin",
@@ -129,6 +161,12 @@ test("Codex environment allowlist excludes common secret variables", () => {
     OPENAI_API_KEY: "secret",
     AWS_SECRET_ACCESS_KEY: "secret",
     CUSTOM_TOKEN: "secret",
+    GITHUB_TOKEN: "secret",
+    GITLAB_PRIVATE_TOKEN: "secret",
+    NPM_TOKEN: "secret",
+    DATABASE_URL: "postgres://credential",
+    CI_JOB_JWT: "secret",
+    SSH_PRIVATE_KEY: "secret",
   });
   assert.deepEqual(environment, { PATH: "/bin", HOME: "/tmp/home", CODEX_HOME: "/tmp/codex" });
 });

@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import type { AdapterRoutingReadiness, ExecutorAdapter } from "./adapter.js";
@@ -19,7 +18,8 @@ import {
   parseExecutorResult,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
-import { containsLikelySecret } from "./secrets.js";
+import { containsLikelySecret, redactDiagnostic } from "./secrets.js";
+import { ensurePrivateDirectory } from "./paths.js";
 
 export const OPENCODE_SDK_VERSION = "2.0.13";
 export const OPENCODE_AGENT = "kerbsflow";
@@ -216,9 +216,8 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     if (!Number.isSafeInteger(this.closePreparationTimeoutMs) || this.closePreparationTimeoutMs < 1) {
       throw new KerbsFlowError("OPENCODE_CLOSE_TIMEOUT_INVALID", "OpenCode close preparation timeout must be a positive integer");
     }
-    this.root = resolve(options.runtimeRoot, "opencode");
+    this.root = ensurePrivateDirectory(resolve(ensurePrivateDirectory(options.runtimeRoot), "opencode"));
     this.databasePath = join(this.root, "sessions.sqlite");
-    mkdirSync(this.root, { recursive: true, mode: 0o700 });
   }
 
   probe(): AdapterDescriptor {
@@ -827,7 +826,7 @@ function safeModelMetadata(model: OpenCodeModelInfo): OpenCodeModelInfo {
 }
 
 function message(error: unknown): string {
-  return error instanceof Error ? error.message : "unknown OpenCode error";
+  return error instanceof Error ? redactDiagnostic(error.message) : "unknown OpenCode error";
 }
 
 function occurrences(value: string, marker: string): number {

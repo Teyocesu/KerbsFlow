@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 
 import { KerbsFlowError } from "./errors.js";
+import { redactDiagnostic, sanitizeDiagnosticValue } from "./secrets.js";
 
 export interface SupervisedProcessSpec {
   executable: string;
@@ -65,7 +66,8 @@ export class SupervisedProcess {
   readonly identity: ProcessIdentity;
   readonly completion: Promise<ProcessResult>;
 
-  private completed = false;
+  private childExited = false;
+  private settled = false;
   private cancellationRequested = false;
   private gracefulSignalSent = false;
   private forcedSignalSent = false;
@@ -89,10 +91,10 @@ export class SupervisedProcess {
   }
 
   cancel(): SupervisorCancelResult {
-    this.cancellationRequested = true;
-    if (this.completed) {
+    if (this.settled) {
       return { outcome: "already_terminal", summary: "process was already terminal", processTreeEvidence: this.processTreeEvidence };
     }
+    this.cancellationRequested = true;
     if (!Number.isSafeInteger(this.identity.pid) || this.identity.pid <= 0) {
       return { outcome: "unknown", summary: "process has no valid positive PID to signal", processTreeEvidence: "not_signalled" };
     }
@@ -108,7 +110,7 @@ export class SupervisedProcess {
       this.forceTimer.unref();
       return { outcome: "signal_sent", summary: "graceful termination signal sent", processTreeEvidence: this.processTreeEvidence };
     } catch (error) {
-      return { outcome: "unknown", summary: error instanceof Error ? error.message : "termination signal failed", processTreeEvidence: this.processTreeEvidence };
+      return { outcome: "unknown", summary: error instanceof Error ? redactDiagnostic(error.message) : "termination signal failed", processTreeEvidence: this.processTreeEvidence };
     }
   }
 
@@ -117,24 +119,18 @@ export class SupervisedProcess {
     return this.cancel();
   }
 
-  finish(): void {
-    this.completed = true;
-    if (this.forceTimer !== undefined) {
-      clearTimeout(this.forceTimer);
-    }
-  }
-
-  observeProcessGroupAfterExit(): void {
+  async settleAfterChildExit(): Promise<void> {
+    this.childExited = true;
     if (this.identity.processGroup !== "owned_posix_group" || (!this.gracefulSignalSent && !this.forcedSignalSent)) {
+      this.finishSettlement();
       return;
     }
-    try {
-      process.kill(-this.identity.pid, 0);
-    } catch (error) {
-      if (typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH") {
-        this.processTreeEvidence = "group_absent_after_exit";
-      }
+    const deadline = Date.now() + this.gracePeriodMs + 1000;
+    while (!this.processGroupAbsent() && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
     }
+    if (this.processGroupAbsent()) this.processTreeEvidence = "group_absent_after_exit";
+    this.finishSettlement();
   }
 
   snapshotTermination(): Pick<ProcessResult, "cancellationRequested" | "gracefulSignalSent" | "forcedSignalSent" | "processTreeEvidence" | "exitKind"> {
@@ -148,7 +144,7 @@ export class SupervisedProcess {
   }
 
   private force(): void {
-    if (this.completed) {
+    if (this.settled || (this.childExited && this.identity.processGroup !== "owned_posix_group")) {
       return;
     }
     try {
@@ -160,6 +156,20 @@ export class SupervisedProcess {
     } catch {
       // The exit event is the authority; a racing ESRCH means the process may already be gone.
     }
+  }
+
+  private processGroupAbsent(): boolean {
+    try {
+      process.kill(-this.identity.pid, 0);
+      return false;
+    } catch (error) {
+      return typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH";
+    }
+  }
+
+  private finishSettlement(): void {
+    this.settled = true;
+    if (this.forceTimer !== undefined) clearTimeout(this.forceTimer);
   }
 }
 
@@ -228,10 +238,9 @@ export class ProcessSupervisor {
       child.once("error", (error) => {
         spawnError = redactMessage(error.message);
       });
-      child.once("close", (exitCode, signal) => {
+      child.once("close", async (exitCode, signal) => {
         clearTimeout(timeout);
-        supervised.finish();
-        supervised.observeProcessGroupAfterExit();
+        await supervised.settleAfterChildExit();
         if (pending.length > 0 && eventBytes + Buffer.byteLength(pending) <= eventLimit) {
           eventBytesObserved += Buffer.byteLength(pending);
           const event = parseEvent(pending, events.length + 1);
@@ -394,24 +403,9 @@ function parseEvent(line: string, sequence: number): RawProcessEvent {
 }
 
 function redactMessage(message: string): string {
-  return message
-    .replace(/\b(?:sk|sess)-[A-Za-z0-9_-]{8,}\b/gu, "<redacted-credential>")
-    .replace(/\bBearer\s+[^\s"']+/giu, "Bearer <redacted>")
-    .replace(/((?:token|secret|password|authorization|api[_-]?key)\s*[:=]\s*)[^\s,;}]+/giu, "$1<redacted>");
+  return redactDiagnostic(message);
 }
 
 function sanitizeJson(value: unknown, key = ""): unknown {
-  if (/token|secret|password|authorization|api[_-]?key/iu.test(key)) {
-    return "<redacted>";
-  }
-  if (typeof value === "string") {
-    return redactMessage(value);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => sanitizeJson(item));
-  }
-  if (typeof value === "object" && value !== null) {
-    return Object.fromEntries(Object.entries(value).map(([entryKey, entryValue]) => [entryKey, sanitizeJson(entryValue, entryKey)]));
-  }
-  return value;
+  return sanitizeDiagnosticValue(value, key);
 }

@@ -25,7 +25,8 @@ import {
   parseSemanticReviewResult,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
-import { containsLikelySecret } from "./secrets.js";
+import { containsLikelySecret, redactDiagnostic } from "./secrets.js";
+import { ensurePrivateDirectory } from "./paths.js";
 import {
   ProcessSupervisor,
   type ProcessIdentity,
@@ -128,10 +129,9 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   constructor(private readonly options: CodexAdapterOptions) {
     this.supervisor = options.supervisor ?? new ProcessSupervisor();
     this.environment = codexEnvironment(options.environment ?? process.env);
-    this.attemptsRoot = resolve(options.runtimeRoot, "codex-attempts");
-    this.reviewsRoot = resolve(options.runtimeRoot, "codex-reviews");
-    mkdirSync(this.attemptsRoot, { recursive: true, mode: 0o700 });
-    mkdirSync(this.reviewsRoot, { recursive: true, mode: 0o700 });
+    const runtimeRoot = ensurePrivateDirectory(options.runtimeRoot);
+    this.attemptsRoot = ensurePrivateDirectory(resolve(runtimeRoot, "codex-attempts"));
+    this.reviewsRoot = ensurePrivateDirectory(resolve(runtimeRoot, "codex-reviews"));
   }
 
   probeReview(): AdapterDescriptor {
@@ -249,7 +249,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
         },
       } satisfies SemanticReviewResult;
     } catch (error) {
-      return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: error instanceof Error ? error.message : "review result invalid" };
+      return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: error instanceof Error ? redactDiagnostic(error.message) : "review result invalid" };
     }
   }
 
@@ -400,7 +400,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       }
       raw = JSON.parse(bytes.toString("utf8"));
     } catch (error) {
-      return invalidResult(`Codex structured result is unreadable: ${error instanceof Error ? error.message : "parse failed"}`, processResult);
+      return invalidResult(`Codex structured result is unreadable: ${error instanceof Error ? redactDiagnostic(error.message) : "parse failed"}`, processResult);
     }
     if (containsLikelySecret(raw)) {
       writeFileSync(session.resultPath, `${JSON.stringify({ redacted: true, reason: "likely credential material rejected" })}\n`, { encoding: "utf8", mode: 0o600 });
@@ -411,7 +411,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       assertResultScope(parsed, session.request);
       return normalizeTerminalResult(parsed, session.request, this.descriptor ?? this.probe(), processResult);
     } catch (error) {
-      return invalidResult(`Codex structured result failed runtime validation: ${error instanceof Error ? error.message : "invalid result"}`, processResult);
+      return invalidResult(`Codex structured result failed runtime validation: ${error instanceof Error ? redactDiagnostic(error.message) : "invalid result"}`, processResult);
     }
   }
 
@@ -466,7 +466,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
     try {
       metadata = readRecoveryMetadata(metadataPath, identity);
     } catch (error) {
-      return { outcome: "unknown", summary: error instanceof Error ? error.message : "durable Codex process metadata is invalid" };
+      return { outcome: "unknown", summary: error instanceof Error ? redactDiagnostic(error.message) : "durable Codex process metadata is invalid" };
     }
     if (!processGroupIsAbsent(metadata.process.pid, metadata.process.processGroup)) {
       return { outcome: "unknown", summary: "the durable Codex process group may still exist; terminal output cannot be trusted after restart" };
@@ -479,7 +479,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
     try {
       processEvidence = readDurableProcessResult(processResultPath);
     } catch (error) {
-      return { outcome: "unknown", summary: error instanceof Error ? error.message : "durable process-result evidence is invalid" };
+      return { outcome: "unknown", summary: error instanceof Error ? redactDiagnostic(error.message) : "durable process-result evidence is invalid" };
     }
     if (!sameProcessIdentity(metadata.process, processEvidence.identity)) {
       return { outcome: "unknown", summary: "durable process-result identity does not match the launched Codex process identity" };
@@ -583,7 +583,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       maxBuffer: 1024 * 1024,
     });
     if (result.error !== undefined || result.status !== 0) {
-      const detail = result.error?.message ?? (result.stderr.trim() || `exit ${String(result.status)}`);
+      const detail = redactDiagnostic(result.error?.message ?? (result.stderr.trim() || `exit ${String(result.status)}`));
       throw new KerbsFlowError("CODEX_PROBE_FAILED", `Codex ${label} probe failed: ${detail.slice(0, 2000)}`);
     }
     return `${result.stdout}\n${result.stderr}`.trim();
@@ -677,7 +677,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
     });
     const succeeded = result.error === undefined && result.status === 0;
     if (succeeded !== shouldSucceed) {
-      const detail = result.error?.message ?? (result.stderr.trim() || `exit ${String(result.status)}`);
+      const detail = redactDiagnostic(result.error?.message ?? (result.stderr.trim() || `exit ${String(result.status)}`));
       throw new KerbsFlowError("CODEX_ISOLATION_UNPROVEN", `Codex ${label} probe ${shouldSucceed ? "failed" : "was unexpectedly permitted"}: ${detail.slice(0, 2000)}`);
     }
   }
@@ -745,7 +745,7 @@ function readRecoveryMetadata(
       ...(raw.reasoning === undefined ? {} : { reasoning: raw.reasoning as string }),
     };
   } catch (error) {
-    throw new KerbsFlowError("CODEX_RECOVERY_METADATA_INVALID", `durable Codex process metadata is invalid: ${error instanceof Error ? error.message : "parse failed"}`);
+    throw new KerbsFlowError("CODEX_RECOVERY_METADATA_INVALID", `durable Codex process metadata is invalid: ${error instanceof Error ? redactDiagnostic(error.message) : "parse failed"}`);
   }
 }
 
@@ -811,7 +811,7 @@ function readDurableProcessResult(path: string): DurableProcessResultEvidence {
       processTreeEvidence: raw.processTreeEvidence as ProcessResult["processTreeEvidence"],
     };
   } catch (error) {
-    throw new KerbsFlowError("CODEX_PROCESS_RESULT_INVALID", `durable Codex process-result evidence is invalid: ${error instanceof Error ? error.message : "parse failed"}`);
+    throw new KerbsFlowError("CODEX_PROCESS_RESULT_INVALID", `durable Codex process-result evidence is invalid: ${error instanceof Error ? redactDiagnostic(error.message) : "parse failed"}`);
   }
 }
 

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -103,7 +103,7 @@ test("OpenCodeAdapter owns the embedded host, reports truthful capability streng
     assert.equal(readiness.ready, true);
     assert.deepEqual(readiness.providers, [{ id: "opencode", name: "OpenCode", activation: "enabled" }]);
     assert.equal(JSON.stringify(readiness).includes("apiKey"), false);
-    assert.equal(fixture.options?.database.path, join(fixture.root, "opencode", "sessions.sqlite"));
+    assert.equal(fixture.options?.database.path, join(realpathSync(fixture.root), "opencode", "sessions.sqlite"));
     assert.equal(fixture.options?.events.persist, true);
     assert.equal(fixture.options?.config.project, false);
     assert.match(fixture.options?.config.content ?? "", /"websearch":false/);
