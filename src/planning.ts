@@ -51,7 +51,7 @@ export function createPhase2PlanningDecision(input: Phase2ActionInput): Planning
   });
 }
 
-export function buildCodexPrompt(decision: PlanningDecision): string {
+export function buildExecutorPrompt(decision: PlanningDecision): string {
   const lines = [
     "You are the bounded KerbsFlow implementation executor for one approved action.",
     `Objective: ${decision.action.summary}`,
@@ -76,3 +76,5 @@ export function buildCodexPrompt(decision: PlanningDecision): string {
   }
   return prompt;
 }
+
+export const buildCodexPrompt = buildExecutorPrompt;

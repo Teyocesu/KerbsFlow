@@ -202,7 +202,7 @@ export function escalatePlanningRoute(
   return parsePlanningDecision({
     ...decision,
     route: {
-      ...decision.route,
+      adapter: "codex",
       model: route.model,
       ...(route.reasoning === undefined ? {} : { reasoning: route.reasoning }),
     },

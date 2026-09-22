@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- **Current state:** Phase 3 final authority/integration corrections and deterministic validation are complete at the remote HEAD of `phase3/verification-recovery`; Phase 4 has not started.
-- **Residual risks:** Independent re-audit and the optional live semantic-review smoke remain unperformed; bundled Codex `0.155.0-alpha.9.2` remains isolation-incompatible and fails closed.
-- **Next action:** Independently re-audit the new `phase3/verification-recovery` remote HEAD.
+- **Current state:** Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`; Phase 4 is in progress on `phase4/opencode-routing`.
+- **Residual risks:** OpenCode V2 adapter/routing implementation and deterministic validation remain incomplete; live OpenCode auth/model readiness is currently unavailable.
+- **Next action:** Complete the pinned embedded OpenCode adapter, typed routing, persistence, and Phase 4 deterministic gate.

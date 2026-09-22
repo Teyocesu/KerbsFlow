@@ -12,6 +12,9 @@
     "test": "npm run build && node --test dist/test/*.test.js",
     "test:live-codex": "npm run build && node scripts/live-codex-smoke.mjs"
   },
+  "dependencies": {
+    "@opencode/sdk": "2.0.13"
+  },
   "devDependencies": {
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"

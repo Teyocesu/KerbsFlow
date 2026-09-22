@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 3 implementation and deterministic validation complete; independent review pending**
+Status: **Phase 4 implementation in progress from independently approved Phase 3 baseline `00e6924c057d6f3e28dfbea3f10f03896f84b07f`**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -105,7 +105,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 3 — Verification, review, and conservative recovery
 
-**Status:** implementation and deterministic integration complete on `phase3/verification-recovery` from the independently approved Phase 2 baseline `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`; independent re-audit pending.
+**Status:** complete and independently confirmed at approved baseline `00e6924c057d6f3e28dfbea3f10f03896f84b07f`.
 
 **Objective:** Make pass/rework/escalation/phase closure trustworthy under failures and validation manipulation.
 
@@ -131,11 +131,13 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Mutation-style fixtures for weakened gates; explicit focused-versus-phase command authority tests; reachable read-only semantic-review outcomes and ambiguity tests; real same-run retry/rework/escalation and attempt-ceiling tests; failure-fingerprint table tests; crash matrix; gate option/consequence tests.
 
-**Exit condition:** Satisfied for implementation and deterministic integration; independent re-audit is pending. The Codex vertical loop requires a separately declared phase command, dispatches semantic review only for nonblocking semantic signals, consumes exact persisted reviewer authority, and executes bounded retry/rework/escalation within one run. Canonical intent is checked from the repository by the core, and ambiguous executor/reviewer crash windows recover conservatively without redispatch.
+**Exit condition:** Satisfied and independently confirmed. The Codex vertical loop requires a separately declared phase command, dispatches semantic review only for nonblocking semantic signals, consumes exact persisted reviewer authority, and executes bounded retry/rework/escalation within one run. Canonical intent is checked from the repository by the core, and ambiguous executor/reviewer crash windows recover conservatively without redispatch.
 
 **Expected route:** Codex/Sol High for verification, recovery, security, and independent phase review.
 
 ## Phase 4 — OpenCode adapter and policy routing
+
+**Status:** in progress on `phase4/opencode-routing` from approved Phase 3 baseline `00e6924c057d6f3e28dfbea3f10f03896f84b07f`.
 
 **Objective:** Add the preferred normal-work route and evidence-based escalation without changing the core lifecycle.
 
@@ -260,4 +262,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 2 is independently confirmed at `06fec341ad16aefd38df5d5cf3d1ccc1aa36a303`. Phase 3 implementation and the final targeted authority/integration corrections pass the deterministic gate on `phase3/verification-recovery`; independent re-audit is next. Phase 4 has not started.
+- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 source-driven OpenCode V2 capability discovery and implementation are in progress on `phase4/opencode-routing`; Phase 5 has not started.

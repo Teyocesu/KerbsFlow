@@ -17,3 +17,5 @@ export * from "./phase3.js";
 export * from "./reviewer.js";
 export * from "./canonical.js";
 export * from "./phase2.js";
+export * from "./opencode.js";
+export * from "./routing.js";

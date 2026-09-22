@@ -223,7 +223,11 @@ export class KerbsFlowCore {
         throw new KerbsFlowError("ACTIVE_EXECUTOR_EXISTS", `attempt ${String(active.attempt_id)} is already active`);
       }
       const task = this.taskInTransaction(tx, run.currentTaskId);
+      this.adapter.select?.(task.decision.route.adapter);
       const descriptor = parseAdapterDescriptor(this.adapter.probe());
+      if (descriptor.adapter !== task.decision.route.adapter) {
+        throw new KerbsFlowError("ROUTE_ADAPTER_MISMATCH", `planned adapter ${task.decision.route.adapter} does not match active adapter ${descriptor.adapter}`);
+      }
       const attemptId = asAttemptId(nextId("attempt"));
       tx.run(
         "INSERT INTO attempts (attempt_id, run_id, task_id, lifecycle, adapter_descriptor_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

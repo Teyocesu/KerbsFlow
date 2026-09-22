@@ -14,7 +14,8 @@ import { KerbsFlowCore } from "./core.js";
 import { KerbsFlowError } from "./errors.js";
 import { GitWorktreeManager, type RepositoryIntake, type WorktreeRecord } from "./git.js";
 import { FailurePolicyCoordinator, escalatePlanningRoute } from "./phase3.js";
-import { buildCodexPrompt } from "./planning.js";
+import { buildExecutorPrompt } from "./planning.js";
+import type { RoutingDecision } from "./routing.js";
 import { StateStore, type StoredFailureOccurrence } from "./persistence.js";
 import { IndependentSemanticReviewer } from "./reviewer.js";
 import type { IdSource } from "./runtime.js";
@@ -35,6 +36,7 @@ export interface Phase2LoopRequest {
     higherCodexRoute?: { model: string; reasoning?: string };
   };
   semanticReview?: { model: string; reasoning?: string; canonicalContract: string };
+  routingDecision?: RoutingDecision;
 }
 
 export interface Phase2LoopResult {
@@ -77,13 +79,19 @@ export class Phase2Loop {
     const worktree = this.git.create(intake, request.runId);
     this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
     command = this.core.plan(request.runId, command.stateVersion, `${request.runId}:plan`, request.planningDecision);
+    if (request.routingDecision !== undefined) this.store.recordRoutingDecision(request.routingDecision);
     let decision = request.planningDecision;
     let attempts = 0;
 
     while (true) {
       attempts += 1;
       command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
-      command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildCodexPrompt(decision), timeoutMs: request.executionTimeoutMs });
+      if (attempts === 1 && request.routingDecision !== undefined) {
+        const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
+        if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing metadata linkage requires the prepared attempt");
+        this.store.linkRoutingDecision(request.routingDecision.planningDecisionId, attemptId);
+      }
+      command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
       command = await this.core.completeAttempt(request.runId, command.stateVersion, `${request.runId}:complete:${attempts}`);
       const afterExecution = this.store.readModel(request.runId);
       if (afterExecution === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared`);
@@ -170,7 +178,9 @@ export class Phase2Loop {
 
   private assertRequest(request: Phase2LoopRequest): void {
     if (request.planningDecision.runId !== request.runId || request.planningDecision.taskId !== request.taskId) throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "planning decision IDs do not match the Phase 3 loop request");
-    if (request.planningDecision.route.adapter !== "codex") throw new KerbsFlowError("ROUTE_NOT_ALLOWED", "the Phase 3 real loop accepts only the Codex adapter");
+    if (request.routingDecision !== undefined && (request.routingDecision.runId !== request.runId || request.routingDecision.taskId !== request.taskId || request.routingDecision.selected.adapter !== request.planningDecision.route.adapter || request.routingDecision.selected.model !== request.planningDecision.route.model)) {
+      throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "routing metadata does not match the Phase 4 loop request");
+    }
   }
 
   private recordFailure(request: Phase2LoopRequest, decision: PlanningDecision, executorResult: ExecutorResult, verification: FocusedVerificationResult, category: "focused_verification" | "phase_verification"): StoredFailureOccurrence {

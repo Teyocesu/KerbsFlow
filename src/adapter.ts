@@ -13,6 +13,7 @@ import type {
 } from "./contracts.js";
 
 export interface ExecutorAdapter {
+  select?(adapter: string): void;
   probe(): AdapterDescriptor;
   start(request: ExecutionRequest): AttemptHandle;
   events(handle: AttemptHandle): AsyncIterable<NormalizedEvent>;
