@@ -262,4 +262,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 implementation and deterministic validation are complete at `8d6c55c9695cc4ddf3694c9e974df737863526ca`; independent Phase 4 audit is next. Phase 5 has not started.
+- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 implementation and the targeted independent-audit corrections are complete on `phase4/opencode-routing`; the correction code is committed at `d9413b9e74df20a78778502b82bf4268e8a8a801`, with the final documentation commit following it. Deterministic validation is green, live OpenCode remains unavailable because readiness reports no enabled provider/model, and Phase 5 has not started.
