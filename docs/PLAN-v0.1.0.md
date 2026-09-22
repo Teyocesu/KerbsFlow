@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 4 implementation in progress from independently approved Phase 3 baseline `00e6924c057d6f3e28dfbea3f10f03896f84b07f`**
+Status: **Phase 4 implementation and deterministic validation complete; independent audit pending**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -137,7 +137,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 4 — OpenCode adapter and policy routing
 
-**Status:** in progress on `phase4/opencode-routing` from approved Phase 3 baseline `00e6924c057d6f3e28dfbea3f10f03896f84b07f`.
+**Status:** implementation and deterministic integration complete at `8d6c55c9695cc4ddf3694c9e974df737863526ca` on `phase4/opencode-routing`; independent audit pending.
 
 **Objective:** Add the preferred normal-work route and evidence-based escalation without changing the core lifecycle.
 
@@ -168,7 +168,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Fake embedded V2 host/in-memory-router fixtures; explicit host ownership/close tests; `AsyncIterable` loss/termination/duplication/order tests; request abort; schema/permission/version capability tests; shared-environment credential non-copy/non-persistence checks; provider-versus-workload network reporting; routing/escalation tests; opt-in synthetic live smoke run. If loopback fallback is implemented, additionally test listener binding/auth, SSE reconciliation, teardown, and equivalence to the same adapter/core contract.
 
-**Exit condition:** Both real adapters satisfy the v1 contract, and routing/escalation is deterministic, bounded, inspectable, and provider-agnostic at the core boundary.
+**Exit condition:** Satisfied for implementation and deterministic integration. `@opencode/sdk` and the isolated official CLI were tested at `2.0.13`; the selected transport is an explicitly owned embedded host with no listener. Both adapters retain the v1 contract, and routing/escalation is deterministic, bounded, inspectable, and provider-agnostic at the core boundary. The opt-in live OpenCode smoke was not run because the provider readiness API reported no enabled provider or model; independent audit remains pending.
 
 **Expected route:** Codex/Sol Medium for embedded V2 SDK integration; Sol High for permission/auth/network/routing review; OpenCode/Muse may implement ordinary follow-up work after its adapter is verified.
 
@@ -262,4 +262,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 source-driven OpenCode V2 capability discovery and implementation are in progress on `phase4/opencode-routing`; Phase 5 has not started.
+- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 implementation and deterministic validation are complete at `8d6c55c9695cc4ddf3694c9e974df737863526ca`; independent Phase 4 audit is next. Phase 5 has not started.
