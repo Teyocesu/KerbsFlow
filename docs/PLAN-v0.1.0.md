@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 4 implementation, deterministic validation, and independent audit complete at approved baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`**
+Status: **Phase 5 implementation complete on `phase5/isolation-operational-hardening` from canonical Phase 4 closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`; support-matrix exit BLOCKED pending live Linux validation and independent audit. Phase 6 has not started.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -174,6 +174,8 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 5 — Isolation and operational hardening
 
+**Status:** implementation complete; independent audit pending. Phase 4 was independently confirmed **PASS** before the Phase 5 branch was created from canonical closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. The Phase 5 support-matrix exit remains **BLOCKED** because Linux operational tests have not run on a real Linux host.
+
 **Objective:** Close the remaining filesystem, process, worktree, network, secret, artifact, and cross-platform risks on the approved support matrix.
 
 **Exact scope:**
@@ -198,7 +200,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Adversarial path/symlink/argv/env/log fixtures; network-policy capability tests; process-tree tests per OS; dirty/missing/moved worktree matrix; database corruption/migration backup tests.
 
-**Exit condition:** Security/recovery review finds no unresolved high-severity boundary issue for the v0.1 support matrix.
+**Exit condition:** Pending. On macOS (Darwin 24.3.0, Node v24.15.0), the focused path/artifact, process/worktree, SQLite recovery, Codex/OpenCode regression, and full deterministic gates pass. Rollback journaling remains sufficient for the tested single-owner architecture: duplicate ownership fails closed, migration rollback and restart tests pass, and no measured reader concurrency need justifies WAL. Linux capability fixtures are deterministic only; live Linux filesystem, process-tree, worktree, and SQLite behavior is **NOT TESTED**. The independent Phase 5 security/recovery audit and that Linux gate must close before a support-matrix **PASS**. Phase 6 has not started.
 
 **Expected route:** Codex/Sol High for implementation decisions and independent security/hardening review.
 
@@ -262,4 +264,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 3 is independently confirmed at `00e6924c057d6f3e28dfbea3f10f03896f84b07f`. Phase 4 implementation and all targeted independent-audit corrections are independently confirmed **PASS** at approved baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`: core dispatch requires durable trusted provenance, and prepared descriptors are hash-bound to authoritative discovery. Focused routing/OpenCode validation and the full deterministic gate are green; live OpenCode remains **NOT RUN** because readiness reports no enabled provider/model, with enforcement honestly `tool_policy_only`. Phase 5 has not started. Next action: begin Phase 5 from the approved Phase 4 baseline.
+- Phase 4 is independently confirmed **PASS** at audited baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`; its canonical closure is `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. Phase 5 is in progress on `phase5/isolation-operational-hardening`. Phase 6 has not started. Next action: implement checkpoint A (filesystem, environment, secrets, and artifacts) and run its focused gate.
