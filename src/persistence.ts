@@ -1,6 +1,6 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { chmodSync, closeSync, constants, existsSync, lstatSync, openSync, readSync, realpathSync, rmSync, statSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -447,6 +447,26 @@ export interface StoredWorktree {
   createdAt: string;
 }
 
+const CLEANUP_AUTHORITIES = new WeakSet<object>();
+
+export interface WorktreeCleanupAuthority {
+  readonly runId: RunId;
+  readonly stateVersion: number;
+  readonly worktreePath: string;
+  readonly worktreeGitDirectory: string;
+  readonly markerPath: string;
+}
+
+export function assertWorktreeCleanupAuthority(value: unknown, runId: string, worktreePath: string, gitDirectory: string, markerPath: string): asserts value is WorktreeCleanupAuthority {
+  if (value === null || typeof value !== "object" || !CLEANUP_AUTHORITIES.has(value)
+    || (value as WorktreeCleanupAuthority).runId !== runId
+    || (value as WorktreeCleanupAuthority).worktreePath !== worktreePath
+    || (value as WorktreeCleanupAuthority).worktreeGitDirectory !== gitDirectory
+    || (value as WorktreeCleanupAuthority).markerPath !== markerPath) {
+    throw new KerbsFlowError("WORKTREE_CLEANUP_AUTHORITY_REQUIRED", "cleanup requires authority issued from durable terminal-success core state");
+  }
+}
+
 export interface StoredCancellationIntent {
   attemptId: AttemptId;
   runId: RunId;
@@ -634,14 +654,16 @@ export class StateStore {
   private readonly ids: IdSource;
   private closed = false;
   private readonly ownershipKey: string | undefined;
+  private readonly ownerLock: DatabaseOwnerLock | undefined;
   private readonly recoveryNotices: RecoveryNotice[] = [];
 
-  private constructor(databasePath: string, db: DatabaseSync, clock: Clock, ids: IdSource, ownershipKey?: string) {
+  private constructor(databasePath: string, db: DatabaseSync, clock: Clock, ids: IdSource, ownershipKey?: string, ownerLock?: DatabaseOwnerLock) {
     this.databasePath = databasePath;
     this.db = db;
     this.clock = clock;
     this.ids = ids;
     this.ownershipKey = ownershipKey;
+    this.ownerLock = ownerLock;
     this.startupRecovery = this.recoveryNotices;
   }
 
@@ -653,12 +675,14 @@ export class StateStore {
     const targetVersion = migrations.at(-1)?.version ?? 0;
     const file = databasePath === ":memory:" ? undefined : prepareDatabasePath(databasePath);
     if (file !== undefined && StateStore.openFiles.has(file.path)) throw new KerbsFlowError("DATABASE_OWNER_EXISTS", "database already has an active KerbsFlow owner in this process");
+    const ownerLock = file === undefined ? undefined : acquireDatabaseOwner(file.path);
     if (file !== undefined) StateStore.openFiles.add(file.path);
     let db: DatabaseSync;
     try {
       db = new DatabaseSync(file?.path ?? databasePath, { timeout: busyTimeoutMs });
     } catch {
       if (file !== undefined) StateStore.openFiles.delete(file.path);
+      ownerLock?.release();
       throw new DatabaseIntegrityError("SQLite database could not be opened; automatic reset is prohibited");
     }
     try {
@@ -674,12 +698,13 @@ export class StateStore {
       sanitizePersistedSemanticReviewContext(db);
       assertIntegrity(db);
       if (file !== undefined && process.platform !== "win32") chmodSync(file.path, 0o600);
-      const store = new StateStore(file?.path ?? databasePath, db, clock, ids, file?.path);
+      const store = new StateStore(file?.path ?? databasePath, db, clock, ids, file?.path, ownerLock);
       store.detectStartupRecovery();
       return store;
     } catch (error) {
       db.close();
       if (file !== undefined) StateStore.openFiles.delete(file.path);
+      ownerLock?.release();
       if (error instanceof KerbsFlowError || !isSqliteFailure(error)) throw error;
       throw new DatabaseIntegrityError("SQLite startup, integrity, backup, or migration failed; automatic reset is prohibited");
     }
@@ -690,6 +715,7 @@ export class StateStore {
       this.db.close();
       this.closed = true;
       if (this.ownershipKey !== undefined) StateStore.openFiles.delete(this.ownershipKey);
+      this.ownerLock?.release();
     }
   }
 
@@ -717,6 +743,21 @@ export class StateStore {
     this.assertOpen();
     const row = this.db.prepare("SELECT * FROM worktrees WHERE run_id = ?").get(runId) as Row | undefined;
     return row === undefined ? undefined : parseWorktreeRow(row);
+  }
+
+  issueWorktreeCleanupAuthority(runId: RunId): WorktreeCleanupAuthority {
+    const run = this.getRun(runId);
+    if (run?.state !== "DONE") {
+      throw new KerbsFlowError("WORKTREE_CLEANUP_INELIGIBLE", `cleanup requires durable DONE state; found ${run?.state ?? "missing"}`);
+    }
+    const record = this.getWorktree(runId);
+    if (record === undefined) throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "cleanup requires a persisted owned worktree");
+    const authority: WorktreeCleanupAuthority = Object.freeze({
+      runId, stateVersion: run.stateVersion, worktreePath: record.worktreePath,
+      worktreeGitDirectory: record.worktreeGitDirectory, markerPath: record.markerPath,
+    });
+    CLEANUP_AUTHORITIES.add(authority);
+    return authority;
   }
 
   getValidation(validationId: ValidationId): StoredValidation | undefined {
@@ -1515,6 +1556,50 @@ function configureDatabase(db: DatabaseSync, busyTimeoutMs: number): void {
 interface PreparedDatabasePath {
   path: string;
   parent: string;
+}
+
+interface DatabaseOwnerLock {
+  release(): void;
+}
+
+function acquireDatabaseOwner(databasePath: string): DatabaseOwnerLock {
+  const path = `${databasePath}.owner`;
+  const nonce = randomUUID();
+  let fd: number;
+  try {
+    fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
+  } catch (error) {
+    if (typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST") {
+      throw new KerbsFlowError("DATABASE_OWNER_EXISTS", "database owner record already exists; a stale owner requires explicit recovery");
+    }
+    throw new KerbsFlowError("DATABASE_OWNER_UNPROVEN", "database ownership could not be acquired");
+  }
+  const identity = fstatSync(fd);
+  const contents = JSON.stringify({ schemaVersion: "kerbsflow.database-owner/v1", pid: process.pid, acquiredAt: new Date().toISOString(), nonce });
+  try {
+    writeSync(fd, contents);
+  } catch {
+    closeSync(fd);
+    unlinkSync(path);
+    throw new KerbsFlowError("DATABASE_OWNER_UNPROVEN", "database owner record could not be written");
+  }
+  let released = false;
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      try {
+        const current = lstatSync(path);
+        if (current.isFile() && current.dev === identity.dev && current.ino === identity.ino && readFileSync(path, "utf8") === contents) {
+          unlinkSync(path);
+        }
+      } catch {
+        // An ambiguous owner record is retained for explicit recovery.
+      } finally {
+        closeSync(fd);
+      }
+    },
+  };
 }
 
 function prepareDatabasePath(databasePath: string): PreparedDatabasePath {

@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 import type { ExecutorResult, PlanningDecision, ValidationBundle, ValidationCheck, ValidationEvidence } from "./contracts.js";
 import { CONTRACT_VERSIONS, asValidationId } from "./contracts.js";
 import { GitWorktreeManager, type RepositoryIntake, type RepositorySnapshot, type WorktreeInspection, type WorktreeRecord } from "./git.js";
-import { ProcessSupervisor, codexEnvironment, type ProcessResult } from "./process.js";
+import type { ProcessResult } from "./process.js";
+import type { VerificationCapability, VerificationCommandSandbox } from "./verification-sandbox.js";
 import type { IdSource } from "./runtime.js";
 import { detectAntiGreenwashing, type AntiGreenwashingSignal } from "./anti-greenwashing.js";
 import { KerbsFlowError } from "./errors.js";
@@ -25,6 +26,7 @@ export interface FocusedVerificationResult {
   preCheckInspection: WorktreeInspection;
   inspection: ReturnType<GitWorktreeManager["inspect"]>;
   checkResult: ProcessResult;
+  sandboxCapability: VerificationCapability;
   suspiciousSignals: AntiGreenwashingSignal[];
   scopeViolations: string[];
   executorDisagreements: string[];
@@ -60,7 +62,7 @@ export function assertAuthoritativePhaseValidation(value: unknown): asserts valu
 export class FocusedVerifier {
   constructor(
     private readonly git: GitWorktreeManager,
-    private readonly supervisor: ProcessSupervisor,
+    private readonly sandbox: VerificationCommandSandbox,
     private readonly ids: IdSource,
   ) {}
 
@@ -104,15 +106,7 @@ export class FocusedVerifier {
   ): Promise<FocusedVerificationResult> {
     const originalBefore = this.git.snapshot(intake.repositoryPath);
     const preCheckInspection = this.git.inspect(worktree);
-    const process = this.supervisor.start({
-      executable: command.executable,
-      args: command.args,
-      cwd: worktree.path,
-      environment: checkEnvironment(),
-      timeoutMs: command.timeoutMs,
-      gracePeriodMs: 1000,
-    });
-    const checkResult = await process.completion;
+    const { result: checkResult, capability: sandboxCapability } = await this.sandbox.run(command, worktree.path);
     const originalAfter = this.git.snapshot(intake.repositoryPath);
     const inspection = this.git.inspect(worktree);
     const originalUnchanged = originalMatchesIntake(originalAfter, intake);
@@ -135,6 +129,7 @@ export class FocusedVerifier {
       this.evidence("review", "inspected", suspiciousSignals.length === 0 ? "anti-greenwashing scan found no suspicious signal" : `anti-greenwashing signals: ${suspiciousSignals.map((signal) => signal.code).join("; ")}`),
       this.evidence("other", "inspected", originalUnchanged ? "original checkout remains clean at the recorded base" : "original checkout no longer matches the clean recorded base"),
       this.evidence("other", "inspected", verifierMutations.length === 0 ? "focused check did not mutate managed Git evidence" : `focused-check mutations: ${verifierMutations.join("; ")}`),
+      this.evidence("other", "automatically_tested", `verification sandbox ${sandboxCapability.backend} ${sandboxCapability.backendVersion} on ${sandboxCapability.platform}; filesystem and workload network enforced; probe ${sandboxCapability.probeHash} at ${sandboxCapability.probeAt}`),
     ];
     const checks: ValidationCheck[] = [
       { name: "original checkout invariant", outcome: originalUnchanged ? "passed" : "failed", evidenceClass: "inspected", evidenceRefs: [], evidenceIds: [evidence[3]!.id] },
@@ -165,7 +160,7 @@ export class FocusedVerifier {
       checks,
       evidence,
     };
-    return { bundle, preCheckInspection, inspection, checkResult, suspiciousSignals, scopeViolations, executorDisagreements, verifierMutations };
+    return { bundle, preCheckInspection, inspection, checkResult, sandboxCapability, suspiciousSignals, scopeViolations, executorDisagreements, verifierMutations };
   }
 
   private evidence(kind: ValidationEvidence["kind"], classification: ValidationEvidence["classification"], summary: string): ValidationEvidence {
@@ -263,10 +258,4 @@ function matchesScope(path: string, scope: string): boolean {
     return true;
   }
   return path === normalized || path.startsWith(`${normalized}/`);
-}
-
-function checkEnvironment(): NodeJS.ProcessEnv {
-  const environment = codexEnvironment();
-  delete environment.CODEX_HOME;
-  return environment;
 }

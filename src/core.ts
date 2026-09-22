@@ -110,6 +110,19 @@ export class KerbsFlowCore {
     });
   }
 
+  prepareWorktreeCleanup(runId: RunId, manager: GitWorktreeManager) {
+    const authority = this.store.issueWorktreeCleanupAuthority(runId);
+    const stored = this.store.getWorktree(runId)!;
+    const record: WorktreeRecord = {
+      schemaVersion: "kerbsflow.worktree/v1", runKey: runId,
+      repositoryPath: stored.repositoryPath, gitCommonDirectory: stored.gitCommonDirectory,
+      worktreeGitDirectory: stored.worktreeGitDirectory, baseOid: stored.baseOid,
+      branch: stored.branch, path: stored.worktreePath, markerPath: stored.markerPath,
+      createdAt: stored.createdAt,
+    };
+    return manager.prepareCleanup(record, authority);
+  }
+
   startRun(runId: RunId, objective: string, idempotencyKey: string): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
@@ -734,6 +747,32 @@ export class KerbsFlowCore {
           { id: "fail", label: "Fail conservatively", consequence: "Stop without closing the phase.", target: "FAILED" },
         ],
         status: "open",
+      };
+      this.insertGate(tx, gate, now);
+      return {
+        transition: { to: "HUMAN_GATE", actor: "verifier", reasonCode: gate.reasonCode, taskId: run.currentTaskId, attemptId: run.activeAttemptId, gateId: gate.gateId },
+        runPatch: { currentGateId: gate.gateId, recoveryRequired: false, recoveryReason: null },
+        details: { gateId: gate.gateId, reasonCode: gate.reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
+  gateVerificationSandboxUnavailable(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "validation", { reasonCode: "verification_sandbox_unavailable" });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if ((run.state !== "VERIFY_FOCUSED" && run.state !== "VERIFY_PHASE") || run.currentTaskId === null || run.activeAttemptId === null) {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", "sandbox availability gate requires a current verification attempt");
+      }
+      const gate: HumanGate = {
+        schemaVersion: CONTRACT_VERSIONS.humanGate,
+        gateId: asGateId(nextId("gate")), runId, taskId: run.currentTaskId,
+        attemptId: run.activeAttemptId, reasonCode: "verification_sandbox_unavailable",
+        summary: "required filesystem and workload-network verification isolation is unavailable or unproven",
+        evidenceRefs: [],
+        options: [
+          { id: "rework", label: "Restore sandbox capability", consequence: "Retry from bounded rework after restoring isolation.", target: "REWORK" },
+          { id: "fail", label: "Fail conservatively", consequence: "Retain the worktree and evidence.", target: "FAILED" },
+        ], status: "open",
       };
       this.insertGate(tx, gate, now);
       return {

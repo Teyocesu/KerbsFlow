@@ -1,3 +1,4 @@
+import { VerificationSandbox } from "../src/verification-sandbox.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -23,6 +24,7 @@ import {
 } from "../src/contracts.js";
 import type { ExecutorAdapter, SemanticReviewAdapter } from "../src/adapter.js";
 import { KerbsFlowCore } from "../src/core.js";
+import { KerbsFlowError } from "../src/errors.js";
 import { GitWorktreeManager } from "../src/git.js";
 import { Phase2Loop, type Phase2LoopRequest } from "../src/phase2.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
@@ -43,7 +45,7 @@ test("Phase 4 planning cannot execute without a runtime-trusted routing decision
       codexCore(fixture.store, fixture.adapter, fixture.ids),
       fixture.store,
       fixture.gitManager,
-      new FocusedVerifier(fixture.gitManager, new ProcessSupervisor(), fixture.ids),
+      new FocusedVerifier(fixture.gitManager, new VerificationSandbox(new ProcessSupervisor()), fixture.ids),
       fixture.ids,
     );
     await assert.rejects(loop.run({
@@ -99,7 +101,7 @@ test("the real Phase 4 loop persists distinct OpenCode and Codex escalation prov
       codexCore(store, new RoutedExecutorAdapter([open, codex]), ids),
       store,
       gitManager,
-      new FocusedVerifier(gitManager, new ProcessSupervisor(), ids),
+      new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids),
       ids,
     );
     const result = await loop.run({
@@ -191,7 +193,7 @@ test("independent verification fails the bundle when executor changed-path claim
       recommendedNext: "verify_focused",
       exit: { kind: "normal", code: 0 },
     };
-    const verification = await new FocusedVerifier(manager, new ProcessSupervisor(), ids).verify(
+    const verification = await new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), ids).verify(
       intake,
       worktree,
       decision,
@@ -230,9 +232,9 @@ for (const mutation of [
         fixture.executorResult,
         { name: "mutating focused check", executable: process.execPath, args: [...mutation.args], timeoutMs: 5000 },
       );
-      assert.equal(verification.checkResult.exitCode, 0);
+      assert.notEqual(verification.checkResult.exitCode, 0);
       assert.equal(verification.bundle.outcome, "failed");
-      assert.deepEqual(verification.verifierMutations, ["focused check mutated managed worktree source evidence"]);
+      assert.deepEqual(verification.verifierMutations, [], "sandbox denied the write before Git evidence changed");
     } finally {
       fixture.close();
     }
@@ -255,9 +257,9 @@ test("focused verification fails closed when the check mutates the original chec
         timeoutMs: 5000,
       },
     );
-    assert.equal(verification.checkResult.exitCode, 0);
+    assert.notEqual(verification.checkResult.exitCode, 0);
     assert.equal(verification.bundle.outcome, "failed");
-    assert.deepEqual(verification.verifierMutations, ["focused check mutated the original human-owned checkout"]);
+    assert.deepEqual(verification.verifierMutations, [], "sandbox denied the original-checkout write");
   } finally {
     fixture.close();
   }
@@ -310,7 +312,7 @@ test("synthetic real vertical loop writes only the owned worktree and passes ind
       reasoning: "medium",
       canonicalContext: "synthetic Phase 2 contract",
     });
-    const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids);
+    const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
     const result = await loop.run({
       runId,
       taskId,
@@ -344,6 +346,21 @@ test("synthetic real vertical loop writes only the owned worktree and passes ind
   }
 });
 
+test("unavailable verification sandbox creates a durable HUMAN_GATE without unrestricted fallback", async () => {
+  const fixture = integratedLoopFixture("success");
+  class UnavailableSandbox extends VerificationSandbox {
+    override async run(): Promise<never> {
+      throw new KerbsFlowError("VERIFICATION_SANDBOX_UNAVAILABLE", "synthetic adversarial probe failed");
+    }
+  }
+  try {
+    const result = await fixture.run({ sandbox: new UnavailableSandbox(new ProcessSupervisor()) });
+    assert.equal(result.verdict, "HUMAN_GATE");
+    assert.equal(fixture.store.readModel(fixture.runId)?.run.state, "HUMAN_GATE");
+    assert.equal(fixture.store.readModel(fixture.runId)?.currentGate?.gate.reasonCode, "verification_sandbox_unavailable");
+  } finally { fixture.close(); }
+});
+
 test("focused evidence alone cannot close a phase without an explicit phase command", async () => {
   const repository = createGitRepository();
   const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-missing-phase-"));
@@ -355,7 +372,7 @@ test("focused evidence alone cannot close a phase without an explicit phase comm
     const runId = asRunId("run_missing_phase");
     const taskId = asTaskId("task_missing_phase");
     const decision = createPhase2PlanningDecision({ decisionId: "decision_missing_phase", runId, taskId, objective: "SCENARIO=success", acceptance: ["explicit phase gate required"], positiveScope: ["result.txt"], negativeScope: ["README.md"], model: "fixture-model", canonicalContext: "missing phase" });
-    const result = await new Phase2Loop(codexCore(store, adapter, ids), store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids).run({
+    const result = await new Phase2Loop(codexCore(store, adapter, ids), store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids).run({
       runId,
       taskId,
       objective: "missing phase validation",
@@ -386,7 +403,7 @@ test("phase-command failure stays phase-scoped and cannot inherit focused succes
     const runId = asRunId("run_phase_failure");
     const taskId = asTaskId("task_phase_failure");
     const decision = createPhase2PlanningDecision({ decisionId: "decision_phase_failure", runId, taskId, objective: "SCENARIO=success", acceptance: ["phase command must pass"], positiveScope: ["result.txt"], negativeScope: ["README.md"], model: "fixture-model", canonicalContext: "phase failure" });
-    const result = await new Phase2Loop(codexCore(store, adapter, ids), store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids).run({
+    const result = await new Phase2Loop(codexCore(store, adapter, ids), store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids).run({
       runId,
       taskId,
       objective: "phase command failure",
@@ -464,7 +481,7 @@ for (const semantic of [
         cancelReview: (_handle, reason) => ({ outcome: "cancelled", summary: reason }),
       };
       const reviewer = new IndependentSemanticReviewer(store, reviewAdapter, gitManager);
-      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids, reviewer);
+      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids, reviewer);
       const result = await loop.run({
         runId,
         taskId,
@@ -682,7 +699,7 @@ for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch"] as 
         model: "fixture-model",
         canonicalContext: "intake gate fixture",
       });
-      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids);
+      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
       const result = await loop.run({
         runId,
         taskId,
@@ -741,7 +758,7 @@ for (const expected of [
         model: "fixture-model",
         canonicalContext: expected.scenario,
       });
-      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids);
+      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
       const result = await loop.run({
         runId,
         taskId,
@@ -926,11 +943,11 @@ function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopReque
     runId,
     taskId,
     decision,
-    run: ({ reviewer }: { reviewer?: IndependentSemanticReviewer }) => new Phase2Loop(
+    run: ({ reviewer, sandbox }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox }) => new Phase2Loop(
       codexCore(store, adapter, ids),
       store,
       gitManager,
-      new FocusedVerifier(gitManager, new ProcessSupervisor(), ids),
+      new FocusedVerifier(gitManager, sandbox ?? new VerificationSandbox(new ProcessSupervisor()), ids),
       ids,
       reviewer,
     ).run({
@@ -1013,7 +1030,7 @@ function verificationFixture(suffix: string): {
     worktree,
     decision,
     executorResult,
-    verifier: new FocusedVerifier(manager, new ProcessSupervisor(), ids),
+    verifier: new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), ids),
     close: () => {
       rmSync(runtime, { recursive: true, force: true });
       rmSync(repository.root, { recursive: true, force: true });

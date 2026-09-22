@@ -152,6 +152,8 @@ The verifier is edit-disabled by default. It gathers authoritative local facts a
 
 It may not weaken or rewrite the validation plan to obtain green. Review sessions receive read-only permissions unless a distinct, approved rework attempt is created.
 
+Verification commands run through a KerbsFlow-owned `VerificationSandbox` boundary. On macOS it capability-probes `/usr/bin/sandbox-exec` (Seatbelt); on Linux it capability-probes Bubblewrap. The assigned worktree and minimum command runtime inputs are read-only; only a private KerbsFlow scratch root is writable. Host home, credentials, host `/tmp` writes, and workload network are denied for the entire verification process tree. Missing, insecure, or adversarially unproven enforcement makes verification unavailable and requires a human gate, with no unrestricted fallback. Linux Bubblewrap must be upstream 0.12.0 or newer, or have explicit trusted evidence of the CVE-2026-87766 fix in a backport; version presence alone is insufficient. The sandbox capability record contains only backend/platform/version and probe evidence, never credentials. This is the human-approved Phase 5 host prerequisite; it does not add a sandbox framework or container/VM product architecture.
+
 ### 4.7 State and artifact stores
 
 The state store owns SQL transactions, migrations, and current state. The artifact store owns immutable or append-only per-attempt evidence files outside the managed repository. SQLite stores metadata and references, not large logs or repository copies.
@@ -211,6 +213,7 @@ The API projects persisted state and accepts idempotent commands. The UI renders
 | `EXECUTE` | `HUMAN_GATE` | Executor requests a material permission or a prohibited action is required. |
 | `EXECUTE` | `RECOVERY` | Process/adapter/orchestrator outcome is uncertain. |
 | `VERIFY_FOCUSED` | `REVIEW` | Focused evidence bundle is persisted, including failures. |
+| `VERIFY_FOCUSED` | `HUMAN_GATE` | Required verification sandbox is unavailable or fails its adversarial probe. |
 | `VERIFY_FOCUSED` | `RECOVERY` | Verifier process outcome is uncertain. |
 | `REVIEW` | `REWORK` | Failure is clear, within scope, retry budget remains, and rework is safe. |
 | `REVIEW` | `VERIFY_PHASE` | Action passes and phase-level acceptance is required. |

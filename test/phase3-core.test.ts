@@ -1,3 +1,4 @@
+import { VerificationSandbox } from "../src/verification-sandbox.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -354,7 +355,7 @@ async function recordAuthoritativePhase(
   new CanonicalIntentGuard(fixture.store).capture(fixture.runId, repositoryPath, intake.baseOid);
   mutate?.(worktree.path);
   const result = parseExecutorResult(JSON.parse(fixture.store.getAttempt(attemptId)!.outcomeJson!));
-  const phase = await new FocusedVerifier(manager, new ProcessSupervisor(), fixture.ids).verifyPhase(
+  const phase = await new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), fixture.ids).verifyPhase(
     intake,
     worktree,
     fixture.decision,

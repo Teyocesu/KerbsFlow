@@ -40,6 +40,20 @@ test("process supervisor uses explicit cwd/env and bounds output and JSONL", asy
   }
 });
 
+test("spawn failure cannot signal the supervisor's own POSIX process group", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-spawn-failure-"));
+  try {
+    const result = await new ProcessSupervisor().start({
+      executable: join(root, "missing-executable"), args: [], cwd: root,
+      environment: {}, timeoutMs: 1000,
+    }).completion;
+    assert.equal(result.exitKind, "spawn_error");
+    assert.equal(result.identity.pid, 0);
+    assert.equal(result.gracefulSignalSent, false);
+    assert.equal(result.forcedSignalSent, false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("timeout and cancellation produce bounded signal evidence", async () => {
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-process-"));
   try {
@@ -148,6 +162,31 @@ test("cancellation terminates an owned grandchild even after the child exits", {
     assert.equal(result.forcedSignalSent, true);
     assert.equal(result.processTreeEvidence, "group_absent_after_exit");
     assert.throws(() => process.kill(grandchildPid, 0), (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("natural leader exit reconciles an owned grandchild before reporting terminality", { skip: process.platform === "win32" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-natural-orphan-"));
+  try {
+    const supervised = new ProcessSupervisor().start({
+      executable: processExecPath(),
+      args: ["-e", `
+        const { spawn } = require('node:child_process');
+        const child = spawn(process.execPath, ['-e', "process.on('SIGTERM',()=>{});console.log('ready');setInterval(()=>{},1000)"], { stdio: ['ignore','pipe','ignore'] });
+        child.stdout.once('data', () => { console.log(JSON.stringify({type:'grandchild', pid:child.pid})); child.stdout.destroy(); child.unref(); });
+      `],
+      cwd: root, environment: {}, timeoutMs: 5000, gracePeriodMs: 30,
+    });
+    const event = await supervised.events()[Symbol.asyncIterator]().next();
+    const pid = Number((event.value?.value as { pid?: number }).pid);
+    assert.ok(Number.isSafeInteger(pid) && pid > 0);
+    const result = await supervised.completion;
+    assert.equal(result.exitKind, "unknown");
+    assert.equal(result.forcedSignalSent, true);
+    assert.equal(result.processTreeEvidence, "group_absent_after_exit");
+    assert.throws(() => process.kill(pid, 0), (error: unknown) => typeof error === "object" && error !== null && "code" in error && error.code === "ESRCH");
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawnSync } from "node:child_process";
 
 import { applyMigrations, MIGRATIONS, StateStore } from "../src/persistence.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
@@ -126,6 +127,36 @@ test("incompatible schema and simultaneous duplicate ownership fail closed", () 
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("database owner excludes an independent Node process and retains ambiguous stale records", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-cross-owner-"));
+  const dbPath = join(root, "state.sqlite");
+  const moduleUrl = new URL("../src/persistence.js", import.meta.url).href;
+  const child = () => spawnSync(process.execPath, ["--input-type=module", "-e", `
+    import { StateStore } from ${JSON.stringify(moduleUrl)};
+    try { const store = StateStore.open(process.argv[1]); store.close(); console.log('opened'); }
+    catch (error) { console.log(error.code ?? 'unknown'); process.exitCode = 2; }
+  `, dbPath], { encoding: "utf8", timeout: 10000 });
+  try {
+    const first = StateStore.open(dbPath);
+    try {
+      const rejected = child();
+      assert.equal(rejected.status, 2);
+      assert.match(rejected.stdout, /DATABASE_OWNER_EXISTS/u);
+    } finally { first.close(); }
+    const accepted = child();
+    assert.equal(accepted.status, 0);
+    assert.match(accepted.stdout, /opened/u);
+    writeFileSync(`${dbPath}.owner`, JSON.stringify({ schemaVersion: "kerbsflow.database-owner/v1", pid: 999999, nonce: "stale" }), { mode: 0o600 });
+    const stale = child();
+    assert.equal(stale.status, 2);
+    assert.match(stale.stdout, /DATABASE_OWNER_EXISTS/u);
+    assert.equal(lstatSync(`${dbPath}.owner`).mode & 0o777, 0o600);
+    const unchanged = new DatabaseSync(dbPath, { readOnly: true });
+    try { assert.ok((unchanged.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count > 0); }
+    finally { unchanged.close(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
 test("credential-shaped command data is rejected before SQLite persistence", () => {

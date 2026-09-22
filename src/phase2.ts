@@ -114,7 +114,14 @@ export class Phase2Loop {
         throw new KerbsFlowError("PHASE2_BOUNDARY_INVALID", `executor completed at unexpected state ${afterExecution.run.state}`);
       }
       const executorResult = parseExecutorResult(JSON.parse(afterExecution.activeAttempt.outcomeJson));
-      const focused = await this.verifier.verify(intake, worktree, decision, executorResult, request.focusedCheck);
+      let focused: FocusedVerificationResult;
+      try {
+        focused = await this.verifier.verify(intake, worktree, decision, executorResult, request.focusedCheck);
+      } catch (error) {
+        if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
+        command = this.core.gateVerificationSandboxUnavailable(request.runId, command.stateVersion, `${request.runId}:focused-sandbox-gate:${attempts}`);
+        return { verdict: "HUMAN_GATE", intake, worktree, executorResult, attempts, stateVersion: command.stateVersion };
+      }
       command = this.core.recordFocusedValidation(request.runId, command.stateVersion, `${request.runId}:focused:${attempts}`, focused.bundle);
       if (focused.bundle.outcome !== "passed") {
         const policy = this.recordFailure(request, decision, executorResult, focused, "focused_verification");
@@ -149,7 +156,14 @@ export class Phase2Loop {
         command = this.core.gateMissingPhaseValidation(request.runId, command.stateVersion, `${request.runId}:phase-plan-missing`);
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, verification: focused, attempts, stateVersion: command.stateVersion };
       }
-      const phase = await this.verifier.verifyPhase(intake, worktree, decision, executorResult, request.phaseCheck);
+      let phase: Awaited<ReturnType<FocusedVerifier["verifyPhase"]>>;
+      try {
+        phase = await this.verifier.verifyPhase(intake, worktree, decision, executorResult, request.phaseCheck);
+      } catch (error) {
+        if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
+        command = this.core.gateVerificationSandboxUnavailable(request.runId, command.stateVersion, `${request.runId}:phase-sandbox-gate:${attempts}`);
+        return { verdict: "HUMAN_GATE", intake, worktree, executorResult, verification: focused, attempts, stateVersion: command.stateVersion };
+      }
       this.store.recordAuthoritativePhaseValidation(phase.authoritative);
       if (phase.verification.bundle.outcome !== "passed") {
         const policy = this.recordFailure(request, decision, executorResult, phase.verification, "phase_verification");

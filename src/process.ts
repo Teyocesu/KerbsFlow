@@ -72,6 +72,7 @@ export class SupervisedProcess {
   private gracefulSignalSent = false;
   private forcedSignalSent = false;
   private timedOut = false;
+  private orphanAfterLeaderExit = false;
   private processTreeEvidence: ProcessResult["processTreeEvidence"] = "not_signalled";
   private forceTimer: NodeJS.Timeout | undefined;
 
@@ -121,13 +122,33 @@ export class SupervisedProcess {
 
   async settleAfterChildExit(): Promise<void> {
     this.childExited = true;
-    if (this.identity.processGroup !== "owned_posix_group" || (!this.gracefulSignalSent && !this.forcedSignalSent)) {
+    if (this.identity.processGroup !== "owned_posix_group") {
       this.finishSettlement();
       return;
     }
-    const deadline = Date.now() + this.gracePeriodMs + 1000;
-    while (!this.processGroupAbsent() && Date.now() < deadline) {
+    if (!Number.isSafeInteger(this.identity.pid) || this.identity.pid <= 0) {
+      this.finishSettlement();
+      return;
+    }
+    if (!this.processGroupAbsent() && !this.gracefulSignalSent && !this.forcedSignalSent) {
+      this.orphanAfterLeaderExit = true;
+      try {
+        this.gracefulSignalSent = process.kill(-this.identity.pid, "SIGTERM");
+        if (this.gracefulSignalSent) this.processTreeEvidence = "group_signal_sent";
+      } catch {
+        // A raced group disappearance is checked below; uncertainty stays unknown.
+      }
+    }
+    const graceDeadline = Date.now() + this.gracePeriodMs;
+    while (!this.processGroupAbsent() && Date.now() < graceDeadline) {
       await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!this.processGroupAbsent()) {
+      this.force();
+      const forceDeadline = Date.now() + 1000;
+      while (!this.processGroupAbsent() && Date.now() < forceDeadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
     }
     if (this.processGroupAbsent()) this.processTreeEvidence = "group_absent_after_exit";
     this.finishSettlement();
@@ -139,7 +160,9 @@ export class SupervisedProcess {
       gracefulSignalSent: this.gracefulSignalSent,
       forcedSignalSent: this.forcedSignalSent,
       processTreeEvidence: this.processTreeEvidence,
-      exitKind: this.timedOut ? "timeout" : "unknown",
+      exitKind: this.identity.processGroup === "owned_posix_group" && this.processTreeEvidence !== "group_absent_after_exit"
+        ? "unknown"
+        : this.timedOut ? "timeout" : this.orphanAfterLeaderExit ? "unknown" : "normal",
     };
   }
 
@@ -253,11 +276,13 @@ export class ProcessSupervisor {
         const termination = supervised.snapshotTermination();
         const exitKind = spawnError !== undefined
           ? "spawn_error"
-          : termination.exitKind === "timeout"
+          : termination.exitKind === "unknown"
+            ? "unknown"
+            : termination.exitKind === "timeout"
             ? "timeout"
             : signal !== null
               ? "signal"
-              : exitCode !== null
+                : exitCode !== null
                 ? "normal"
                 : "unknown";
         const result: ProcessResult = {

@@ -5,6 +5,7 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { KerbsFlowError } from "./errors.js";
 import { atomicWritePrivateFile, ensurePrivateDirectory, pathIsWithin, readPrivateFileWithin } from "./paths.js";
 import { redactDiagnostic } from "./secrets.js";
+import { assertWorktreeCleanupAuthority, type WorktreeCleanupAuthority } from "./persistence.js";
 
 export interface RepositoryIntake {
   repositoryPath: string;
@@ -102,6 +103,7 @@ export class GitWorktreeManager {
     if (inside !== "true") {
       throw new KerbsFlowError("NOT_GIT_REPOSITORY", `${canonical} is not a Git worktree`);
     }
+    assertSafeCheckoutConfiguration(canonical);
     const baseOid = git(canonical, ["rev-parse", "--verify", "HEAD^{commit}"]);
     if (options.expectedBaseOid !== undefined && baseOid !== options.expectedBaseOid) {
       throw new KerbsFlowError("BASE_OID_MISMATCH", `expected ${options.expectedBaseOid}, found ${baseOid}`);
@@ -207,12 +209,12 @@ export class GitWorktreeManager {
     return this.inspectProven(record, maxDiffBytes);
   }
 
-  prepareCleanup(record: WorktreeRecord, disposition: "terminal_clean" | "failed" | "recovery" | "cancelled", now = new Date().toISOString()): WorktreeCleanupOutcome {
+  prepareCleanup(record: WorktreeRecord, authority: WorktreeCleanupAuthority, now = new Date().toISOString()): WorktreeCleanupOutcome {
+    assertWorktreeCleanupAuthority(authority, record.runKey, record.path, record.worktreeGitDirectory, record.markerPath);
     const owned = this.discover(record.runKey);
     if (owned === undefined || owned.path !== record.path || owned.worktreeGitDirectory !== record.worktreeGitDirectory) {
       throw new KerbsFlowError("WORKTREE_OWNERSHIP_UNPROVEN", "cleanup requires the exact persisted owned worktree identity");
     }
-    if (disposition !== "terminal_clean") return { outcome: "retained", record: owned, reason: disposition };
     if (this.inspectProven(owned).dirty) return { outcome: "retained", record: owned, reason: "dirty" };
     const intent: WorktreeCleanupIntent = { schemaVersion: "kerbsflow.worktree-cleanup-intent/v1", record: owned, preparedAt: now };
     atomicWritePrivateFile(join(this.runtimeRoot, "worktree-records"), basename(owned.markerPath), `${JSON.stringify(intent)}\n`, true);
@@ -270,13 +272,13 @@ export class GitWorktreeManager {
   private inspectProven(record: WorktreeRecord, maxDiffBytes = 2_000_000): WorktreeInspection {
     const headOid = git(record.path, ["rev-parse", "--verify", "HEAD^{commit}"]);
     const status = parsePorcelain(gitBuffer(record.path, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]));
-    const trackedDiff = gitBuffer(record.path, ["diff", "--no-ext-diff", "--no-renames", "--binary", record.baseOid, "--"]);
+    const trackedDiff = gitBuffer(record.path, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--binary", record.baseOid, "--"]);
     const untrackedDiff = renderUntrackedDiff(record.path, status, maxDiffBytes - trackedDiff.byteLength);
     const diffBuffer = Buffer.concat([trackedDiff, untrackedDiff]);
     if (diffBuffer.byteLength > maxDiffBytes) {
       throw new KerbsFlowError("DIFF_TOO_LARGE", `worktree diff exceeds ${maxDiffBytes} bytes`);
     }
-    const tracked = splitNul(gitBuffer(record.path, ["diff", "--no-renames", "--name-only", "-z", record.baseOid, "--"]));
+    const tracked = splitNul(gitBuffer(record.path, ["diff", "--no-ext-diff", "--no-textconv", "--no-renames", "--name-only", "-z", record.baseOid, "--"]));
     const changedPaths = [...new Set([...tracked, ...status.map((entry) => entry.path)])].sort();
     return {
       baseOid: record.baseOid,
@@ -369,7 +371,7 @@ function renderUntrackedDiff(worktreePath: string, status: GitStatusEntry[], rem
 
 function git(cwd: string, args: string[]): string {
   try {
-    return execFileSync("git", args, { cwd, env: gitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 * 1024 * 1024 }).trim();
+    return execFileSync("git", safeGitArgs(args), { cwd, env: gitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 * 1024 * 1024 }).trim();
   } catch (error) {
     const detail = error instanceof Error ? redactDiagnostic(error.message) : "Git command failed";
     throw new KerbsFlowError("GIT_COMMAND_FAILED", `git ${args[0] ?? "command"} failed: ${detail}`);
@@ -378,7 +380,7 @@ function git(cwd: string, args: string[]): string {
 
 function gitOptional(cwd: string, args: string[]): string {
   try {
-    return execFileSync("git", args, { cwd, env: gitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1024 * 1024 }).trim();
+    return execFileSync("git", safeGitArgs(args), { cwd, env: gitEnvironment(), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], maxBuffer: 1024 * 1024 }).trim();
   } catch {
     return "";
   }
@@ -386,7 +388,7 @@ function gitOptional(cwd: string, args: string[]): string {
 
 function gitBuffer(cwd: string, args: string[]): Buffer {
   try {
-    return execFileSync("git", args, { cwd, env: gitEnvironment(), encoding: "buffer", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 * 1024 * 1024 });
+    return execFileSync("git", safeGitArgs(args), { cwd, env: gitEnvironment(), encoding: "buffer", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 4 * 1024 * 1024 });
   } catch (error) {
     const detail = error instanceof Error ? redactDiagnostic(error.message) : "Git command failed";
     throw new KerbsFlowError("GIT_COMMAND_FAILED", `git ${args[0] ?? "command"} failed: ${detail}`);
@@ -394,13 +396,50 @@ function gitBuffer(cwd: string, args: string[]): Buffer {
 }
 
 export function gitEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const allowed = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"] as const;
-  const environment: NodeJS.ProcessEnv = { GIT_TERMINAL_PROMPT: "0" };
+  const allowed = ["PATH", "TMPDIR", "TMP", "TEMP", "LANG", "LC_ALL"] as const;
+  const environment: NodeJS.ProcessEnv = {
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_ATTR_NOSYSTEM: "1",
+    GIT_PAGER: "cat",
+  };
   for (const name of allowed) {
     const value = source[name];
     if (value !== undefined && !value.includes("\0")) environment[name] = value;
   }
   return environment;
+}
+
+function safeGitArgs(args: string[]): string[] {
+  return ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "diff.external=", ...args];
+}
+
+function assertSafeCheckoutConfiguration(repositoryPath: string): void {
+  const configKeys = gitBuffer(repositoryPath, ["config", "--local", "--no-includes", "--null", "--name-only", "--list"])
+    .toString("utf8").split("\0").filter(Boolean);
+  const executableConfig = /^(?:filter\..*|core\.(?:fsmonitor|attributesfile)|diff\.(?:external|.*\.(?:command|textconv))|merge\..*\.driver|include(?:if)?\..*)$/iu;
+  const blocked = configKeys.filter((key) => executableConfig.test(key));
+  if (blocked.length > 0) {
+    throw new KerbsFlowError("GIT_EXECUTABLE_CONFIG_GATE", `repository configuration needs human review before safe checkout: ${blocked.join(", ")}`);
+  }
+  const attributePaths = splitNul(gitBuffer(repositoryPath, ["ls-tree", "-r", "--name-only", "-z", "HEAD"]))
+    .filter((path) => path === ".gitattributes" || path.endsWith("/.gitattributes"));
+  for (const path of attributePaths) {
+    const content = git(repositoryPath, ["show", `HEAD:${path}`]);
+    if (/(?:^|\s)filter(?:=|\s|$)/mu.test(content)) {
+      throw new KerbsFlowError("GIT_CHECKOUT_FILTER_GATE", `tracked ${path} requests a checkout filter; safe worktree semantics require human review`);
+    }
+  }
+  const localAttributes = join(git(repositoryPath, ["rev-parse", "--git-common-dir"]), "info", "attributes");
+  const attributesPath = isAbsolute(localAttributes) ? localAttributes : resolve(repositoryPath, localAttributes);
+  if (existsSync(attributesPath) && lstatSync(attributesPath).isSymbolicLink()) {
+    throw new KerbsFlowError("GIT_CHECKOUT_FILTER_GATE", "repository-local attributes link requires human review");
+  }
+  if (existsSync(attributesPath) && /(?:^|\s)filter(?:=|\s|$)/mu.test(readFileSync(attributesPath, "utf8"))) {
+    throw new KerbsFlowError("GIT_CHECKOUT_FILTER_GATE", "repository-local attributes request a checkout filter; safe worktree semantics require human review");
+  }
 }
 
 function parsePorcelain(buffer: Buffer): GitStatusEntry[] {
