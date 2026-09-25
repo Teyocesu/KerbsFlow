@@ -34,6 +34,7 @@ import {
   asTaskId,
   asTransitionId,
   asValidationId,
+  CommandId,
   canonicalJson,
   parseHumanGate,
   parseAdapterDescriptor,
@@ -737,6 +738,13 @@ export class StateStore {
   getRun(runId: RunId): StoredRun | undefined {
     this.assertOpen();
     return this.readRun(this.db.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId) as Row | undefined);
+  }
+
+  getCommandIdempotencyKey(commandId: CommandId): string | undefined {
+    this.assertOpen();
+    const safeCommandId = asCommandId(commandId);
+    const row = this.db.prepare("SELECT idempotency_key FROM commands WHERE command_id = ?").get(safeCommandId) as Row | undefined;
+    return row === undefined ? undefined : stringValue(row.idempotency_key, "commands.idempotency_key");
   }
 
   getTask(taskId: TaskId): StoredTask | undefined {

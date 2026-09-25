@@ -203,6 +203,7 @@ export class LocalApiServer {
     if (segments.length === 2 && segments[1] === "runs") {
       if (method !== "POST") return this.methodNotAllowed(response, "POST");
       const envelope = parseMutationEnvelope(await readMutationBody(request));
+      this.assertCommandIdAvailable(envelope);
       assertExactKeys(envelope.payload, ["runId", "objective"]);
       const runId = asRunId(requiredMutationString(envelope.payload.runId, 120));
       const objective = requiredMutationString(envelope.payload.objective, 10_000);
@@ -230,6 +231,7 @@ export class LocalApiServer {
       if (segments.length === 4 && ["pause", "resume", "cancel"].includes(segments[3]!)) {
         if (method !== "POST") return this.methodNotAllowed(response, "POST");
         const envelope = parseMutationEnvelope(await readMutationBody(request));
+        this.assertCommandIdAvailable(envelope);
         assertExactKeys(envelope.payload, segments[3] === "cancel" ? ["reason"] : []);
         const result = segments[3] === "pause"
           ? this.dependencies.core.pause(runId, envelope.expectedStateVersion, envelope.idempotencyKey, envelope.commandId)
@@ -249,6 +251,7 @@ export class LocalApiServer {
         if (method !== "POST") return this.methodNotAllowed(response, "POST");
         const gateId = parseGateId(segments[4]);
         const envelope = parseMutationEnvelope(await readMutationBody(request));
+        this.assertCommandIdAvailable(envelope);
         assertExactKeys(envelope.payload, ["optionId", "note"]);
         const optionId = requiredMutationString(envelope.payload.optionId, 100);
         const note = optionalMutationText(envelope.payload.note, 4_096);
@@ -329,6 +332,17 @@ export class LocalApiServer {
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.setHeader("Cache-Control", "no-store");
     response.end(JSON.stringify(result));
+  }
+
+  private assertCommandIdAvailable(envelope: MutationEnvelope): void {
+    const existingKey = this.dependencies.store.getCommandIdempotencyKey(envelope.commandId);
+    if (existingKey !== undefined && existingKey !== envelope.idempotencyKey) {
+      throw new LocalApiRequestError({
+        status: 409,
+        code: "COMMAND_ID_CONFLICT",
+        message: "command identifier conflicts with an earlier command",
+      });
+    }
   }
 
   private openEvents(request: IncomingMessage, response: ServerResponse, runId: RunId): void {

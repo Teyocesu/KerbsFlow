@@ -485,12 +485,92 @@ test("start persists the supplied command ID and retains idempotent replay", asy
     assert.equal(JSON.parse(replayed.body).replayed, true);
     assert.equal(fixture.store.listTransitions(runId).length, 1);
 
+    const newCommandIdSameSemantics = mutationEnvelope("command_http_start_semantic_replay", "http:start", 0, {
+      runId,
+      objective: "synthetic HTTP start objective",
+    });
+    const semanticReplay = await postMutation(api, path, token, newCommandIdSameSemantics);
+    assert.equal(semanticReplay.status, 200);
+    assert.equal(JSON.parse(semanticReplay.body).replayed, true);
+    assert.equal(fixture.store.listTransitions(runId).length, 1);
+
+    const sameCommandChanged = mutationEnvelope("command_http_start", "http:start", 0, {
+      runId,
+      objective: "changed semantic objective with same command ID",
+    });
+    assert.equal((await postMutation(api, path, token, sameCommandChanged)).status, 409);
+
     const changed = mutationEnvelope("command_http_start_changed", "http:start", 0, {
       runId,
       objective: "changed semantic objective",
     });
     assert.equal((await postMutation(api, path, token, changed)).status, 409);
     assert.equal(fixture.store.listTransitions(runId).length, 1);
+  });
+});
+
+test("command ID collision rejects cancel before Core or adapter cancellation", async () => {
+  let coreCancelCalls = 0;
+  let adapterCancelCalls = 0;
+  await withApi(async ({ fixture, api, token }) => {
+    const clock = new FixedClock("2026-09-25T12:00:00.000Z");
+    const ids = new SequenceIdSource("local-api-command-collision");
+    const fake = new FakeAdapter(clock, ids);
+    const adapter: ExecutorAdapter = {
+      probe: () => fake.probe(),
+      start: (request) => fake.start(request),
+      events: (handle) => fake.events(handle),
+      wait: (handle) => fake.wait(handle),
+      cancel: (handle, reason) => {
+        adapterCancelCalls += 1;
+        return fake.cancel(handle, reason);
+      },
+      reconcile: (identity) => fake.reconcile(identity),
+    };
+    fixture.core = new KerbsFlowCore(fixture.store, adapter, fixture.artifacts, { clock, ids });
+
+    const runId = asRunId("run_local_api_command_collision");
+    const commandId = "command_http_collision";
+    const created = await postMutation(api, "/v1/runs", token, mutationEnvelope(commandId, "collision:first", 0, {
+      runId,
+      objective: "synthetic command ID collision objective",
+    }));
+    assert.equal(created.status, 200);
+
+    let command = fixture.core.completeIntake(runId, 1, "collision:intake");
+    command = fixture.core.plan(runId, command.stateVersion, "collision:plan", planFor(runId, "api_command_collision"));
+    command = fixture.core.prepareExecution(runId, command.stateVersion, "collision:prepare");
+    await fixture.core.beginFakeAttempt(runId, command.stateVersion, "collision:begin");
+    const before = fixture.core.readModel(runId);
+    assert.ok(before?.activeAttempt);
+    assert.equal(before.run.state, "EXECUTE");
+    assert.equal(before.activeAttempt.lifecycle, "RUNNING");
+    const transitionsBefore = fixture.store.listTransitions(runId);
+
+    const collision = await postMutation(api, `/v1/runs/${runId}/cancel`, token, mutationEnvelope(commandId, "collision:cancel", before.run.stateVersion, {
+      reason: "this command ID is already owned by another idempotency key",
+    }));
+    assert.equal(collision.status, 409);
+    assert.deepEqual(JSON.parse(collision.body), {
+      error: {
+        code: "COMMAND_ID_CONFLICT",
+        message: "command identifier conflicts with an earlier command",
+      },
+    });
+    assert.equal(coreCancelCalls, 0);
+    assert.equal(adapterCancelCalls, 0);
+    const after = fixture.core.readModel(runId);
+    assert.equal(after?.run.state, before.run.state);
+    assert.equal(after?.run.stateVersion, before.run.stateVersion);
+    assert.equal(after?.activeAttempt?.lifecycle, before.activeAttempt.lifecycle);
+    assert.deepEqual(fixture.store.listTransitions(runId), transitionsBefore);
+  }, {
+    core: (fixture) => ({
+      cancel(...args) {
+        coreCancelCalls += 1;
+        return fixture.core.cancel(...args);
+      },
+    }),
   });
 });
 
