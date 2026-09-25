@@ -366,7 +366,8 @@ test("bootstrap enforces Host and returns a same-launch inert token with securit
     assert.equal(tokenFrom(root.body), token);
     assert.equal(tokenFrom((await sendRequest(api, "/")).body), token);
     assert.match(root.body, /<meta name="kerbsflow-token" content="[A-Za-z0-9_-]+">/u);
-    assert.doesNotMatch(root.body, /<script\b|\?token=/iu);
+    assert.match(root.body, /<script type="module" src="\/app\.js"><\/script>/u);
+    assert.doesNotMatch(root.body, /<script\b(?![^>]*\bsrc=)[^>]*>|\?token=/iu);
     assert.equal(root.headers["cache-control"], "no-store");
     assert.equal(root.headers["referrer-policy"], "no-referrer");
     assert.equal(root.headers["x-content-type-options"], "nosniff");

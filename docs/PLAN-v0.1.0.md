@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6 planning is complete and ready on `phase6/thin-local-ui`, based exactly on approved cleanup baseline `a62a84c830ab153dc6f45acb86e7f5f721566a02`; implementation has not started.**
+Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328` on `phase6/thin-local-ui`; Phase 6B's read-only dashboard is implemented pending physical macOS QA; Phase 6C has not started.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -207,7 +207,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 6 — Thin local UI
 
-**Status:** Planning complete and ready for implementation on `phase6/thin-local-ui`, created from approved cleanup baseline `a62a84c830ab153dc6f45acb86e7f5f721566a02`. Implementation has not started. Next checkpoint: **6A — local protocol and security boundary**.
+**Status:** 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`. 6B's read-only dashboard is implemented and pending physical macOS QA. Next checkpoint: **6C — Core controls**.
 
 **Objective:** Expose the proven headless loop in a small local dashboard while keeping command authority, durable state, and provider logic in the existing KerbsFlow process/core.
 
@@ -254,7 +254,7 @@ Map malformed/schema errors to `400`, missing/wrong token to `401`, Host/Origin 
 **Checkpoints and exit criteria:**
 
 - **6A — Local protocol and security boundary.** Own the loopback listener lifecycle, token bootstrap, Host/Origin checks, API schemas/body limits/error mapping, bounded snapshot, command delegation/ID handling, artifact-by-ID ownership, and authenticated SSE cursor contract. Test failure modes for foreign Host; foreign or required-but-missing Origin; missing/wrong/valid token; oversized body before processing; malformed/extra-field body; stale state version; duplicate idempotent command executing once; illegal HTTP transition; pathlike/traversal artifact ID; artifact owned by another run; unauthenticated SSE; reconnect/sequence gap repaired by snapshot; UI/server disconnect not canceling a run; and headless operation without the server. Keep tests synthetic and deterministic. No test-count target.
-- **6B — Read-only dashboard.** Add the static document/styles/modules, initial snapshot rendering, connection/reconnect state, bounded activity, validation, scope, and human-gate display. Demonstrate that text is inert and no command or state transition originates from rendering.
+- **6B — Read-only dashboard.** Add the static document/styles/modules, initial snapshot rendering, connection/reconnect state, bounded activity, validation, scope, and human-gate display. Demonstrate that text is inert and no command or state transition originates from rendering. **Status: implemented; physical QA pending.**
 - **6C — Core controls.** Add start, pause, resume, cancel, gate resolution, and the constrained persisted Steer command. Demonstrate state-version/idempotency handling and the existing durable cancellation order through real core boundaries.
 - **6D — UX hardening.** Cover stale snapshot refresh, SSE gaps/reconnect, empty/loading/error states, keyboard/accessibility, responsive layout, and inert rendering of untrusted content. Verify disconnect and UI restart preserve the headless run.
 - **6E — Phase 6 full audit.** Review the complete diff and API trust boundary, run the headless regression suite without the UI/server, exercise the complete dashboard lifecycle, perform physical macOS UI QA, and obtain independent review of security, state authority, recovery, and scope. Close only with evidence against the Phase 6 acceptance criteria.
@@ -302,5 +302,5 @@ Map malformed/schema errors to `400`, missing/wrong token to `401`, Host/Origin 
 ## Current gate
 
 - Phase 5 is independently confirmed **PASS** at approved baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported.
-- Phase 6 planning is complete and ready on `phase6/thin-local-ui` from approved cleanup baseline `a62a84c830ab153dc6f45acb86e7f5f721566a02`; selected UI is static HTML/CSS/browser ES modules served by the existing process. Phase 6 implementation has not started.
-- Next action: Phase 6A — local protocol and security boundary.
+- Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`; Phase 6B read-only dashboard is implemented pending physical macOS QA; Phase 6C has not started.
+- Next action: Phase 6C — Core controls.

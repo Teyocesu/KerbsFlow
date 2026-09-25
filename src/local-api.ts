@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -50,6 +51,17 @@ const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const CONTENT_SECURITY_POLICY = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const MUTATION_SCHEMA_VERSION = "kerbsflow.local-command/v1";
+const INDEX_DOCUMENT_URL = new URL("../../src/ui/index.html", import.meta.url);
+const STATIC_ASSETS = new Map<string, { contentType: string; url: URL }>([
+  ["/app.js", {
+    contentType: "text/javascript; charset=utf-8",
+    url: new URL("../../src/ui/app.js", import.meta.url),
+  }],
+  ["/styles.css", {
+    contentType: "text/css; charset=utf-8",
+    url: new URL("../../src/ui/styles.css", import.meta.url),
+  }],
+]);
 
 export class LocalApiServer {
   private readonly token = randomBytes(32).toString("base64url");
@@ -177,6 +189,16 @@ export class LocalApiServer {
         return;
       }
       this.sendBootstrap(response);
+      return;
+    }
+
+    const assetPath = segments.length === 1 ? "/" + segments[0] : undefined;
+    const asset = assetPath === undefined ? undefined : STATIC_ASSETS.get(assetPath);
+    if (asset !== undefined) {
+      if (request.method !== "GET") return this.methodNotAllowed(response, "GET");
+      response.statusCode = 200;
+      response.setHeader("Content-Type", asset.contentType);
+      response.end(readFileSync(asset.url, "utf8"));
       return;
     }
 
@@ -433,8 +455,8 @@ export class LocalApiServer {
   private sendBootstrap(response: ServerResponse): void {
     response.statusCode = 200;
     response.setHeader("Content-Type", "text/html; charset=utf-8");
-    response.setHeader("Cache-Control", "no-store");
-    response.end(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="kerbsflow-token" content="${this.token}"><title>KerbsFlow local API</title></head><body></body></html>`);
+    const index = readFileSync(INDEX_DOCUMENT_URL, "utf8");
+    response.end(index.replace("__KERBSFLOW_TOKEN__", this.token));
   }
 
   private methodNotAllowed(response: ServerResponse, allow: string): void {
