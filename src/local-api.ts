@@ -154,9 +154,11 @@ export class LocalApiServer {
     const origin = singleRawHeader(request, "origin");
     const expectedOrigin = `http://${expectedHost}`;
     const isRoot = segments.length === 0;
-    if (origin.duplicate || (isRoot
-      ? origin.value !== undefined && origin.value !== expectedOrigin
-      : origin.value !== expectedOrigin)) {
+    const isSafeRead = request.method === "GET" || request.method === "HEAD";
+    const originRequired = !isRoot && !isSafeRead;
+    if (origin.duplicate || (originRequired
+      ? origin.value !== expectedOrigin
+      : origin.value !== undefined && origin.value !== expectedOrigin)) {
       this.sendError(response, { status: 403, code: "ORIGIN_FORBIDDEN", message: "request origin is not allowed" });
       return;
     }

@@ -40,7 +40,7 @@ interface RequestOptions {
   method?: string;
   host?: string;
   includeHost?: boolean;
-  origin?: string;
+  origin?: string | string[];
   token?: string;
   lastEventId?: string;
 }
@@ -146,7 +146,7 @@ async function withApi(
 }
 
 function sendRequest(api: LocalApiServer, path: string, options: RequestOptions = {}): Promise<ApiResponse> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string | string[]> = {};
   if (options.includeHost !== false) headers.host = options.host ?? `127.0.0.1:${api.port()}`;
   if (options.origin !== undefined) headers.origin = options.origin;
   if (options.token !== undefined) headers["X-KerbsFlow-Token"] = options.token;
@@ -174,7 +174,6 @@ function sendRequest(api: LocalApiServer, path: string, options: RequestOptions 
 function openSse(api: LocalApiServer, runId: RunId, token: string, lastEventId?: string): Promise<SseConnection> {
   const headers: Record<string, string> = {
     host: `127.0.0.1:${api.port()}`,
-    origin: `http://127.0.0.1:${api.port()}`,
     "X-KerbsFlow-Token": token,
   };
   if (lastEventId !== undefined) headers["Last-Event-ID"] = lastEventId;
@@ -312,23 +311,27 @@ test("bootstrap enforces Host and returns a same-launch inert token with securit
     assert.equal(root.headers["x-frame-options"], "DENY");
     assert.equal(root.headers["content-security-policy"], "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'");
     assert.equal(root.headers["access-control-allow-origin"], undefined);
+    for (const origin of ["null", "https://foreign.example", [`http://127.0.0.1:${port}`, `http://127.0.0.1:${port}`]]) {
+      assert.equal((await sendRequest(api, "/", { origin })).status, 403);
+    }
   });
 });
 
-test("every v1 read requires the launch token and exact origin and Host", async () => {
+test("v1 reads allow omitted Origin but still require token and exact Host", async () => {
   await withApi(async ({ fixture, api, token }) => {
     const runId = asRunId("run_local_api_auth");
     startRun(fixture, runId);
     const path = `/v1/runs/${runId}/snapshot`;
     const exactOrigin = `http://127.0.0.1:${api.port()}`;
     const valid = { origin: exactOrigin, token };
-    assert.equal((await sendRequest(api, path, { origin: exactOrigin })).status, 401);
+    assert.equal((await sendRequest(api, path, { token })).status, 200);
+    assert.equal((await sendRequest(api, path)).status, 401);
     assert.equal((await sendRequest(api, path, { ...valid, token: "wrong-token" })).status, 401);
     const accepted = await sendRequest(api, path, valid);
     assert.equal(accepted.status, 200);
     assert.equal(accepted.headers["access-control-allow-origin"], undefined);
-    for (const origin of [undefined, "null", `http://localhost:${api.port()}`, `http://127.0.0.1:${api.port() + 1}`, "https://foreign.example"]) {
-      const response = await sendRequest(api, path, origin === undefined ? { token } : { ...valid, origin });
+    for (const origin of ["null", `http://localhost:${api.port()}`, `http://127.0.0.1:${api.port() + 1}`, "https://foreign.example", [exactOrigin, exactOrigin]]) {
+      const response = await sendRequest(api, path, { ...valid, origin });
       assert.equal(response.status, 403);
       assert.equal(response.headers["access-control-allow-origin"], undefined);
     }
@@ -336,6 +339,7 @@ test("every v1 read requires the launch token and exact origin and Host", async 
     assert.equal((await sendRequest(api, `${path}?token=${token}`, valid)).status, 400);
 
     const before = fixture.core.readModel(runId)?.run.stateVersion;
+    assert.equal((await sendRequest(api, `/v1/runs/${runId}/cancel`, { token, method: "POST" })).status, 403);
     const unsupportedMutation = await sendRequest(api, `/v1/runs/${runId}/cancel`, { ...valid, method: "POST" });
     assert.equal(unsupportedMutation.status, 404);
     assert.equal(fixture.core.readModel(runId)?.run.stateVersion, before);
@@ -443,7 +447,7 @@ test("artifact reads require a valid owned ID before calling the integrity-check
     const artifactId = await createArtifact(fixture, ownerRunId, "api_artifact_owner");
     startRun(fixture, otherRunId);
     const pathFor = (runId: RunId, id: string) => `/v1/runs/${runId}/artifacts/${id}`;
-    const auth = { origin: `http://127.0.0.1:${api.port()}`, token };
+    const auth = { token };
 
     const good = await sendRequest(api, pathFor(ownerRunId, artifactId), auth);
     assert.equal(good.status, 200);
@@ -492,10 +496,11 @@ test("SSE authenticates, streams persisted run sequences, reconnects, polls, and
     assert.equal(persisted.length, 3);
     assert.ok(persisted[1]!.sequence > persisted[0]!.sequence + 1);
 
-    const unauthenticated = await sendRequest(api, `/v1/runs/${runId}/events`, { origin: `http://127.0.0.1:${api.port()}` });
+    const unauthenticated = await sendRequest(api, `/v1/runs/${runId}/events`);
     assert.equal(unauthenticated.status, 401);
-    assert.equal((await sendRequest(api, `/v1/runs/${runId}/events`, { origin: `http://127.0.0.1:${api.port()}`, token, lastEventId: "-1" })).status, 400);
-    assert.equal((await sendRequest(api, "/v1/runs/run_local_api_unknown/events", { origin: `http://127.0.0.1:${api.port()}`, token })).status, 404);
+    assert.equal((await sendRequest(api, `/v1/runs/${runId}/events`, { token, lastEventId: "-1" })).status, 400);
+    assert.equal((await sendRequest(api, `/v1/runs/${runId}/events`, { token, origin: "https://foreign.example" })).status, 403);
+    assert.equal((await sendRequest(api, "/v1/runs/run_local_api_unknown/events", { token })).status, 404);
 
     const initial = await openSse(api, runId, token);
     assert.equal(initial.response.statusCode, 200);
