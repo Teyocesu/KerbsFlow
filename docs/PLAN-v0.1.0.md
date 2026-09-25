@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6 has not started.**
+Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6 planning is complete and ready on `phase6/thin-local-ui`, based exactly on approved cleanup baseline `a62a84c830ab153dc6f45acb86e7f5f721566a02`; implementation has not started.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -174,7 +174,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 5 — Isolation and operational hardening
 
-**Status:** Complete and independently confirmed **PASS** at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`. F3–F5 remain accepted. By explicit product-scope decision, macOS is the only officially supported v0.1 host. Linux remains unsupported preview/best-effort; incomplete historical Linux validation is non-blocking and is not v0.1 certification. Phase 6 has not started.
+**Status:** Complete and independently confirmed **PASS** at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`. F3–F5 remain accepted. By explicit product-scope decision, macOS is the only officially supported v0.1 host. Linux remains unsupported preview/best-effort; incomplete historical Linux validation is non-blocking and is not v0.1 certification. Phase 6 implementation has not started.
 
 **Objective:** Close the remaining filesystem, process, worktree, network, secret, artifact, and recovery risks for the officially supported macOS v0.1 host. Preserve fail-closed behavior in the Linux preview implementation without treating Linux as a v0.1 support or release gate.
 
@@ -201,37 +201,73 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Adversarial path/symlink/argv/env/log fixtures; real macOS Seatbelt capability tests; macOS process-tree tests; dirty/missing/moved worktree matrix; database integrity, corruption, migration, backup, and recovery tests. Linux fixtures may verify defensive capability classification but are not release-certification evidence.
 
-**Exit condition:** Satisfied and independently confirmed **PASS** at baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; the audit found no unresolved macOS Phase 5 blocker. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did build, typecheck, the 241-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Historical Linux validation is incomplete and does not establish Linux support; it is non-blocking for v0.1. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
+**Exit condition:** Satisfied and independently confirmed **PASS** at baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; the audit found no unresolved macOS Phase 5 blocker. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did build, typecheck, the 241-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Historical Linux validation is incomplete and does not establish Linux support; it is non-blocking for v0.1. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 implementation has not started.
 
 **Expected route:** Codex/Sol High for implementation decisions and independent security/hardening review.
 
 ## Phase 6 — Thin local UI
 
-**Objective:** Expose the proven headless loop without moving authority or provider logic into the UI.
+**Status:** Planning complete and ready for implementation on `phase6/thin-local-ui`, created from approved cleanup baseline `a62a84c830ab153dc6f45acb86e7f5f721566a02`. Implementation has not started. Next checkpoint: **6A — local protocol and security boundary**.
 
-**Exact scope:**
+**Objective:** Expose the proven headless loop in a small local dashboard while keeping command authority, durable state, and provider logic in the existing KerbsFlow process/core.
 
-- Implement the versioned loopback HTTP/JSON snapshot/command surface and SSE notifications over persisted state versions.
-- Add per-launch token, strict host/origin/no-CORS policy, schema/size validation, conflict/idempotency responses, and artifact-ID confinement.
-- Select the smallest maintainable local UI approach only after comparing dependency cost against a minimal native/static implementation; record any material decision in the SPEC.
-- Render project, run/state/phase, task, executor/model, SPEC/scope/invariants, validations, retries/escalations, activity, and human gate.
-- Implement Pause, Resume, Inspect, Steer, Cancel, and gate resolution as core commands.
+**Selected UI approach:** Static HTML/CSS and browser ES modules, served by the existing KerbsFlow Node process using the built-in HTTP module. The UI surface is small, the repository has no UI framework/build stack or KerbsFlow HTTP UI server today, and another framework/build dependency has no demonstrated v0.1 benefit. This is an implementation choice within the SPEC's loopback HTTP/JSON + SSE boundary; it does not change the product contract, so this plan records it without changing the SPEC.
 
-**Out of scope:** Remote access, accounts, collaboration, cloud hosting, UI-owned database access, arbitrary terminal/file browser, raw HTML/ANSI rendering.
+**Process and authority boundary:**
 
-**Acceptance criteria:**
+- One existing KerbsFlow process owns the listener and the existing core/SQLite connection. Bind only to `127.0.0.1` on an OS-assigned ephemeral port. Define start, ready, and close lifecycle behavior; closing or disconnecting the dashboard must not cancel a run. Never create a second database owner or let browser code write SQLite/state directly.
+- Route run creation through the existing orchestration/run-start boundary; route lifecycle and gate actions through core command methods. Inspect/snapshot is read-only. Preserve the real-executor cancellation ordering: persist cancellation intent before signaling the owned process/adapter.
+- Generate 32 cryptographically random bytes per process launch. Keep the token in process memory, bootstrap it into the no-store dashboard document, and keep the browser copy in page memory only. Do not put it in a URL, local storage, logs, persisted state, or repository content. Require it on every `/v1` request, including snapshots and SSE, using `X-KerbsFlow-Token`.
+- Require the exact `Host` for `127.0.0.1:<assigned-port>`. Require the exact `/v1` origin `http://127.0.0.1:<assigned-port>`; reject `localhost`, alternate ports, `null`, foreign origins, missing mutation origins, and foreign hosts. Do not enable permissive CORS. Permit a top-level `GET /` without `Origin`, but only with the exact Host.
+- Send `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, `X-Content-Type-Options: nosniff`, frame denial (`frame-ancestors 'none'` and `X-Frame-Options: DENY`), and a restrictive same-origin CSP for the static assets and API connection.
 
-- The headless test suite runs unchanged without UI/server.
-- UI restart/disconnect does not cancel or corrupt a run; snapshot + SSE sequence repairs missed events.
-- Every mutation requires token, valid origin/host, schema, command ID, and expected state version.
-- UI cannot produce an illegal transition or bypass a human gate.
-- Repository/model text renders inertly and artifacts cannot traverse the runtime root.
+**Versioned local API:** Implement only these routes; do not add generic RPC or arbitrary filesystem-path access:
 
-**Focused validation:** API contract/state-conflict/idempotency tests; origin/token/CSRF-like localhost tests; SSE reconnect; escaped-content fixtures; UI smoke flows for run, gate, pause/resume/cancel.
+| Method | Route | Behavior |
+| --- | --- | --- |
+| `GET` | `/v1/runs/:runId/snapshot` | Bounded authoritative read model and recent persisted activity |
+| `GET` | `/v1/runs/:runId/events` | Authenticated SSE notifications keyed by persisted transition sequence |
+| `POST` | `/v1/runs` | Start through existing orchestration boundary |
+| `POST` | `/v1/runs/:runId/pause` | Core pause command |
+| `POST` | `/v1/runs/:runId/resume` | Core resume command |
+| `POST` | `/v1/runs/:runId/steer` | Persisted human instruction under the constraints below |
+| `POST` | `/v1/runs/:runId/cancel` | Core cancellation command and durable cancellation ordering |
+| `POST` | `/v1/runs/:runId/gates/:gateId/resolve` | Run- and gate-scoped core resolution |
+| `GET` | `/v1/runs/:runId/artifacts/:artifactId` | Validated artifact-ID lookup scoped to the owning run |
 
-**Exit condition:** A user can supervise the entire proven loop locally while the same behavior remains available headlessly.
+Every mutation uses one runtime-validated JSON envelope with `commandId`, `idempotencyKey`, `expectedStateVersion`, and command-specific payload; start uses expected state version `0`. The current core/API creates command IDs internally, so 6A makes the smallest adjustment needed to accept and persist the supplied ID through the existing command path. Reuse the existing idempotency and state-version checks; do not create an HTTP-side idempotency store. Reject unknown fields and malformed JSON. Bound JSON request bodies to 64 KiB, Steer text to 4 KiB, gate notes to 4 KiB, and cancellation reasons to 1 KiB. Use the existing runtime-validation style, not a new validation framework.
 
-**Expected route:** OpenCode/Muse for ordinary UI work if verified; Codex/Luna Max fallback; Codex/Sol High security review of the localhost boundary.
+Map malformed/schema errors to `400`, missing/wrong token to `401`, Host/Origin failures to `403`, unknown run/gate/artifact to `404`, state-version/idempotency/current-state conflicts to `409`, oversized bodies to `413`, and unexpected failures to sanitized `500`. Never include stack traces, paths, secrets, or provider diagnostics in responses.
+
+**Snapshot, events, and artifacts:**
+
+- Build the snapshot from the current persisted read model: run ID/state/state version, project identity, task, active attempt/adapter/model/phase, recovery and pause details, current human gate, latest validation/review, retry/escalation information, and bounded recent transitions/activity and artifact metadata/IDs. Exclude raw database content, environment, credentials, unbounded logs, and arbitrary paths.
+- Use persisted transition sequence IDs for SSE cursor/reconnect. Authenticate SSE with `fetch` and `X-KerbsFlow-Token` (native `EventSource` cannot set that header). Send progress/invalidation notifications only; the client refetches the snapshot as canonical state. On reconnect or a sequence gap, refresh from the snapshot. Never rebuild canonical state from an event stream. UI/SSE disconnect does not mutate or cancel a run.
+- Resolve artifacts only by validated artifact ID. Verify persisted ownership by the requested run before calling `FileArtifactStore.get()`, preserving its hash/size/path-confinement checks. Add only the minimal read-only ownership lookup if the existing read model does not expose it. Return conservative content type/disposition; never accept a path from the client.
+
+**Steer contract:** Steer does not exist in the current core. 6C adds only a bounded, run-bound, durable, idempotent human instruction, with actor recorded as human. It must not rewrite an active prompt or mutate an in-flight attempt/state; the Planning Master consumes it once at the next safe boundary. Keep at most one pending human instruction and persist consumed status/evidence. Material scope, security, or permission implications still go through the normal human gate; Steer cannot grant permissions or broaden scope automatically. Do not add chat history, arbitrary agent messages, or a prompt editor.
+
+**Dashboard:** One compact view with header/run identity, current work and attempt, validation/scope, human gate and consequences, available controls, and bounded activity. Render repository/provider/model text as inert text, never raw HTML or ANSI. Include clear loading, empty, disconnected/stale, and error states.
+
+**Out of scope:** Remote access, accounts, collaboration, cloud hosting, a frontend framework/build dependency, WebSockets, UI-owned database access, generic RPC, arbitrary terminal/file browsing, client-supplied paths, raw HTML/ANSI rendering, and Phase 7 release actions.
+
+**Checkpoints and exit criteria:**
+
+- **6A — Local protocol and security boundary.** Own the loopback listener lifecycle, token bootstrap, Host/Origin checks, API schemas/body limits/error mapping, bounded snapshot, command delegation/ID handling, artifact-by-ID ownership, and authenticated SSE cursor contract. Test failure modes for foreign Host; foreign or required-but-missing Origin; missing/wrong/valid token; oversized body before processing; malformed/extra-field body; stale state version; duplicate idempotent command executing once; illegal HTTP transition; pathlike/traversal artifact ID; artifact owned by another run; unauthenticated SSE; reconnect/sequence gap repaired by snapshot; UI/server disconnect not canceling a run; and headless operation without the server. Keep tests synthetic and deterministic. No test-count target.
+- **6B — Read-only dashboard.** Add the static document/styles/modules, initial snapshot rendering, connection/reconnect state, bounded activity, validation, scope, and human-gate display. Demonstrate that text is inert and no command or state transition originates from rendering.
+- **6C — Core controls.** Add start, pause, resume, cancel, gate resolution, and the constrained persisted Steer command. Demonstrate state-version/idempotency handling and the existing durable cancellation order through real core boundaries.
+- **6D — UX hardening.** Cover stale snapshot refresh, SSE gaps/reconnect, empty/loading/error states, keyboard/accessibility, responsive layout, and inert rendering of untrusted content. Verify disconnect and UI restart preserve the headless run.
+- **6E — Phase 6 full audit.** Review the complete diff and API trust boundary, run the headless regression suite without the UI/server, exercise the complete dashboard lifecycle, perform physical macOS UI QA, and obtain independent review of security, state authority, recovery, and scope. Close only with evidence against the Phase 6 acceptance criteria.
+
+**Phase 6 acceptance criteria:**
+
+- The existing headless suite and core behavior remain usable without starting the UI server.
+- UI restart/disconnect does not cancel or corrupt a run; authenticated snapshot plus persisted SSE sequence repairs missed events.
+- Every mutation is host/origin/token/schema/command-ID/state-version checked and delegates to the core/orchestration boundary; duplicate commands do not execute twice and illegal transitions remain illegal.
+- Browser code cannot write persisted state, bypass a human gate, expand Steer authority, or access an artifact outside its run.
+- Persisted/UI summaries are bounded and redacted; external text renders inertly.
+
+**Expected route:** OpenCode/Muse for ordinary UI implementation if verified; Codex/Luna Max fallback; Codex/Sol High for local-boundary security and independent Phase 6 review.
 
 ## Phase 7 — Full v0.1 gate and release preparation
 
@@ -265,4 +301,6 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 5 is independently confirmed **PASS** at approved baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported. Phase 6 has not started. Next action: begin Phase 6 thin local UI planning/implementation.
+- Phase 5 is independently confirmed **PASS** at approved baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported.
+- Phase 6 planning is complete and ready on `phase6/thin-local-ui` from approved cleanup baseline `a62a84c830ab153dc6f45acb86e7f5f721566a02`; selected UI is static HTML/CSS/browser ES modules served by the existing process. Phase 6 implementation has not started.
+- Next action: Phase 6A — local protocol and security boundary.

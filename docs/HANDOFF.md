@@ -1,6 +1,6 @@
 # KerbsFlow handoff
 
-- Phase 5 independently confirmed PASS at `16359e9a37e62bc37da8b2c480fca88fe855a2dd`.
-- Official v0.1 support: macOS only; Linux preview/non-blocking; Windows deferred.
-- Phase 6 has not started.
-- Next action: Phase 6 thin local UI.
+- Cleanup baseline: `a62a84c830ab153dc6f45acb86e7f5f721566a02`.
+- Phase 6 plan: approved and ready; implementation has not started.
+- UI: static HTML/CSS/browser ES modules served by the existing KerbsFlow process.
+- Next action: Phase 6A — local protocol and security boundary.
