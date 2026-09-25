@@ -19,3 +19,4 @@ export * from "./canonical.js";
 export * from "./phase2.js";
 export * from "./opencode.js";
 export * from "./routing.js";
+export * from "./local-api.js";

@@ -4,6 +4,7 @@ import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, open
 import { DatabaseSync } from "node:sqlite";
 
 import {
+  ArtifactId,
   CONTRACT_VERSIONS,
   Command,
   CommandResult,
@@ -25,6 +26,7 @@ import {
   SemanticReviewRequest,
   SemanticReviewResult,
   AttemptLifecycle,
+  asArtifactId,
   asAttemptId,
   asCommandId,
   asGateId,
@@ -547,6 +549,19 @@ export interface StoredTransition {
   stateVersionBefore: number;
   stateVersionAfter: number;
   payloadJson: string;
+  createdAt: string;
+}
+
+export interface StoredArtifact {
+  artifactId: ArtifactId;
+  runId: RunId;
+  attemptId: AttemptId | null;
+  kind: string;
+  relativePath: string;
+  contentHash: string;
+  sizeBytes: number;
+  redactionState: "not_applicable" | "redacted";
+  retentionCategory: "active_run" | "retained_failure_recovery" | "terminal_clean_eligible" | "public_synthetic_fixture";
   createdAt: string;
 }
 
@@ -1124,6 +1139,46 @@ export class StateStore {
     this.assertOpen();
     const rows = this.db.prepare("SELECT * FROM transitions WHERE run_id = ? ORDER BY sequence").all(runId) as Row[];
     return rows.map(parseTransitionRow);
+  }
+
+  listRecentTransitions(runId: RunId, limit: number): StoredTransition[] {
+    this.assertOpen();
+    const safeRunId = asRunId(runId);
+    const boundedLimit = boundedReadLimit(limit);
+    const rows = this.db.prepare(
+      "SELECT * FROM (SELECT * FROM transitions WHERE run_id = ? ORDER BY sequence DESC LIMIT ?) ORDER BY sequence ASC",
+    ).all(safeRunId, boundedLimit) as Row[];
+    return rows.map(parseTransitionRow);
+  }
+
+  listTransitionsAfter(runId: RunId, afterSequence: number, limit: number): StoredTransition[] {
+    this.assertOpen();
+    const safeRunId = asRunId(runId);
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+      throw new KerbsFlowError("TRANSITION_CURSOR_INVALID", "transition cursor must be a non-negative safe integer");
+    }
+    const boundedLimit = boundedReadLimit(limit);
+    const rows = this.db.prepare(
+      "SELECT * FROM transitions WHERE run_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?",
+    ).all(safeRunId, afterSequence, boundedLimit) as Row[];
+    return rows.map(parseTransitionRow);
+  }
+
+  getArtifactRecord(artifactId: ArtifactId): StoredArtifact | undefined {
+    this.assertOpen();
+    const safeArtifactId = asArtifactId(artifactId);
+    const row = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id = ?").get(safeArtifactId) as Row | undefined;
+    return row === undefined ? undefined : parseArtifactRow(row);
+  }
+
+  listArtifactRecords(runId: RunId, limit: number): StoredArtifact[] {
+    this.assertOpen();
+    const safeRunId = asRunId(runId);
+    const boundedLimit = boundedReadLimit(limit);
+    const rows = this.db.prepare(
+      "SELECT * FROM (SELECT * FROM artifacts WHERE run_id = ? ORDER BY created_at DESC, artifact_id DESC LIMIT ?) ORDER BY created_at ASC, artifact_id ASC",
+    ).all(safeRunId, boundedLimit) as Row[];
+    return rows.map(parseArtifactRow);
   }
 
   hasFailureEscalation(runId: RunId, taskId: TaskId): boolean {
@@ -1936,6 +1991,34 @@ function parseTransitionRow(row: Row): StoredTransition {
   };
 }
 
+function parseArtifactRow(row: Row): StoredArtifact {
+  const kind = stringValue(row.kind, "artifacts.kind");
+  const contentHash = stringValue(row.content_hash, "artifacts.content_hash");
+  const sizeBytes = numberValue(row.size_bytes, "artifacts.size_bytes");
+  const redactionState = stringValue(row.redaction_state, "artifacts.redaction_state");
+  const retentionCategory = stringValue(row.retention_category, "artifacts.retention_category");
+  if (!/^[a-z0-9._-]{1,100}$/iu.test(kind)
+    || !/^[a-f0-9]{64}$/u.test(contentHash)
+    || sizeBytes < 0
+    || (redactionState !== "not_applicable" && redactionState !== "redacted")
+    || (retentionCategory !== "active_run" && retentionCategory !== "retained_failure_recovery" && retentionCategory !== "terminal_clean_eligible" && retentionCategory !== "public_synthetic_fixture")) {
+    throw new KerbsFlowError("PERSISTED_ROW_INVALID", "artifacts metadata is invalid");
+  }
+  const attemptId = nullableString(row.attempt_id, "artifacts.attempt_id");
+  return {
+    artifactId: asArtifactId(stringValue(row.artifact_id, "artifacts.artifact_id")),
+    runId: asRunId(stringValue(row.run_id, "artifacts.run_id")),
+    attemptId: attemptId === null ? null : asAttemptId(attemptId),
+    kind,
+    relativePath: stringValue(row.relative_path, "artifacts.relative_path"),
+    contentHash,
+    sizeBytes,
+    redactionState,
+    retentionCategory,
+    createdAt: stringValue(row.created_at, "artifacts.created_at"),
+  };
+}
+
 function parseValidationRow(row: Row): StoredValidation {
   return {
     validationId: stringValue(row.validation_id, "validations.validation_id"),
@@ -2197,6 +2280,13 @@ function isTerminalAttempt(value: AttemptLifecycle): boolean {
 function isSqliteFailure(error: unknown): boolean {
   if (!(error instanceof Error) || !("code" in error)) return false;
   return typeof error.code === "string" && error.code.startsWith("ERR_SQLITE");
+}
+
+function boundedReadLimit(limit: number): number {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+    throw new KerbsFlowError("QUERY_LIMIT_INVALID", "read limit must be an integer from 1 through 100");
+  }
+  return limit;
 }
 
 function stringValue(value: unknown, path: string): string {
