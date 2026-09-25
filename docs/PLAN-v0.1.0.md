@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 5 macOS implementation is ready for independent audit on `phase5/isolation-operational-hardening`, from canonical Phase 4 closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6 has not started.**
+Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6 has not started.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -174,7 +174,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 5 — Isolation and operational hardening
 
-**Status:** macOS Phase 5 candidate implementation and deterministic/security gates pass; independent Phase 5 audit remains required for closure. F3–F5 remain accepted. Phase 4 was independently confirmed **PASS** before the Phase 5 branch was created from canonical closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. By explicit product-scope decision, macOS is the only officially supported v0.1 host. Linux remains unsupported preview/best-effort; incomplete historical Linux validation is non-blocking and is not v0.1 certification. Phase 6 has not started.
+**Status:** Complete and independently confirmed **PASS** at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`. F3–F5 remain accepted. By explicit product-scope decision, macOS is the only officially supported v0.1 host. Linux remains unsupported preview/best-effort; incomplete historical Linux validation is non-blocking and is not v0.1 certification. Phase 6 has not started.
 
 **Objective:** Close the remaining filesystem, process, worktree, network, secret, artifact, and recovery risks for the officially supported macOS v0.1 host. Preserve fail-closed behavior in the Linux preview implementation without treating Linux as a v0.1 support or release gate.
 
@@ -201,7 +201,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Focused validation:** Adversarial path/symlink/argv/env/log fixtures; real macOS Seatbelt capability tests; macOS process-tree tests; dirty/missing/moved worktree matrix; database integrity, corruption, migration, backup, and recovery tests. Linux fixtures may verify defensive capability classification but are not release-certification evidence.
 
-**Exit condition:** macOS implementation and local gates are ready for independent Phase 5 audit. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did build, typecheck, the 241-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Historical Linux validation is incomplete and does not establish Linux support; it is non-blocking for v0.1. Phase 5 closes after the independent audit. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
+**Exit condition:** Satisfied and independently confirmed **PASS** at baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; the audit found no unresolved macOS Phase 5 blocker. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did build, typecheck, the 241-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Historical Linux validation is incomplete and does not establish Linux support; it is non-blocking for v0.1. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
 
 **Expected route:** Codex/Sol High for implementation decisions and independent security/hardening review.
 
@@ -265,4 +265,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 5 macOS candidate is ready for independent audit on `phase5/isolation-operational-hardening`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported. Phase 6 has not started. Next action: independent Phase 5 macOS audit.
+- Phase 5 is independently confirmed **PASS** at approved baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported. Phase 6 has not started. Next action: begin Phase 6 thin local UI planning/implementation.
