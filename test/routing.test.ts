@@ -289,6 +289,7 @@ test("routing decision and separate provenance for every attempt persist without
     store.recordRoutingDecision(routed.routingDecision);
 
     command = core.prepareExecution(routed.planningDecision.runId, command.stateVersion, "prepare-routing-1");
+    assert.equal(JSON.parse(store.readModel(routed.planningDecision.runId)?.activeAttempt?.adapterDescriptorJson ?? "{}").adapter, "opencode");
     const firstAttempt = store.readModel(routed.planningDecision.runId)?.run.activeAttemptId;
     assert.ok(firstAttempt);
     store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({ routingDecision: routed.routingDecision, planningDecision: routed.planningDecision, attemptId: firstAttempt!, selectionReason: routed.routingDecision.selectionReason }));
@@ -308,6 +309,7 @@ test("routing decision and separate provenance for every attempt persist without
     const escalated = escalatePlanningRoute(routed.planningDecision, { model: "openai/sol-current", reasoning: "high" });
     command = core.reworkToReady(routed.planningDecision.runId, command.stateVersion, "ready-routing-2", escalated);
     command = core.prepareExecution(routed.planningDecision.runId, command.stateVersion, "prepare-routing-2");
+    assert.equal(JSON.parse(store.readModel(routed.planningDecision.runId)?.activeAttempt?.adapterDescriptorJson ?? "{}").adapter, "codex");
     const secondAttempt = store.readModel(routed.planningDecision.runId)?.run.activeAttemptId;
     assert.ok(secondAttempt);
     await assert.rejects(() => core.beginAttempt(routed.planningDecision.runId, command.stateVersion, "begin-routing-2-missing", root), /attempt routing provenance|routing authority/i);
@@ -340,27 +342,6 @@ test("an escalated attempt cannot use a route absent from the trusted discovery 
   const routed = new PolicyRouter().route({ planningDecision: baseDecision(), classification: "normal", discovery: actual.discovery });
   const absent = escalatePlanningRoute(routed.planningDecision, { model: "openai/unseen", reasoning: "high" });
   assert.throws(() => createAttemptRoutingProvenance({ routingDecision: routed.routingDecision, planningDecision: absent, attemptId: "attempt_absent" as never, selectionReason: "untrusted escalation" }), /not an available and suitable route/i);
-});
-
-test("core still selects the routed adapter for each prepared planning route", async () => {
-  const root = mkdtempSync(join(tmpdir(), "kerbsflow-routing-adapters-"));
-  const clock = new FixedClock("2026-09-22T12:00:00.000Z");
-  const ids = new SequenceIdSource("switch");
-  const store = StateStore.open(join(root, "state.sqlite"), { clock, ids });
-  try {
-    const actual = await discover();
-    const routed = new PolicyRouter().route({ planningDecision: baseDecision(), classification: "normal", discovery: actual.discovery });
-    const adapter = new RoutedExecutorAdapter([descriptorOnlyAdapter(opencodeDescriptor(), readiness()), descriptorOnlyAdapter(codexDescriptor())]);
-    const core = configuredCore(store, adapter, clock, ids);
-    let command = core.startRun(routed.planningDecision.runId, "switch adapters", "switch:start");
-    command = core.completeIntake(routed.planningDecision.runId, command.stateVersion, "switch:intake");
-    command = core.plan(routed.planningDecision.runId, command.stateVersion, "switch:plan", routed.planningDecision);
-    core.prepareExecution(routed.planningDecision.runId, command.stateVersion, "switch:prepare");
-    assert.equal(JSON.parse(store.readModel(routed.planningDecision.runId)?.activeAttempt?.adapterDescriptorJson ?? "{}").adapter, "opencode");
-  } finally {
-    store.close();
-    rmSync(root, { recursive: true, force: true });
-  }
 });
 
 function baseDecision(suffix = "route") {
