@@ -152,7 +152,9 @@ The verifier is edit-disabled by default. It gathers authoritative local facts a
 
 It may not weaken or rewrite the validation plan to obtain green. Review sessions receive read-only permissions unless a distinct, approved rework attempt is created.
 
-Verification commands run through a KerbsFlow-owned `VerificationSandbox` boundary. On macOS it capability-probes `/usr/bin/sandbox-exec` (Seatbelt); on Linux it capability-probes Bubblewrap. The assigned worktree and minimum command runtime inputs are read-only; only a private KerbsFlow scratch root is writable. Host home, credentials, host `/tmp` writes, and workload network are denied for the entire verification process tree. Missing, insecure, or adversarially unproven enforcement makes verification unavailable and requires a human gate, with no unrestricted fallback. Linux Bubblewrap must be upstream 0.12.0 or newer, or have explicit trusted evidence of the CVE-2026-87766 fix in a backport; version presence alone is insufficient. The sandbox capability record contains only backend/platform/version and probe evidence, never credentials. This is the human-approved Phase 5 host prerequisite; it does not add a sandbox framework or container/VM product architecture.
+Verification commands run through a KerbsFlow-owned `VerificationSandbox` boundary. For officially supported v0.1 on macOS, `/usr/bin/sandbox-exec` (Seatbelt) is the required, release-critical backend. Its adversarial capability probe must establish that the assigned worktree is read-only, only a private KerbsFlow scratch root is writable, credentials and protected environment files cannot be read, unauthorized host writes are denied or confined, workload network access is denied, descendants remain restricted, and cleanup fails closed. Missing, insecure, or adversarially unproven enforcement makes verification unavailable and requires a human gate, with no unrestricted fallback.
+
+Linux Bubblewrap may remain implemented as unsupported preview/best-effort behavior. Linux has no v0.1 compatibility guarantee, is outside the official v0.1 support matrix, and is not a Phase 5 or Phase 7 exit requirement. Whenever the Linux path is invoked, its existing capability checks and fail-closed behavior still apply; it must not fall back to unrestricted execution. Bubblewrap must be upstream 0.12.0 or newer, or have explicit trusted evidence of the CVE-2026-87766 fix in a backport; version presence alone is insufficient. Linux may be promoted in a future release after its own real-host validation. The sandbox capability record contains only backend/platform/version and probe evidence, never credentials. This does not add a sandbox framework or container/VM product architecture.
 
 ### 4.7 State and artifact stores
 
@@ -760,7 +762,7 @@ v0.1 is acceptable only when:
 12. No success is declared from exit code alone or through weakened validation.
 13. Secrets/credentials are tool-owned by default and absent from SQLite, committed files, logs, and public fixtures.
 14. Push/merge/tag/release/deploy/production remain human-controlled and unimplemented as automatic actions.
-15. Full deterministic v0.1 validation passes on the approved support matrix with evidence classifications intact.
+15. Full deterministic v0.1 validation passes on the officially supported macOS host with evidence classifications intact.
 
 ## 22. Phase 0 acceptance
 
@@ -776,8 +778,8 @@ Phase 0 is approved and frozen for implementation. Independent review confirmed 
 
 ### U-03 — v0.1 support matrix (resolved)
 
-- **Decision:** Official v0.1 support is macOS and Linux. Windows is deferred; its architecture remains portable, but it is not officially supported until Windows-specific process-tree cancellation, filesystem/permissions, worktree, and recovery gates pass.
-- **Scope:** No Windows implementation or support claim is added in Phase 1. Phase 2 and later process/worktree acceptance uses the approved macOS/Linux matrix unless a later decision expands it.
+- **Decision:** Official v0.1 host support is macOS only. This explicit product-scope decision supersedes the earlier macOS/Linux matrix. Linux is unsupported preview/best-effort, has no v0.1 compatibility guarantee, and is not a Phase 5 or Phase 7 requirement. Windows is deferred and unsupported in v0.1. Linux may be promoted in a future release after its own real-host validation.
+- **Scope:** v0.1 release and phase acceptance use macOS as the only officially supported host. The Linux implementation may remain in source, but any Linux invocation must retain its existing capability checks and fail-closed behavior; unsupported status does not permit an unsafe fallback. No Windows implementation or support claim is added in v0.1.
 
 ## 24. Explicitly deferred capabilities
 

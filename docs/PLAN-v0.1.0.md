@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 5 implementation complete on `phase5/isolation-operational-hardening` from canonical Phase 4 closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`; support-matrix exit BLOCKED pending live Linux validation and independent audit. Phase 6 has not started.**
+Status: **Phase 5 macOS implementation is ready for independent audit on `phase5/isolation-operational-hardening`, from canonical Phase 4 closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6 has not started.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -174,9 +174,9 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 5 — Isolation and operational hardening
 
-**Status:** final targeted pre-Linux F1/F2 corrections implemented and macOS deterministic/security gates passed on the Phase 5 branch; independent re-audit remains required. F3–F5 remain accepted. Phase 4 was independently confirmed **PASS** before the Phase 5 branch was created from canonical closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. The Phase 5 support-matrix exit remains **BLOCKED** pending a real Linux Node 24 operational gate.
+**Status:** macOS Phase 5 candidate implementation and deterministic/security gates pass; independent Phase 5 audit remains required for closure. F3–F5 remain accepted. Phase 4 was independently confirmed **PASS** before the Phase 5 branch was created from canonical closure `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. By explicit product-scope decision, macOS is the only officially supported v0.1 host. Linux remains unsupported preview/best-effort; incomplete historical Linux validation is non-blocking and is not v0.1 certification. Phase 6 has not started.
 
-**Objective:** Close the remaining filesystem, process, worktree, network, secret, artifact, and cross-platform risks on the approved support matrix.
+**Objective:** Close the remaining filesystem, process, worktree, network, secret, artifact, and recovery risks for the officially supported macOS v0.1 host. Preserve fail-closed behavior in the Linux preview implementation without treating Linux as a v0.1 support or release gate.
 
 **Exact scope:**
 
@@ -193,14 +193,15 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 **Acceptance criteria:**
 
 - No tested escape reaches outside allowed paths; unsupported enforcement is labeled/gated rather than claimed.
+- The real macOS Seatbelt adversarial probe proves worktree read-only, private scratch writable, credential/environment protection, denied or confined unauthorized host writes, denied workload network, restricted descendants, and fail-closed cleanup.
 - Known secrets and sensitive environment values are absent from persisted state/logs/artifacts and public fixtures.
-- Cancellation terminates the owned process tree or produces an explicit recovery gate on every supported OS.
+- macOS cancellation terminates the owned process tree or produces an explicit recovery gate.
 - Cleanup never force-removes unknown dirty work and can reconcile interrupted removal safely.
 - SQLite remains consistent through migration/crash tests; any journaling change is evidence-backed and documented in the SPEC.
 
-**Focused validation:** Adversarial path/symlink/argv/env/log fixtures; network-policy capability tests; process-tree tests per OS; dirty/missing/moved worktree matrix; database corruption/migration backup tests.
+**Focused validation:** Adversarial path/symlink/argv/env/log fixtures; real macOS Seatbelt capability tests; macOS process-tree tests; dirty/missing/moved worktree matrix; database integrity, corruption, migration, backup, and recovery tests. Linux fixtures may verify defensive capability classification but are not release-certification evidence.
 
-**Exit condition:** Pending. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did typecheck, the full 237-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Linux capability fixtures are deterministic only; live Linux sandbox, filesystem, process-tree, worktree, and SQLite behavior is **NOT TESTED**. Independent Phase 5 re-audit and the real Linux gate must close before a support-matrix **PASS**. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
+**Exit condition:** macOS implementation and local gates are ready for independent Phase 5 audit. On macOS Darwin 24.3.0 / Node v24.15.0, the actual Seatbelt probe denied `.env`, `.env.local`, and nested `.env.production` reads while allowing an ordinary source read. Focused sandbox, Git configuration/filter, process-tree, SQLite ownership, and cleanup tests passed, as did build, typecheck, the 241-test suite, high-severity dependency audit, and `git diff --check`. Rollback journaling remains the selected single-owner architecture, guarded across processes by a private owner record. Historical Linux validation is incomplete and does not establish Linux support; it is non-blocking for v0.1. Phase 5 closes after the independent audit. Static path/symlink checks do not eliminate concurrent same-user path swaps under the v0.1 single-user threat model. Phase 6 has not started.
 
 **Expected route:** Codex/Sol High for implementation decisions and independent security/hardening review.
 
@@ -238,9 +239,9 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Exact scope:**
 
-- Verify the resolved Apache-2.0 license decision and macOS/Linux v0.1 support matrix remain reflected in the release evidence; Windows remains deferred until its explicit platform gates pass.
+- Verify the resolved Apache-2.0 license decision and macOS-only official v0.1 support remain reflected in release evidence. Linux remains unsupported preview/best-effort, with no v0.1 compatibility guarantee or release gate; Windows remains deferred and unsupported.
 - Freeze contract/migration versions and document tested Codex/OpenCode/runtime/support versions.
-- Run the complete deterministic gate from the SPEC across the approved platforms.
+- Run the complete deterministic gate from the SPEC on the officially supported macOS host. Do not require Linux preview validation for v0.1 release readiness.
 - Run synthetic end-to-end pass, rework, escalation, human gate, cancel, executor crash, orchestrator crash, and recovery scenarios through both adapters where live credentials are available; label unavailable live checks accurately.
 - Review dependencies/licenses, public artifacts/fixtures, secrets, `.gitignore`, install/run guidance, and release diff.
 - Perform independent critical code, architecture, security, recovery, and simplification review; fix only within SPEC.
@@ -250,9 +251,9 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 **Acceptance criteria:**
 
-- All 15 v0.1 SPEC acceptance criteria have current evidence or are explicitly not tested and block release readiness.
+- All 15 v0.1 SPEC acceptance criteria have current evidence on macOS or are explicitly not tested and block release readiness. Linux preview evidence is outside the v0.1 support matrix.
 - No weakened validation, unfinished stub, silent fallback, secret/private content, operational database, or raw worktree is present in the release diff.
-- Migrations/recovery and supported-platform process/worktree tests pass.
+- Migrations/recovery and macOS process/worktree tests pass.
 - Provider/version limitations and residual risks are visible in the human release gate.
 - License text matches the human decision and copyright ownership.
 
@@ -264,4 +265,4 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Current gate
 
-- Phase 4 is independently confirmed **PASS** at audited baseline `15274317000dd724ae3b280a0de82f0d477b6d1d`; its canonical closure is `ad134e0c630c800cb80fa40eb8cedb822cd0040e`. Phase 5 is in progress on `phase5/isolation-operational-hardening`. Phase 6 has not started. Next action: implement checkpoint A (filesystem, environment, secrets, and artifacts) and run its focused gate.
+- Phase 5 macOS candidate is ready for independent audit on `phase5/isolation-operational-hardening`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported. Phase 6 has not started. Next action: independent Phase 5 macOS audit.

@@ -1,8 +1,8 @@
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync, type Stats } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, parse, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, parse, sep } from "node:path";
 import { createServer } from "node:net";
 
 import { KerbsFlowError } from "./errors.js";
@@ -39,6 +39,9 @@ export class VerificationSandbox implements VerificationCommandSandbox {
 
   async run(command: VerificationCommand, worktreePath: string): Promise<VerificationSandboxResult> {
     let root: string | undefined;
+    let result: VerificationSandboxResult | undefined;
+    let failure: KerbsFlowError | undefined;
+    const expectedUid = typeof process.geteuid === "function" ? process.geteuid() : undefined;
     try {
       if (!isAbsolute(worktreePath) || !existsSync(worktreePath)) throw unavailable("assigned worktree is missing");
       const worktree = realpathSync(worktreePath);
@@ -56,9 +59,11 @@ export class VerificationSandbox implements VerificationCommandSandbox {
       writeFileSync(join(probeWorktree, "subdir", ".env.production"), "synthetic-credential", { mode: 0o600 });
       const outside = join(root, "outside.txt");
       writeFileSync(outside, "outside", { mode: 0o600 });
+      const outsideSnapshot = lstatSync(outside, { bigint: true });
       const hostTmpProbe = `/tmp/kerbsflow-sandbox-${randomUUID()}`;
       try { writeFileSync(hostTmpProbe, "preflight", { flag: "wx", mode: 0o600 }); unlinkSync(hostTmpProbe); }
       catch { throw unavailable("host /tmp denial probe cannot establish a writable control path"); }
+      if (lstatIfPresent(hostTmpProbe) !== undefined) throw unavailable("host /tmp control path could not be cleared before the probe");
       const listener = createServer();
       await new Promise<void>((accept, reject) => {
         listener.once("error", reject);
@@ -71,13 +76,43 @@ export class VerificationSandbox implements VerificationCommandSandbox {
         const probe = await this.supervisor.start(probeSpec).completion;
         let observed: Record<string, unknown>;
         try { observed = JSON.parse(probe.stdout) as Record<string, unknown>; } catch { throw unavailable("adversarial sandbox probe produced no valid evidence"); }
-        const expected = ["worktreeRead", "scratchWrite", "worktreeWriteDenied", "outsideReadDenied", "outsideWriteDenied", "credentialReadDenied", "envLocalReadDenied", "nestedEnvProductionReadDenied", "hostTmpWriteDenied", "networkDenied", "outboundDenied", "childRestricted"];
+        const expected = ["worktreeRead", "scratchWrite", "worktreeWriteDenied", "outsideReadDenied", "credentialReadDenied", "envLocalReadDenied", "nestedEnvProductionReadDenied", "networkDenied", "outboundDenied", "childWorktreeWriteDenied"];
         if (probe.exitKind !== "normal" || probe.exitCode !== 0 || expected.some((key) => observed[key] !== true)) {
           throw unavailable(`adversarial sandbox probe failed: ${expected.filter((key) => observed[key] !== true).join(", ") || probe.exitKind}`);
         }
+        const validWriteOutcome = (succeeded: unknown, errorCode: unknown): boolean =>
+          (succeeded === true && errorCode === null)
+          || (succeeded === false && typeof errorCode === "string" && SANDBOX_DENIAL_CODES.has(errorCode));
+        if (!validWriteOutcome(observed.outsideWriteSucceeded, observed.outsideWriteError)
+          || !validWriteOutcome(observed.hostTmpWriteSucceeded, observed.hostTmpWriteError)) {
+          throw unavailable("adversarial sandbox write probe produced invalid evidence");
+        }
+        const outsideAfter = lstatSync(outside, { bigint: true });
+        const outsideUnchanged = outsideAfter.isFile()
+          && readFileSync(outside, "utf8") === "outside"
+          && outsideAfter.dev === outsideSnapshot.dev
+          && outsideAfter.ino === outsideSnapshot.ino
+          && outsideAfter.mode === outsideSnapshot.mode
+          && outsideAfter.uid === outsideSnapshot.uid
+          && outsideAfter.gid === outsideSnapshot.gid
+          && outsideAfter.nlink === outsideSnapshot.nlink
+          && outsideAfter.size === outsideSnapshot.size
+          && outsideAfter.mtimeNs === outsideSnapshot.mtimeNs
+          && outsideAfter.ctimeNs === outsideSnapshot.ctimeNs;
+        const privateScratchWritePreserved = readFileSync(join(probeScratch, "allowed"), "utf8") === "ok";
+        const privateHostTmpProbe = join(probeScratch, basename(hostTmpProbe));
+        const hostTmpWriteWasPrivate = observed.hostTmpWriteSucceeded !== true
+          || backend.kind !== "bubblewrap"
+          || (lstatIfPresent(privateHostTmpProbe) !== undefined && readFileSync(privateHostTmpProbe, "utf8") === "x");
+        const protectedWorktreeTargetsAbsent = lstatIfPresent(join(probeWorktree, "blocked")) === undefined
+          && lstatIfPresent(join(probeWorktree, "blocked-child")) === undefined;
+        if (!outsideUnchanged || !privateScratchWritePreserved || !hostTmpWriteWasPrivate
+          || !protectedWorktreeTargetsAbsent || lstatIfPresent(hostTmpProbe) !== undefined) {
+          throw unavailable("adversarial sandbox host-effect probe failed");
+        }
       } finally {
         listener.close();
-        if (existsSync(hostTmpProbe)) unlinkSync(hostTmpProbe);
+        if (lstatIfPresent(hostTmpProbe) !== undefined) unlinkSync(hostTmpProbe);
       }
       const scratch = join(root, "scratch");
       mkdirSync(scratch, { mode: 0o700 });
@@ -91,17 +126,19 @@ export class VerificationSandbox implements VerificationCommandSandbox {
         probeAt: new Date().toISOString(),
         probeHash: createHash("sha256").update(JSON.stringify({ backend: backend.kind, version: backend.version, probe: ADVERSARIAL_PROBE, profile: spec.args.slice(0, -command.args.length - 1) })).digest("hex"),
       };
-      const result = await this.supervisor.start(spec).completion;
-      return { result, capability };
+      const processResult = await this.supervisor.start(spec).completion;
+      result = { result: processResult, capability };
     } catch (error) {
-      if (error instanceof KerbsFlowError && error.code === "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
-      throw unavailable("verification sandbox preparation or launch failed");
-    } finally {
-      if (root !== undefined) {
-        try { rmSync(root, { recursive: true, force: true }); }
-        catch { throw unavailable("verification scratch cleanup could not be proven"); }
-      }
+      failure = normalizeSandboxFailure(error);
     }
+    try {
+      if (root !== undefined) cleanupPrivateRoot(root, expectedUid);
+    } catch (cleanupError) {
+      throw combineCleanupFailure(failure, cleanupError);
+    }
+    if (failure !== undefined) throw failure;
+    if (result === undefined) throw unavailable("verification sandbox produced no result");
+    return result;
   }
 }
 
@@ -267,29 +304,141 @@ function privateTemp(prefix: string): string {
   return realpathSync(root);
 }
 
+class ScratchCleanupError extends Error {
+  constructor(readonly code: string) {
+    super("verification scratch cleanup encountered an unsafe private-root entry");
+    this.name = "ScratchCleanupError";
+  }
+}
+
+function cleanupPrivateRoot(root: string, expectedUid: number | undefined): void {
+  const initial = lstatIfPresent(root);
+  if (initial === undefined) return;
+  if (initial.isSymbolicLink() || !initial.isDirectory()) throw new ScratchCleanupError("INVALID_ROOT");
+  const ownerUid = expectedUid ?? initial.uid;
+  const device = initial.dev;
+  assertCleanupOwnership(initial, ownerUid, device);
+  if (realpathSync(root) !== root) throw new ScratchCleanupError("ROOT_PATH_CHANGED");
+
+  const pending: Array<{ path: string | Buffer; root: boolean; removeDirectory: boolean }> = [
+    { path: root, root: true, removeDirectory: false },
+  ];
+  const separator = Buffer.from(sep);
+  const dot = Buffer.from(".");
+  const dotDot = Buffer.from("..");
+  while (pending.length > 0) {
+    const entry = pending.pop();
+    if (entry === undefined) break;
+    const metadata = lstatIfPresent(entry.path);
+    if (metadata === undefined) continue;
+    assertCleanupOwnership(metadata, ownerUid, device);
+
+    if (entry.removeDirectory) {
+      if (metadata.isSymbolicLink() || !metadata.isDirectory()) throw new ScratchCleanupError("DIRECTORY_CHANGED");
+      restoreOwnerDirectoryAccess(entry.path, metadata);
+      rmdirSync(entry.path);
+      continue;
+    }
+
+    if (entry.root && (metadata.isSymbolicLink() || !metadata.isDirectory())) {
+      throw new ScratchCleanupError("INVALID_ROOT");
+    }
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      unlinkSync(entry.path);
+      continue;
+    }
+
+    restoreOwnerDirectoryAccess(entry.path, metadata);
+    pending.push({ path: entry.path, root: entry.root, removeDirectory: true });
+    for (const name of readdirSync(entry.path, { encoding: "buffer" })) {
+      if (name.length === 0 || name.equals(dot) || name.equals(dotDot) || name.includes(separator) || name.includes(0)) {
+        throw new ScratchCleanupError("INVALID_ENTRY_NAME");
+      }
+      const parent = Buffer.isBuffer(entry.path) ? entry.path : Buffer.from(entry.path);
+      pending.push({ path: Buffer.concat([parent, separator, name]), root: false, removeDirectory: false });
+    }
+  }
+
+  if (lstatIfPresent(root) !== undefined) throw new ScratchCleanupError("ROOT_REMAINS");
+}
+
+function lstatIfPresent(path: string | Buffer): Stats | undefined {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (nodeErrorCode(error) === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+function assertCleanupOwnership(metadata: Stats, ownerUid: number, device: number): void {
+  if (metadata.uid !== ownerUid) throw new ScratchCleanupError("UNEXPECTED_OWNER");
+  if (metadata.dev !== device) throw new ScratchCleanupError("MOUNT_BOUNDARY");
+}
+
+function restoreOwnerDirectoryAccess(path: string | Buffer, metadata: Stats): void {
+  const permissions = metadata.mode & 0o7777;
+  const accessiblePermissions = permissions | 0o700;
+  if (permissions !== accessiblePermissions) chmodSync(path, accessiblePermissions);
+}
+
+function nodeErrorCode(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null || !("code" in error)) return undefined;
+  return typeof error.code === "string" ? error.code : undefined;
+}
+
+function normalizeSandboxFailure(error: unknown): KerbsFlowError {
+  if (error instanceof KerbsFlowError && error.code === "VERIFICATION_SANDBOX_UNAVAILABLE") return error;
+  return unavailable("verification sandbox preparation or launch failed");
+}
+
+export function combineCleanupFailure(primary: KerbsFlowError | undefined, cleanupError: unknown): KerbsFlowError {
+  const errorCode = nodeErrorCode(cleanupError);
+  const cleanupFailure = {
+    code: errorCode !== undefined && /^[A-Z][A-Z0-9_]{0,63}$/u.test(errorCode) ? errorCode : "UNKNOWN",
+  };
+  if (primary === undefined) {
+    return new KerbsFlowError("VERIFICATION_SANDBOX_UNAVAILABLE", "verification scratch cleanup could not be proven", { cleanupFailure });
+  }
+  return new KerbsFlowError(primary.code, primary.message, {
+    primaryFailure: { code: primary.code },
+    cleanupFailure,
+  });
+}
+
 function unavailable(summary: string): KerbsFlowError {
   return new KerbsFlowError("VERIFICATION_SANDBOX_UNAVAILABLE", summary);
 }
 
+const SANDBOX_DENIAL_CODES = new Set(["EPERM", "EACCES", "ENOENT", "EROFS"]);
+const sandboxDenialCodesJson = JSON.stringify([...SANDBOX_DENIAL_CODES]);
+
 const ADVERSARIAL_PROBE = String.raw`
 const fs=require('node:fs'),net=require('node:net'),cp=require('node:child_process');
 const [worktree,scratch,outside,port,hostTmpProbe]=process.argv.slice(1);
-const denied=(fn)=>{try{fn();return false}catch(e){return e&&(['EPERM','EACCES','ENOENT'].includes(e.code))}};
+const DENIAL_CODES=new Set(${sandboxDenialCodesJson});
+const errorCode=(fn)=>{try{fn();return null}catch(e){return typeof e?.code==='string'?e.code:'UNKNOWN'}};
+const denied=(code)=>DENIAL_CODES.has(code);
 const result={
  worktreeRead:fs.readFileSync(worktree+'/readable.txt','utf8')==='readable',
- scratchWrite:false,worktreeWriteDenied:false,outsideReadDenied:false,outsideWriteDenied:false,
+ scratchWrite:false,worktreeWriteDenied:false,worktreeWriteError:null,outsideReadDenied:false,
+ outsideWriteSucceeded:false,outsideWriteError:null,
  credentialReadDenied:false,envLocalReadDenied:false,nestedEnvProductionReadDenied:false,
- hostTmpWriteDenied:false,networkDenied:false,outboundDenied:false,childRestricted:false
+ hostTmpWriteSucceeded:false,hostTmpWriteError:null,networkDenied:false,outboundDenied:false,
+ childWorktreeWriteDenied:false,childWorktreeWriteError:null
 };
-try{fs.writeFileSync(scratch+'/allowed','ok');result.scratchWrite=true}catch{}
-result.worktreeWriteDenied=denied(()=>fs.writeFileSync(worktree+'/blocked','x'));
-result.outsideReadDenied=denied(()=>fs.readFileSync(outside));
-result.outsideWriteDenied=denied(()=>fs.writeFileSync(outside,'x'));
-result.credentialReadDenied=denied(()=>fs.readFileSync(worktree+'/.env'));
-result.envLocalReadDenied=denied(()=>fs.readFileSync(worktree+'/.env.local'));
-result.nestedEnvProductionReadDenied=denied(()=>fs.readFileSync(worktree+'/subdir/.env.production'));
-result.hostTmpWriteDenied=denied(()=>fs.writeFileSync(hostTmpProbe,'x'));
-try{const child=cp.spawnSync(process.execPath,['-e','const fs=require("node:fs");try{fs.writeFileSync(process.argv[1],"x");process.exit(1)}catch{process.exit(0)}',outside]);result.childRestricted=child.status===0}catch{}
+const scratchError=errorCode(()=>fs.writeFileSync(scratch+'/allowed','ok'));result.scratchWrite=scratchError===null;
+result.worktreeWriteError=errorCode(()=>fs.writeFileSync(worktree+'/blocked','x'));result.worktreeWriteDenied=denied(result.worktreeWriteError);
+result.outsideReadDenied=denied(errorCode(()=>fs.readFileSync(outside)));
+result.outsideWriteError=errorCode(()=>fs.writeFileSync(outside,'x'));result.outsideWriteSucceeded=result.outsideWriteError===null;
+result.credentialReadDenied=denied(errorCode(()=>fs.readFileSync(worktree+'/.env')));
+result.envLocalReadDenied=denied(errorCode(()=>fs.readFileSync(worktree+'/.env.local')));
+result.nestedEnvProductionReadDenied=denied(errorCode(()=>fs.readFileSync(worktree+'/subdir/.env.production')));
+result.hostTmpWriteError=errorCode(()=>fs.writeFileSync(hostTmpProbe,'x'));result.hostTmpWriteSucceeded=result.hostTmpWriteError===null;
+const childScript='const fs=require("node:fs"),codes=new Set('+JSON.stringify([...DENIAL_CODES])+');try{fs.writeFileSync(process.argv[1],"x");process.exit(1)}catch(e){const code=typeof e?.code==="string"?e.code:"UNKNOWN";process.stdout.write(code);process.exit(codes.has(code)?0:2)}';
+const child=cp.spawnSync(process.execPath,['-e',childScript,worktree+'/blocked-child'],{encoding:'utf8'});
+result.childWorktreeWriteError=child.stdout.trim()||child.error?.code||'UNEXPECTED';
+result.childWorktreeWriteDenied=child.status===0&&DENIAL_CODES.has(result.childWorktreeWriteError);
 const attempt=(host,port,codes)=>new Promise((resolve)=>{
  const socket=net.connect(port,host);let settled=false;
  const done=(value)=>{if(settled)return;settled=true;socket.destroy();resolve(value)};
