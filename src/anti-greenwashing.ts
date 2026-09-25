@@ -58,7 +58,7 @@ export function detectAntiGreenwashing(diff: string, changedPaths: readonly stri
 
   for (const path of deletedPaths) {
     if (isTestPath(path)) {
-      add("test_deleted", { path, text: "" }, "a test file was deleted", true, false);
+      add("test_deleted", { path, text: "" }, "a test file was deleted and requires semantic review", false, true);
     }
     if (isCiPath(path)) {
       add("ci_check_removed", { path, text: "" }, "a CI/check definition was deleted", true, false);

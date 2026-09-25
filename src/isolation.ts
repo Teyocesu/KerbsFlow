@@ -1,6 +1,6 @@
 import type { AdapterDescriptor, EnforcementStrength } from "./contracts.js";
 
-export type SupportedHostPlatform = "darwin" | "linux";
+export type SupportedHostPlatform = "darwin";
 
 export interface IsolationRequirement {
   filesystem: EnforcementStrength;
@@ -10,20 +10,23 @@ export interface IsolationRequirement {
 export interface AdapterOsCapability {
   adapter: string;
   platform: NodeJS.Platform;
-  supportedHost: boolean;
+  officiallySupportedHost: boolean;
+  runtimeIsolationAvailable: boolean;
   filesystem: EnforcementStrength;
   workloadNetwork: EnforcementStrength;
   providerControlPlane: AdapterDescriptor["capabilities"]["network"]["providerControlPlane"];
 }
 
 export function adapterOsCapability(descriptor: AdapterDescriptor, platform: NodeJS.Platform = process.platform): AdapterOsCapability {
-  const supportedHost = platform === "darwin" || platform === "linux";
+  const officiallySupportedHost = platform === "darwin";
+  const runtimeIsolationAvailable = platform === "darwin" || platform === "linux";
   return {
     adapter: descriptor.adapter,
     platform,
-    supportedHost,
-    filesystem: supportedHost ? descriptor.capabilities.filesystemEnforcement : "unavailable",
-    workloadNetwork: supportedHost ? descriptor.capabilities.network.workload : "unavailable",
+    officiallySupportedHost,
+    runtimeIsolationAvailable,
+    filesystem: runtimeIsolationAvailable ? descriptor.capabilities.filesystemEnforcement : "unavailable",
+    workloadNetwork: runtimeIsolationAvailable ? descriptor.capabilities.network.workload : "unavailable",
     providerControlPlane: descriptor.capabilities.network.providerControlPlane,
   };
 }
@@ -34,7 +37,7 @@ export function isolationIssues(
   platform: NodeJS.Platform = process.platform,
 ): string[] {
   const capability = adapterOsCapability(descriptor, platform);
-  if (!capability.supportedHost) return [`host OS ${platform} is outside the approved macOS/Linux support matrix`];
+  if (!capability.runtimeIsolationAvailable) return [`host OS ${platform} is outside the runtime isolation support matrix`];
   const issues: string[] = [];
   if (!enforcementSatisfies(capability.filesystem, requirement.filesystem)) {
     issues.push(`filesystem enforcement ${capability.filesystem} is weaker than required ${requirement.filesystem} on ${platform}`);

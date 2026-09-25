@@ -31,6 +31,11 @@ for (const mutation of mutations) {
     assert.equal(typeof signal.blocksPass, "boolean");
     assert.equal(typeof signal.semanticReviewRequired, "boolean");
     assert.equal(signal.path, mutation.path);
+    if (mutation.expected === "test_deleted") {
+      assert.equal(signal.code, "test_deleted");
+      assert.equal(signal.blocksPass, false);
+      assert.equal(signal.semanticReviewRequired, true);
+    }
   });
 }
 

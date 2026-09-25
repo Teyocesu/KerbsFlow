@@ -4,14 +4,15 @@ import assert from "node:assert/strict";
 import { CONTRACT_VERSIONS, type AdapterDescriptor } from "../src/contracts.js";
 import { adapterOsCapability, isolationIssues } from "../src/isolation.js";
 
-test("adapter and OS capability matrix keeps enforced and tool-policy boundaries distinct", () => {
+test("official host support and runtime isolation capability remain distinct", () => {
   const codex = descriptor("codex", "enforced", "enforced");
   const opencode = descriptor("opencode", "tool_policy_only", "tool_policy_only");
   for (const platform of ["darwin", "linux"] as const) {
     assert.deepEqual(adapterOsCapability(codex, platform), {
       adapter: "codex",
       platform,
-      supportedHost: true,
+      officiallySupportedHost: platform === "darwin",
+      runtimeIsolationAvailable: true,
       filesystem: "enforced",
       workloadNetwork: "enforced",
       providerControlPlane: "provider_owned",
@@ -19,8 +20,14 @@ test("adapter and OS capability matrix keeps enforced and tool-policy boundaries
     assert.equal(adapterOsCapability(opencode, platform).filesystem, "tool_policy_only");
     assert.equal(adapterOsCapability(opencode, platform).workloadNetwork, "tool_policy_only");
     assert.deepEqual(isolationIssues(opencode, { filesystem: "enforced", workloadNetwork: "enforced" }, platform).length, 2);
+    assert.deepEqual(isolationIssues(codex, { filesystem: "enforced", workloadNetwork: "enforced" }, platform), []);
   }
+
+  const windows = adapterOsCapability(codex, "win32");
+  assert.equal(windows.officiallySupportedHost, false);
+  assert.equal(windows.runtimeIsolationAvailable, false);
   assert.equal(adapterOsCapability(codex, "win32").filesystem, "unavailable");
+  assert.equal(windows.workloadNetwork, "unavailable");
   assert.match(isolationIssues(codex, { filesystem: "tool_policy_only", workloadNetwork: "tool_policy_only" }, "win32")[0] ?? "", /outside.*support matrix/i);
 });
 
