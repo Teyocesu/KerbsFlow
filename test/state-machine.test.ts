@@ -11,9 +11,11 @@ test("every frozen legal transition is accepted", () => {
 });
 
 test("representative illegal and terminal transitions are rejected", () => {
+  assert.ok(allLegalTransitions().length > 0);
   assert.throws(() => assertLegalTransition("PLAN", "EXECUTE"), StateMachineError);
   assert.throws(() => assertLegalTransition("EXECUTE", "DONE"), StateMachineError);
   assert.throws(() => assertLegalTransition("DONE", "PLAN"), StateMachineError);
+  assert.equal(isLegalTransition("PAUSED", "EXECUTE"), false);
 });
 
 test("pause selection is deterministic and never targets EXECUTE", () => {

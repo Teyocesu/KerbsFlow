@@ -16,7 +16,7 @@ import {
 import { IdempotencyConflictError, StateVersionConflictError } from "../src/errors.js";
 import { KerbsFlowCore } from "../src/core.js";
 import { StateStore } from "../src/persistence.js";
-import { allLegalTransitions, StateMachineError } from "../src/state-machine.js";
+import { StateMachineError } from "../src/state-machine.js";
 import { createFixture, executorResultFor, primeExecute, primeReady, reviewFor, validationFor, TestFixture } from "./helpers.js";
 
 function reopen(fixture: TestFixture): void {
@@ -433,9 +433,4 @@ test("the Phase 1 adapter descriptor is explicitly simulated, not a real provide
   } finally {
     fixture.close();
   }
-});
-
-test("the legal transition table remains the sole transition vocabulary", () => {
-  assert.ok(allLegalTransitions().length > 0);
-  assert.ok(!allLegalTransitions().some(([from, to]) => from === "PAUSED" && to === "EXECUTE"));
 });
