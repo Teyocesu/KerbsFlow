@@ -5,12 +5,18 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import type { ExecutorAdapter } from "../src/adapter.js";
 import { FileArtifactStore } from "../src/artifacts.js";
 import {
   CONTRACT_VERSIONS,
   asDecisionId,
+  asGateId,
   asRunId,
   asTaskId,
+  DEFAULT_HARD_INVARIANTS,
+  DEFAULT_PROJECT_POLICY,
+  DEFAULT_RUN_OVERRIDE,
+  DEFAULT_USER_PREFERENCES,
   type ArtifactId,
   type ExecutorResult,
   type PlanningDecision,
@@ -42,8 +48,15 @@ interface RequestOptions {
   includeHost?: boolean;
   origin?: string | string[];
   token?: string;
+  includeOrigin?: boolean;
+  includeToken?: boolean;
   lastEventId?: string;
+  body?: string | Buffer;
+  contentLength?: number;
+  chunked?: boolean;
 }
+
+type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "startRun" | "pause" | "resume" | "cancel" | "resolveGateScoped">;
 
 interface RunningApi {
   fixture: ApiFixture;
@@ -126,11 +139,11 @@ function createFixture(): ApiFixture {
 
 async function withApi(
   run: (context: RunningApi) => Promise<void>,
-  options: { pollIntervalMs?: number; artifactReader?: (fixture: ApiFixture) => ArtifactReader; core?: (fixture: ApiFixture) => Pick<KerbsFlowCore, "readModel"> } = {},
+  options: { pollIntervalMs?: number; artifactReader?: (fixture: ApiFixture) => ArtifactReader; core?: (fixture: ApiFixture) => Partial<LocalApiCore> } = {},
 ): Promise<void> {
   const fixture = createFixture();
   const api = new LocalApiServer({
-    core: options.core?.(fixture) ?? fixture.core,
+    core: localApiCore(fixture, options.core?.(fixture)),
     store: fixture.store,
     artifacts: options.artifactReader?.(fixture) ?? fixture.artifacts,
   }, options.pollIntervalMs === undefined ? {} : { pollIntervalMs: options.pollIntervalMs });
@@ -145,13 +158,27 @@ async function withApi(
   }
 }
 
+function localApiCore(fixture: ApiFixture, overrides: Partial<LocalApiCore> = {}): LocalApiCore {
+  return {
+    readModel: (runId) => (overrides.readModel ?? fixture.core.readModel.bind(fixture.core))(runId),
+    startRun: (...args) => (overrides.startRun ?? fixture.core.startRun.bind(fixture.core))(...args),
+    pause: (...args) => (overrides.pause ?? fixture.core.pause.bind(fixture.core))(...args),
+    resume: (...args) => (overrides.resume ?? fixture.core.resume.bind(fixture.core))(...args),
+    cancel: (...args) => (overrides.cancel ?? fixture.core.cancel.bind(fixture.core))(...args),
+    resolveGateScoped: (...args) => (overrides.resolveGateScoped ?? fixture.core.resolveGateScoped.bind(fixture.core))(...args),
+  };
+}
+
 function sendRequest(api: LocalApiServer, path: string, options: RequestOptions = {}): Promise<ApiResponse> {
   const headers: Record<string, string | string[]> = {};
   if (options.includeHost !== false) headers.host = options.host ?? `127.0.0.1:${api.port()}`;
   if (options.origin !== undefined) headers.origin = options.origin;
   if (options.token !== undefined) headers["X-KerbsFlow-Token"] = options.token;
   if (options.lastEventId !== undefined) headers["Last-Event-ID"] = options.lastEventId;
+  if (options.contentLength !== undefined) headers["Content-Length"] = String(options.contentLength);
+  if (options.chunked === true) headers["Transfer-Encoding"] = "chunked";
   return new Promise((resolve, reject) => {
+    let responseReceived = false;
     const request = httpRequest({
       hostname: "127.0.0.1",
       port: api.port(),
@@ -161,13 +188,48 @@ function sendRequest(api: LocalApiServer, path: string, options: RequestOptions 
       setHost: false,
       agent: false,
     }, (response) => {
+      responseReceived = true;
       response.setEncoding("utf8");
       let body = "";
       response.on("data", (chunk: string) => { body += chunk; });
       response.on("end", () => resolve({ status: response.statusCode ?? 0, headers: response.headers, body }));
     });
-    request.on("error", reject);
-    request.end();
+    request.on("error", (error) => { if (!responseReceived) reject(error); });
+    if (options.body === undefined) request.end();
+    else request.end(options.body);
+  });
+}
+
+function mutationEnvelope(
+  commandId: string,
+  idempotencyKey: string,
+  expectedStateVersion: number,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    schemaVersion: "kerbsflow.local-command/v1",
+    commandId,
+    idempotencyKey,
+    expectedStateVersion,
+    payload,
+  };
+}
+
+function postMutation(
+  api: LocalApiServer,
+  path: string,
+  token: string,
+  body: unknown,
+  options: Partial<RequestOptions> = {},
+): Promise<ApiResponse> {
+  const serialized = typeof body === "string" || Buffer.isBuffer(body) ? body : JSON.stringify(body);
+  if (serialized === undefined) return Promise.reject(new Error("mutation test body is not serializable"));
+  return sendRequest(api, path, {
+    method: "POST",
+    ...(options.includeToken === false ? {} : { token }),
+    ...(options.includeOrigin === false ? {} : { origin: `http://127.0.0.1:${api.port()}` }),
+    body: serialized,
+    ...options,
   });
 }
 
@@ -214,7 +276,7 @@ function tokenFrom(html: string): string {
   return token;
 }
 
-function planFor(runId: RunId, suffix: string): PlanningDecision {
+function planFor(runId: RunId, suffix: string, adapter: "fake" | "codex" = "fake"): PlanningDecision {
   return {
     schemaVersion: CONTRACT_VERSIONS.planningDecision,
     decisionId: asDecisionId(`decision_${suffix}`),
@@ -228,7 +290,7 @@ function planFor(runId: RunId, suffix: string): PlanningDecision {
       positiveScope: ["src"],
       negativeScope: ["production providers"],
     },
-    route: { adapter: "fake", model: "fake" },
+    route: { adapter, model: adapter === "fake" ? "fake" : "openai/sol-current" },
     requiredCapabilities: ["simulated_execution"],
     selectedSkills: ["test"],
     canonicalContextHash: "synthetic-local-api-context",
@@ -340,10 +402,241 @@ test("v1 reads allow omitted Origin but still require token and exact Host", asy
 
     const before = fixture.core.readModel(runId)?.run.stateVersion;
     assert.equal((await sendRequest(api, `/v1/runs/${runId}/cancel`, { token, method: "POST" })).status, 403);
-    const unsupportedMutation = await sendRequest(api, `/v1/runs/${runId}/cancel`, { ...valid, method: "POST" });
-    assert.equal(unsupportedMutation.status, 404);
+    const emptyMutation = await sendRequest(api, `/v1/runs/${runId}/cancel`, { ...valid, method: "POST" });
+    assert.equal(emptyMutation.status, 400);
     assert.equal(fixture.core.readModel(runId)?.run.stateVersion, before);
     assert.equal((await sendRequest(api, path, { ...valid, method: "POST" })).status, 405);
+  });
+});
+
+test("POST mutations require exact Host, token, and same-origin Origin", async () => {
+  await withApi(async ({ api, token }) => {
+    const body = mutationEnvelope("command_http_security", "http:security", 0, {
+      runId: "run_local_api_post_security",
+      objective: "synthetic mutation security check",
+    });
+    const accepted = await postMutation(api, "/v1/runs", token, body);
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.headers["content-type"], "application/json; charset=utf-8");
+    assert.equal(accepted.headers["cache-control"], "no-store");
+    assert.equal(JSON.parse(accepted.body).commandId, "command_http_security");
+
+    assert.equal((await postMutation(api, "/v1/runs", token, body, { includeOrigin: false })).status, 403);
+    assert.equal((await postMutation(api, "/v1/runs", token, body, { origin: "https://foreign.example" })).status, 403);
+    assert.equal((await postMutation(api, "/v1/runs", token, body, { includeToken: false })).status, 401);
+    assert.equal((await postMutation(api, "/v1/runs", token, body, { host: `localhost:${api.port()}` })).status, 403);
+  });
+});
+
+test("mutation bodies reject malformed, non-object, unknown, and oversized input before core invocation", async () => {
+  let startCalls = 0;
+  await withApi(async ({ api, token }) => {
+    const valid = mutationEnvelope("command_http_body", "http:body", 0, {
+      runId: "run_local_api_body",
+      objective: "synthetic mutation body check",
+    });
+    const unknownTopLevel = { ...valid, unexpected: true };
+    const unknownPayload = { ...valid, payload: { ...(valid.payload as Record<string, unknown>), unexpected: true } };
+    assert.equal((await postMutation(api, "/v1/runs", token, "{")).status, 400);
+    assert.equal((await postMutation(api, "/v1/runs", token, "[]")).status, 400);
+    assert.equal((await postMutation(api, "/v1/runs", token, unknownTopLevel)).status, 400);
+    assert.equal((await postMutation(api, "/v1/runs", token, unknownPayload)).status, 400);
+
+    const oversized = "x".repeat(64 * 1024 + 1);
+    assert.equal((await postMutation(api, "/v1/runs", token, oversized, { contentLength: Buffer.byteLength(oversized) })).status, 413);
+    assert.equal((await postMutation(api, "/v1/runs", token, oversized, { chunked: true })).status, 413);
+    assert.equal(startCalls, 0);
+  }, {
+    core: (fixture) => ({
+      startRun(...args) {
+        startCalls += 1;
+        return fixture.core.startRun(...args);
+      },
+    }),
+  });
+});
+
+test("start persists the supplied command ID and retains idempotent replay", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_post_start");
+    const path = "/v1/runs";
+    const invalidVersion = mutationEnvelope("command_http_start_bad_version", "http:start:bad-version", 1, {
+      runId: "run_local_api_bad_version",
+      objective: "synthetic objective",
+    });
+    assert.equal((await postMutation(api, path, token, invalidVersion)).status, 400);
+    assert.equal(fixture.core.readModel(asRunId("run_local_api_bad_version")), undefined);
+
+    const body = mutationEnvelope("command_http_start", "http:start", 0, {
+      runId,
+      objective: "synthetic HTTP start objective",
+    });
+    const started = await postMutation(api, path, token, body);
+    assert.equal(started.status, 200);
+    const result = JSON.parse(started.body) as { commandId: string; replayed: boolean; stateVersion: number };
+    assert.equal(result.commandId, "command_http_start");
+    assert.equal(result.replayed, false);
+    assert.equal(result.stateVersion, 1);
+    const transition = fixture.store.listTransitions(runId)[0];
+    assert.equal(transition?.commandId, result.commandId);
+
+    const replayed = await postMutation(api, path, token, body);
+    assert.equal(replayed.status, 200);
+    assert.equal(JSON.parse(replayed.body).replayed, true);
+    assert.equal(fixture.store.listTransitions(runId).length, 1);
+
+    const changed = mutationEnvelope("command_http_start_changed", "http:start", 0, {
+      runId,
+      objective: "changed semantic objective",
+    });
+    assert.equal((await postMutation(api, path, token, changed)).status, 409);
+    assert.equal(fixture.store.listTransitions(runId).length, 1);
+  });
+});
+
+test("pause and resume mutations use Core state versions and the persisted resume target", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_post_pause");
+    const start = await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_pause_start", "http:pause:start", 0, {
+      runId,
+      objective: "synthetic pause and resume objective",
+    }));
+    assert.equal(start.status, 200);
+
+    const pauseBody = mutationEnvelope("command_http_pause", "http:pause", 1, {});
+    const paused = await postMutation(api, `/v1/runs/${runId}/pause`, token, pauseBody);
+    assert.equal(paused.status, 200);
+    const pauseResult = JSON.parse(paused.body) as { commandId: string; replayed: boolean; to: string; stateVersion: number; details?: { resumeTarget?: string } };
+    assert.equal(pauseResult.to, "PAUSED");
+    assert.equal(pauseResult.details?.resumeTarget, "INTAKE");
+    assert.equal(pauseResult.replayed, false);
+    assert.equal(fixture.store.listTransitions(runId).at(-1)?.commandId, "command_http_pause");
+
+    const pauseReplay = await postMutation(api, `/v1/runs/${runId}/pause`, token, pauseBody);
+    assert.equal(pauseReplay.status, 200);
+    assert.equal(JSON.parse(pauseReplay.body).replayed, true);
+    assert.equal(fixture.store.listTransitions(runId).length, 2);
+
+    assert.equal((await postMutation(api, `/v1/runs/${runId}/pause`, token, mutationEnvelope("command_http_pause_stale", "http:pause:stale", 1, {}))).status, 409);
+    const resumed = await postMutation(api, `/v1/runs/${runId}/resume`, token, mutationEnvelope("command_http_resume", "http:resume", pauseResult.stateVersion, {}));
+    assert.equal(resumed.status, 200);
+    assert.equal(JSON.parse(resumed.body).to, "INTAKE");
+    assert.equal(fixture.store.listTransitions(runId).at(-1)?.commandId, "command_http_resume");
+    assert.equal(fixture.core.readModel(runId)?.run.state, "INTAKE");
+
+    const illegalRunId = asRunId("run_local_api_post_resume_illegal");
+    assert.equal((await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_resume_start", "http:resume:start", 0, {
+      runId: illegalRunId,
+      objective: "synthetic illegal resume objective",
+    }))).status, 200);
+    const illegalResume = await postMutation(api, `/v1/runs/${illegalRunId}/resume`, token, mutationEnvelope("command_http_resume_illegal", "http:resume:illegal", 1, {}));
+    assert.equal(illegalResume.status, 409);
+    assert.equal(fixture.core.readModel(illegalRunId)?.run.state, "INTAKE");
+    assert.equal((await postMutation(api, "/v1/runs/run_local_api_missing/pause", token, mutationEnvelope("command_http_pause_missing", "http:pause:missing", 0, {}))).status, 404);
+  });
+});
+
+test("gate resolution is run-scoped, versioned, replayable, and persists the supplied command ID", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_post_gate");
+    assert.equal((await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_gate_start", "http:gate:start", 0, {
+      runId,
+      objective: "synthetic gate objective",
+    }))).status, 200);
+    fixture.core.gateIntake(runId, 1, "http:gate:create", "synthetic_human_gate", "Synthetic local API gate");
+    const gateId = fixture.core.readModel(runId)?.currentGate?.gateId;
+    assert.ok(gateId);
+    const path = `/v1/runs/${runId}/gates/${gateId}/resolve`;
+
+    assert.equal((await postMutation(api, `/v1/runs/${runId}/gates/not-a-gate/resolve`, token, mutationEnvelope("command_http_gate_invalid_id", "http:gate:invalid-id", 2, { optionId: "fail" }))).status, 400);
+    assert.equal((await postMutation(api, `/v1/runs/${runId}/gates/${asGateId("gate_unknown")}/resolve`, token, mutationEnvelope("command_http_gate_unknown", "http:gate:unknown", 2, { optionId: "fail" }))).status, 404);
+    const otherRunId = asRunId("run_local_api_post_gate_other");
+    fixture.core.startRun(otherRunId, "synthetic other gate objective", "http:gate:other:start");
+    fixture.core.gateIntake(otherRunId, 1, "http:gate:other:create", "synthetic_other_human_gate", "Synthetic other run gate");
+    const otherGateId = fixture.core.readModel(otherRunId)?.currentGate?.gateId;
+    assert.ok(otherGateId);
+    assert.equal((await postMutation(api, `/v1/runs/${runId}/gates/${otherGateId}/resolve`, token, mutationEnvelope("command_http_gate_wrong_scope", "http:gate:wrong-scope", 2, { optionId: "fail" }))).status, 409);
+    assert.equal((await postMutation(api, path, token, mutationEnvelope("command_http_gate_stale", "http:gate:stale", 1, { optionId: "fail" }))).status, 409);
+    const maximumNote = `${"€".repeat(1_365)}a`;
+    assert.equal(Buffer.byteLength(maximumNote, "utf8"), 4_096);
+    assert.equal((await postMutation(api, path, token, mutationEnvelope("command_http_gate_note_too_long", "http:gate:long-note", 2, { optionId: "fail", note: "€".repeat(1_366) }))).status, 400);
+
+    const body = mutationEnvelope("command_http_gate_resolve", "http:gate:resolve", 2, { optionId: "fail", note: maximumNote });
+    const resolved = await postMutation(api, path, token, body);
+    assert.equal(resolved.status, 200);
+    const result = JSON.parse(resolved.body) as { commandId: string; replayed: boolean; to: string };
+    assert.equal(result.commandId, "command_http_gate_resolve");
+    assert.equal(result.replayed, false);
+    assert.equal(result.to, "FAILED");
+    assert.equal(fixture.store.listTransitions(runId).at(-1)?.commandId, result.commandId);
+    assert.equal(fixture.store.getGate(gateId)?.gate.resolution?.note, maximumNote);
+
+    const replayed = await postMutation(api, path, token, body);
+    assert.equal(replayed.status, 200);
+    assert.equal(JSON.parse(replayed.body).replayed, true);
+    assert.equal(fixture.store.listTransitions(runId).length, 3);
+  });
+});
+
+test("cancel delegates to Core and blocks real-adapter cancellation before any adapter signal", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const fakeRunId = asRunId("run_local_api_post_cancel_fake");
+    assert.equal((await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_cancel_start", "http:cancel:start", 0, {
+      runId: fakeRunId,
+      objective: "synthetic fake cancellation objective",
+    }))).status, 200);
+    const cancelBody = mutationEnvelope("command_http_cancel", "http:cancel", 1, { reason: "synthetic cancellation request" });
+    const cancelled = await postMutation(api, `/v1/runs/${fakeRunId}/cancel`, token, cancelBody);
+    assert.equal(cancelled.status, 200);
+    assert.equal(JSON.parse(cancelled.body).to, "CANCELLED");
+    assert.equal(fixture.store.listTransitions(fakeRunId).at(-1)?.commandId, "command_http_cancel");
+    const replayed = await postMutation(api, `/v1/runs/${fakeRunId}/cancel`, token, cancelBody);
+    assert.equal(replayed.status, 200);
+    assert.equal(JSON.parse(replayed.body).replayed, true);
+    assert.equal(fixture.store.listTransitions(fakeRunId).length, 2);
+
+    let adapterCancelCalls = 0;
+    const fake = new FakeAdapter(new FixedClock("2026-09-25T12:00:00.000Z"), new SequenceIdSource("local-api-real-cancel"));
+    const adapter: ExecutorAdapter = {
+      probe: () => {
+        const descriptor = fake.probe();
+        return {
+          ...descriptor,
+          adapter: "codex",
+          provider: "openai",
+          capabilities: { ...descriptor.capabilities, cancellation: "process_only" },
+        };
+      },
+      start: (request) => fake.start(request),
+      events: (handle) => fake.events(handle),
+      wait: (handle) => fake.wait(handle),
+      cancel: (handle, reason) => {
+        adapterCancelCalls += 1;
+        return fake.cancel(handle, reason);
+      },
+      reconcile: (identity) => fake.reconcile(identity),
+    };
+    fixture.core = new KerbsFlowCore(fixture.store, adapter, fixture.artifacts, {
+      configuration: {
+        hardInvariants: DEFAULT_HARD_INVARIANTS,
+        projectPolicy: { ...DEFAULT_PROJECT_POLICY, allowedAdapters: ["fake", "codex"] },
+        userPreferences: DEFAULT_USER_PREFERENCES,
+        runOverride: DEFAULT_RUN_OVERRIDE,
+      },
+    });
+    const realRunId = asRunId("run_local_api_post_cancel_real");
+    let command = fixture.core.startRun(realRunId, "synthetic real-adapter cancellation objective", "http:cancel:real:start");
+    command = fixture.core.completeIntake(realRunId, command.stateVersion, "http:cancel:real:intake");
+    command = fixture.core.plan(realRunId, command.stateVersion, "http:cancel:real:plan", planFor(realRunId, "api_cancel_real", "codex"));
+    command = fixture.core.prepareExecution(realRunId, command.stateVersion, "http:cancel:real:prepare");
+    const activeDescriptorJson = fixture.store.readModel(realRunId)?.activeAttempt?.adapterDescriptorJson;
+    assert.ok(activeDescriptorJson);
+    assert.equal(JSON.parse(activeDescriptorJson).adapter, "codex");
+    const realCancel = await postMutation(api, `/v1/runs/${realRunId}/cancel`, token, mutationEnvelope("command_http_cancel_real", "http:cancel:real", command.stateVersion, { reason: "must use durable cancellation" }));
+    assert.equal(realCancel.status, 409);
+    assert.deepEqual(JSON.parse(realCancel.body), { error: { code: "REAL_CANCEL_REQUIRES_DURABLE_INTENT", message: "command conflicts with the current state" } });
+    assert.equal(adapterCancelCalls, 0);
+    assert.equal(fixture.core.readModel(realRunId)?.run.state, "EXECUTE");
   });
 });
 

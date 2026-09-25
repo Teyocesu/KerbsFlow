@@ -4,14 +4,19 @@ import type { AddressInfo } from "node:net";
 
 import {
   asArtifactId,
+  asCommandId,
+  asGateId,
   asRunId,
   ContractValidationError,
   type ArtifactId,
+  type CommandId,
   type RunId,
 } from "./contracts.js";
 import type { KerbsFlowCore } from "./core.js";
+import { IdempotencyConflictError, KerbsFlowError, NotFoundError, StateVersionConflictError } from "./errors.js";
 import { containsLikelySecret, redactDiagnostic } from "./secrets.js";
 import { StateStore, type ReadModel, type StoredArtifact, type StoredTransition } from "./persistence.js";
+import { StateMachineError } from "./state-machine.js";
 
 export interface ArtifactReader {
   get(artifactId: ArtifactId): string;
@@ -22,7 +27,7 @@ export interface LocalApiServerOptions {
 }
 
 export interface LocalApiServerDependencies {
-  core: Pick<KerbsFlowCore, "readModel">;
+  core: Pick<KerbsFlowCore, "readModel" | "startRun" | "pause" | "resume" | "cancel" | "resolveGateScoped">;
   store: StateStore;
   artifacts: ArtifactReader;
 }
@@ -41,8 +46,10 @@ interface LocalApiErrorShape {
 const MAX_TRANSITIONS = 50;
 const MAX_ARTIFACTS = 50;
 const MAX_POLL_ROWS = 100;
+const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const CONTENT_SECURITY_POLICY = "default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const MUTATION_SCHEMA_VERSION = "kerbsflow.local-command/v1";
 
 export class LocalApiServer {
   private readonly token = randomBytes(32).toString("base64url");
@@ -193,6 +200,16 @@ export class LocalApiServer {
 
   private async dispatchV1(request: IncomingMessage, response: ServerResponse, segments: string[]): Promise<void> {
     const method = request.method ?? "";
+    if (segments.length === 2 && segments[1] === "runs") {
+      if (method !== "POST") return this.methodNotAllowed(response, "POST");
+      const envelope = parseMutationEnvelope(await readMutationBody(request));
+      assertExactKeys(envelope.payload, ["runId", "objective"]);
+      const runId = asRunId(requiredMutationString(envelope.payload.runId, 120));
+      const objective = requiredMutationString(envelope.payload.objective, 10_000);
+      if (envelope.expectedStateVersion !== 0) throw invalidRequest("run creation requires expectedStateVersion zero");
+      this.sendCommandResult(response, this.dependencies.core.startRun(runId, objective, envelope.idempotencyKey, envelope.commandId));
+      return;
+    }
     if (segments.length >= 3 && segments[1] === "runs") {
       const runId = parseRunId(segments[2]);
       if (segments.length === 4 && segments[3] === "snapshot") {
@@ -208,6 +225,44 @@ export class LocalApiServer {
       if (segments.length === 5 && segments[3] === "artifacts") {
         if (method !== "GET") return this.methodNotAllowed(response, "GET");
         this.sendArtifact(response, runId, parseArtifactId(segments[4]));
+        return;
+      }
+      if (segments.length === 4 && ["pause", "resume", "cancel"].includes(segments[3]!)) {
+        if (method !== "POST") return this.methodNotAllowed(response, "POST");
+        const envelope = parseMutationEnvelope(await readMutationBody(request));
+        assertExactKeys(envelope.payload, segments[3] === "cancel" ? ["reason"] : []);
+        const result = segments[3] === "pause"
+          ? this.dependencies.core.pause(runId, envelope.expectedStateVersion, envelope.idempotencyKey, envelope.commandId)
+          : segments[3] === "resume"
+            ? this.dependencies.core.resume(runId, envelope.expectedStateVersion, envelope.idempotencyKey, envelope.commandId)
+            : this.dependencies.core.cancel(
+              runId,
+              envelope.expectedStateVersion,
+              envelope.idempotencyKey,
+              requiredMutationString(envelope.payload.reason, 1_000),
+              envelope.commandId,
+            );
+        this.sendCommandResult(response, result);
+        return;
+      }
+      if (segments.length === 6 && segments[3] === "gates" && segments[5] === "resolve") {
+        if (method !== "POST") return this.methodNotAllowed(response, "POST");
+        const gateId = parseGateId(segments[4]);
+        const envelope = parseMutationEnvelope(await readMutationBody(request));
+        assertExactKeys(envelope.payload, ["optionId", "note"]);
+        const optionId = requiredMutationString(envelope.payload.optionId, 100);
+        const note = optionalMutationText(envelope.payload.note, 4_096);
+        if (this.dependencies.store.getGate(gateId) === undefined) throw new NotFoundError("gate", gateId);
+        const result = this.dependencies.core.resolveGateScoped(
+          runId,
+          envelope.expectedStateVersion,
+          envelope.idempotencyKey,
+          gateId,
+          optionId,
+          note,
+          envelope.commandId,
+        );
+        this.sendCommandResult(response, result);
         return;
       }
       if (segments[3] === "artifacts" || ((segments[3] === "snapshot" || segments[3] === "events") && segments.length !== 4)) {
@@ -267,6 +322,13 @@ export class LocalApiServer {
     response.setHeader("Cache-Control", "no-store");
     response.setHeader("X-Content-Type-Options", "nosniff");
     response.end(content);
+  }
+
+  private sendCommandResult(response: ServerResponse, result: ReturnType<KerbsFlowCore["startRun"]>): void {
+    response.statusCode = 200;
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Cache-Control", "no-store");
+    response.end(JSON.stringify(result));
   }
 
   private openEvents(request: IncomingMessage, response: ServerResponse, runId: RunId): void {
@@ -380,6 +442,10 @@ export class LocalApiServer {
       return;
     }
     response.statusCode = error.status;
+    if (error.status === 413) {
+      response.shouldKeepAlive = false;
+      response.setHeader("Connection", "close");
+    }
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.setHeader("Cache-Control", "no-store");
     response.end(JSON.stringify({ error: { code: error.code, message: error.message } }));
@@ -417,6 +483,128 @@ function parseArtifactId(value: string | undefined): ArtifactId {
   } catch {
     throw invalidRequest("artifact identifier is invalid");
   }
+}
+
+function parseGateId(value: string | undefined): ReturnType<typeof asGateId> {
+  try {
+    if (value === undefined) throw new ContractValidationError("gateId", "is required");
+    return asGateId(value);
+  } catch {
+    throw invalidRequest("gate identifier is invalid");
+  }
+}
+
+interface MutationEnvelope {
+  commandId: CommandId;
+  idempotencyKey: string;
+  expectedStateVersion: number;
+  payload: Record<string, unknown>;
+}
+
+async function readMutationBody(request: IncomingMessage): Promise<unknown> {
+  const contentLength = singleRawHeader(request, "content-length");
+  if (contentLength.duplicate) throw invalidRequest("request body length is invalid");
+  if (contentLength.value !== undefined) {
+    if (!/^(?:0|[1-9][0-9]*)$/u.test(contentLength.value)) throw invalidRequest("request body length is invalid");
+    if (BigInt(contentLength.value) > BigInt(MAX_REQUEST_BODY_BYTES)) throw bodyTooLarge();
+  }
+
+  const bytes = await readBoundedBody(request);
+  if (bytes.length === 0) throw invalidRequest("request body is empty");
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.toString("utf8")) as unknown;
+  } catch {
+    throw invalidRequest("request body is not valid JSON");
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw invalidRequest("request body must be a JSON object");
+  return value;
+}
+
+function readBoundedBody(request: IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let byteLength = 0;
+    const cleanup = () => {
+      request.off("data", onData);
+      request.off("end", onEnd);
+      request.off("aborted", onAborted);
+      request.off("error", onError);
+    };
+    const fail = (error: Error) => {
+      cleanup();
+      request.pause();
+      reject(error);
+    };
+    const onData = (chunk: Buffer | string) => {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      if (byteLength + bytes.length > MAX_REQUEST_BODY_BYTES) {
+        fail(bodyTooLarge());
+        return;
+      }
+      chunks.push(bytes);
+      byteLength += bytes.length;
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve(Buffer.concat(chunks, byteLength));
+    };
+    const onAborted = () => fail(invalidRequest("request body was interrupted"));
+    const onError = () => fail(invalidRequest("request body could not be read"));
+
+    request.on("data", onData);
+    request.once("end", onEnd);
+    request.once("aborted", onAborted);
+    request.once("error", onError);
+  });
+}
+
+function parseMutationEnvelope(value: unknown): MutationEnvelope {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw invalidRequest("request body must be a JSON object");
+  const envelope = value as Record<string, unknown>;
+  assertExactKeys(envelope, ["schemaVersion", "commandId", "idempotencyKey", "expectedStateVersion", "payload"]);
+  if (envelope.schemaVersion !== MUTATION_SCHEMA_VERSION) throw invalidRequest("mutation schema version is invalid");
+  if (typeof envelope.commandId !== "string") throw invalidRequest("command identifier is invalid");
+  if (typeof envelope.idempotencyKey !== "string" || envelope.idempotencyKey.length === 0 || envelope.idempotencyKey.length > 200) {
+    throw invalidRequest("idempotency key is invalid");
+  }
+  if (!Number.isSafeInteger(envelope.expectedStateVersion) || (envelope.expectedStateVersion as number) < 0) {
+    throw invalidRequest("expected state version is invalid");
+  }
+  if (typeof envelope.payload !== "object" || envelope.payload === null || Array.isArray(envelope.payload)) {
+    throw invalidRequest("mutation payload must be a JSON object");
+  }
+  return {
+    commandId: asCommandId(envelope.commandId),
+    idempotencyKey: envelope.idempotencyKey,
+    expectedStateVersion: envelope.expectedStateVersion as number,
+    payload: envelope.payload as Record<string, unknown>,
+  };
+}
+
+function assertExactKeys(object: Record<string, unknown>, expected: readonly string[]): void {
+  const allowed = new Set(expected);
+  if (Object.keys(object).some((key) => !allowed.has(key))) throw invalidRequest("request contains an unknown field");
+  if (expected.some((key) => !(key in object) && key !== "note")) throw invalidRequest("request is missing a required field");
+}
+
+function requiredMutationString(value: unknown, maximumLength: number): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > maximumLength) {
+    throw invalidRequest("request text field is invalid");
+  }
+  return value;
+}
+
+function optionalMutationText(value: unknown, maximumBytes: number): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length > 2_000 || Buffer.byteLength(value, "utf8") > maximumBytes) {
+    throw invalidRequest("request text field is invalid");
+  }
+  return value;
+}
+
+function bodyTooLarge(): LocalApiRequestError {
+  return new LocalApiRequestError({ status: 413, code: "BODY_TOO_LARGE", message: "request body exceeds the allowed size" });
 }
 
 function singleRawHeader(request: IncomingMessage, name: string): HeaderValue {
@@ -572,6 +760,30 @@ function invalidRequest(message: string): LocalApiRequestError {
 function mapRequestError(error: unknown): LocalApiErrorShape {
   if (error instanceof LocalApiRequestError) return error.shape;
   if (error instanceof ContractValidationError) return { status: 400, code: "INVALID_REQUEST", message: "request input is invalid" };
+  if (error instanceof NotFoundError || (error instanceof KerbsFlowError && error.code === "NOT_FOUND")) {
+    return { status: 404, code: "NOT_FOUND", message: "run or gate not found" };
+  }
+  if (error instanceof StateVersionConflictError) return { status: 409, code: "STATE_VERSION_CONFLICT", message: "run state changed; refresh before retrying" };
+  if (error instanceof IdempotencyConflictError) return { status: 409, code: "IDEMPOTENCY_CONFLICT", message: "idempotency key conflicts with an earlier command" };
+  if (error instanceof StateMachineError) return { status: 409, code: error.code, message: "command conflicts with the current state" };
+  if (error instanceof KerbsFlowError) {
+    if (error.code === "PERSISTENCE_SECRET_REJECTED") {
+      return { status: 400, code: "INVALID_REQUEST", message: "request input is invalid" };
+    }
+    if ([
+      "RUN_EXISTS",
+      "INVALID_COMMAND_STATE",
+      "RESUME_NOT_PAUSED",
+      "RESUME_REQUIRES_RECOVERY",
+      "GATE_NOT_OPEN",
+      "GATE_OPTION_INVALID",
+      "GATE_SCOPE_MISMATCH",
+      "REAL_CANCEL_REQUIRES_DURABLE_INTENT",
+      "CANCEL_NOT_ALLOWED",
+    ].includes(error.code)) {
+      return { status: 409, code: error.code, message: "command conflicts with the current state" };
+    }
+  }
   return { status: 500, code: "INTERNAL_ERROR", message: "internal server error" };
 }
 

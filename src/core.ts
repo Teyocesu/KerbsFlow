@@ -5,6 +5,7 @@ import {
   AttemptId,
   AttemptLifecycle,
   Command,
+  CommandId,
   CommandResult,
   CONTRACT_VERSIONS,
   ExecutorResult,
@@ -123,10 +124,10 @@ export class KerbsFlowCore {
     return manager.prepareCleanup(record, authority);
   }
 
-  startRun(runId: RunId, objective: string, idempotencyKey: string): CommandResult {
+  startRun(runId: RunId, objective: string, idempotencyKey: string, commandId?: CommandId): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
-      commandId: this.nextCommandId(),
+      commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
       expectedStateVersion: 0,
@@ -883,12 +884,12 @@ export class KerbsFlowCore {
     });
   }
 
-  resolveGate(runId: RunId, expectedStateVersion: number, idempotencyKey: string, optionId: string, note?: string): CommandResult {
+  resolveGate(runId: RunId, expectedStateVersion: number, idempotencyKey: string, optionId: string, note?: string, commandId?: CommandId): CommandResult {
     const payload: Record<string, JsonValue> = { optionId };
     if (note !== undefined) {
       payload.note = note;
     }
-    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "gate_resolution", payload);
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "gate_resolution", payload, commandId);
     return this.store.executeCommand(command, ({ tx, run, now }) => {
       if (run.state !== "HUMAN_GATE" || run.currentGateId === null) {
         throw new KerbsFlowError("GATE_NOT_OPEN", "gate resolution requires an open HUMAN_GATE");
@@ -930,7 +931,7 @@ export class KerbsFlowCore {
     });
   }
 
-  resolveGateScoped(runId: RunId, expectedStateVersion: number, idempotencyKey: string, gateId: ReturnType<typeof asGateId>, optionId: string, note?: string): CommandResult {
+  resolveGateScoped(runId: RunId, expectedStateVersion: number, idempotencyKey: string, gateId: ReturnType<typeof asGateId>, optionId: string, note?: string, commandId?: CommandId): CommandResult {
     const model = this.requiredModel(runId);
     const gate = this.store.getGate(gateId);
     const currentMatches = model.run.currentGateId === gateId;
@@ -938,13 +939,13 @@ export class KerbsFlowCore {
     if (!currentMatches && !replayCandidate) {
       throw new KerbsFlowError("GATE_SCOPE_MISMATCH", `gate scope mismatch: ${gateId} is not the current gate for run ${runId} at state version ${expectedStateVersion}`);
     }
-    return this.resolveGate(runId, expectedStateVersion, idempotencyKey, optionId, note);
+    return this.resolveGate(runId, expectedStateVersion, idempotencyKey, optionId, note, commandId);
   }
 
-  pause(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+  pause(runId: RunId, expectedStateVersion: number, idempotencyKey: string, commandId?: CommandId): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
-      commandId: this.nextCommandId(),
+      commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
       expectedStateVersion,
@@ -972,10 +973,10 @@ export class KerbsFlowCore {
     });
   }
 
-  resume(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+  resume(runId: RunId, expectedStateVersion: number, idempotencyKey: string, commandId?: CommandId): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
-      commandId: this.nextCommandId(),
+      commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
       expectedStateVersion,
@@ -1002,10 +1003,10 @@ export class KerbsFlowCore {
     });
   }
 
-  cancel(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reason: string): CommandResult {
+  cancel(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reason: string, commandId?: CommandId): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
-      commandId: this.nextCommandId(),
+      commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
       expectedStateVersion,
@@ -1321,10 +1322,10 @@ export class KerbsFlowCore {
     });
   }
 
-  private specializedCommand(runId: RunId, expectedStateVersion: number, idempotencyKey: string, kind: Command["kind"], payload: JsonValue): Command {
+  private specializedCommand(runId: RunId, expectedStateVersion: number, idempotencyKey: string, kind: Command["kind"], payload: JsonValue, commandId?: CommandId): Command {
     return parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
-      commandId: this.nextCommandId(),
+      commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
       expectedStateVersion,
