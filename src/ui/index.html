@@ -9,125 +9,104 @@
     <link rel="stylesheet" href="/styles.css">
     <script type="module" src="/app.js"></script>
   </head>
-  <body data-view="empty">
-    <div class="app-shell">
-      <aside class="sidebar" aria-label="Run navigation">
-        <div>
-          <a class="brand" href="#top">KerbsFlow</a>
-          <nav class="section-nav" aria-label="Sections">
-            <a href="#overview">Overview</a>
-            <a href="#activity">Activity</a>
-            <a href="#evidence">Evidence</a>
-            <a href="#artifacts">Artifacts</a>
-          </nav>
+  <body>
+    <header class="app-header">
+      <span class="brand">KerbsFlow</span>
+      <div id="view-tabs" class="view-tabs" role="tablist" aria-label="Run views" hidden>
+        <button id="tab-overview" type="button" role="tab" aria-controls="view-overview" aria-selected="true" tabindex="0" data-view="overview">Overview</button>
+        <button id="tab-activity" type="button" role="tab" aria-controls="view-activity" aria-selected="false" tabindex="-1" data-view="activity">Activity</button>
+        <button id="tab-evidence" type="button" role="tab" aria-controls="view-evidence" aria-selected="false" tabindex="-1" data-view="evidence">Evidence</button>
+        <button id="tab-artifacts" type="button" role="tab" aria-controls="view-artifacts" aria-selected="false" tabindex="-1" data-view="artifacts">Artifacts</button>
+      </div>
+      <div class="header-tools">
+        <p id="connection-status" class="connection-status" data-state="idle" role="status" aria-live="polite">Not connected</p>
+        <div id="run-switcher" class="run-switcher" hidden>
+          <code id="selected-run-id" class="identifier">—</code>
+          <button id="switch-run" class="quiet-button" type="button" aria-controls="run-form" aria-expanded="false">Switch run</button>
         </div>
-        <div class="sidebar-status">
-          <p id="connection-status" class="connection-status" data-state="idle" role="status" aria-live="polite">Not connected</p>
-          <div class="sidebar-run">
-            <span id="sidebar-run-id">No run selected</span>
-            <span id="sidebar-run-state">—</span>
-            <span id="sidebar-run-version" class="identifier">—</span>
-          </div>
-        </div>
-      </aside>
+      </div>
+      <form id="run-form" class="run-selector header-selector" hidden>
+        <label for="run-id">Run ID</label>
+        <input id="run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="run_…">
+        <button type="submit">Open</button>
+        <button id="cancel-run-selection" class="quiet-button" type="button">Cancel</button>
+      </form>
+    </header>
 
-      <div id="top" class="workspace">
-        <header class="topbar">
-          <a class="brand mobile-brand" href="#top">KerbsFlow</a>
-          <p id="mobile-connection-status" class="connection-status mobile-connection" data-state="idle" role="status" aria-live="polite">Not connected</p>
-          <form id="run-form" class="run-selector">
-            <label for="run-id">Run ID</label>
-            <input id="run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Enter a run ID">
-            <button type="submit">Load run</button>
-          </form>
-        </header>
+    <main>
+      <p id="page-status" class="page-status" role="status" aria-live="polite" hidden></p>
 
-        <main>
-          <p id="page-status" class="page-status" role="status" aria-live="polite" hidden></p>
+      <section id="empty-view" class="empty-view" aria-labelledby="empty-title">
+        <h1 id="empty-title">Open a run</h1>
+        <form id="empty-run-form" class="run-selector empty-selector">
+          <label for="empty-run-id">Run ID</label>
+          <input id="empty-run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="run_…">
+          <button type="submit">Open</button>
+        </form>
+        <p>Runs stay local to this KerbsFlow process.</p>
+      </section>
 
-          <section id="empty-view" class="empty-view" aria-labelledby="empty-title">
-            <div class="empty-content">
-              <div class="empty-mark" aria-hidden="true">K</div>
-              <h1 id="empty-title">KerbsFlow</h1>
-              <p>Monitor and inspect a local workflow run.</p>
-              <form id="empty-run-form" class="run-selector empty-selector">
-                <label for="empty-run-id">Run ID</label>
-                <div class="empty-selector-fields">
-                  <input id="empty-run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Enter a run ID">
-                  <button type="submit">Load run</button>
-                </div>
-              </form>
-              <span class="empty-caption">No run selected</span>
+      <div id="run-content" class="run-content" aria-busy="false" hidden>
+        <section id="view-overview" class="run-view" role="tabpanel" aria-labelledby="tab-overview" tabindex="0">
+          <header class="run-summary">
+            <div class="run-heading">
+              <h1 id="snapshot-run-id" class="run-id identifier">—</h1>
+              <span id="snapshot-state" class="state-badge" data-state="idle">—</span>
             </div>
+            <p id="snapshot-run-meta" class="run-meta">State v—</p>
+          </header>
+          <dl id="execution-context" class="execution-context" aria-label="Execution context"></dl>
+
+          <section class="content-section current-work" aria-labelledby="current-work-title">
+            <h2 id="current-work-title">Current task</h2>
+            <div id="current-work-content"></div>
           </section>
 
-          <div id="run-content" hidden>
-            <header id="overview" class="run-summary" aria-label="Run identity">
-              <div class="run-heading">
-                <h1 id="snapshot-run-id" class="run-id identifier">—</h1>
-                <span id="snapshot-state" class="state-badge" data-state="idle">—</span>
+          <section id="human-gate" class="content-section gate-section" data-open="false" aria-labelledby="human-gate-title">
+            <h2 id="human-gate-title">Human gate</h2>
+            <div id="human-gate-content"></div>
+          </section>
+
+          <section class="content-section scope-section" aria-labelledby="scope-title">
+            <h2 id="scope-title">Scope</h2>
+            <div class="scope-columns">
+              <div>
+                <h3>In scope</h3>
+                <ul id="positive-scope" class="value-list"></ul>
               </div>
-              <p id="snapshot-run-meta" class="run-meta identifier">State v—</p>
-              <p id="snapshot-task-preview" class="run-task-preview">—</p>
-            </header>
-
-            <section class="path-section" aria-labelledby="path-title">
-              <h2 id="path-title">Workflow path</h2>
-              <div class="state-rail-scroll" tabindex="0" aria-label="Persisted workflow state path">
-                <ol id="state-path" class="state-rail"></ol>
+              <div>
+                <h3>Out of scope</h3>
+                <ul id="negative-scope" class="value-list"></ul>
               </div>
-            </section>
-
-            <div id="dashboard-grid" class="dashboard-content" aria-busy="false">
-              <section class="content-section current-work" aria-labelledby="current-work-title">
-                <h2 id="current-work-title">Current task</h2>
-                <div id="current-work-content"></div>
-              </section>
-
-              <section id="human-gate" class="content-section gate-section" data-open="false" aria-labelledby="human-gate-title">
-                <h2 id="human-gate-title">Human gate</h2>
-                <div id="human-gate-content"></div>
-              </section>
-
-              <div class="detail-columns">
-                <section id="evidence" class="content-section" aria-labelledby="validation-title">
-                  <h2 id="validation-title">Evidence</h2>
-                  <div id="validation-content" class="evidence-list"></div>
-                </section>
-
-                <section class="content-section" aria-labelledby="scope-title">
-                  <h2 id="scope-title">Scope</h2>
-                  <div class="scope-columns">
-                    <div>
-                      <h3>In scope</h3>
-                      <ul id="positive-scope" class="value-list"></ul>
-                    </div>
-                    <div>
-                      <h3>Out of scope</h3>
-                      <ul id="negative-scope" class="value-list"></ul>
-                    </div>
-                  </div>
-                </section>
-              </div>
-
-              <section id="artifacts" class="content-section" aria-labelledby="artifacts-title">
-                <h2 id="artifacts-title">Artifacts</h2>
-                <div id="artifact-head" class="artifact-head" aria-hidden="true">
-                  <span>Artifact ID</span><span>Kind</span><span>Size</span><span>Redaction</span><span>Created</span><span>Download</span>
-                </div>
-                <ul id="artifact-list" class="artifact-list"></ul>
-              </section>
-
-              <section id="activity" class="content-section" aria-labelledby="activity-title">
-                <h2 id="activity-title">Activity</h2>
-                <ol id="activity-list" class="activity-list"></ol>
-              </section>
             </div>
-          </div>
-        </main>
+          </section>
+        </section>
 
-        <footer class="footer-note">Read-only dashboard · Local run data</footer>
+        <section id="view-activity" class="run-view reading-view" role="tabpanel" aria-labelledby="tab-activity" tabindex="0" hidden>
+          <header class="view-heading">
+            <h1>Activity</h1>
+            <p>Recent persisted transitions</p>
+          </header>
+          <ol id="activity-list" class="activity-list"></ol>
+        </section>
+
+        <section id="view-evidence" class="run-view reading-view" role="tabpanel" aria-labelledby="tab-evidence" tabindex="0" hidden>
+          <header class="view-heading">
+            <h1>Evidence</h1>
+          </header>
+          <div id="validation-content" class="evidence-list"></div>
+        </section>
+
+        <section id="view-artifacts" class="run-view" role="tabpanel" aria-labelledby="tab-artifacts" tabindex="0" hidden>
+          <header class="view-heading">
+            <h1>Artifacts</h1>
+          </header>
+          <div id="artifact-head" class="artifact-head" aria-hidden="true" hidden>
+            <span>Artifact ID</span><span>Kind</span><span>Size</span><span>Redaction</span><span>Created</span><span>Download</span>
+          </div>
+          <ul id="artifact-list" class="artifact-list"></ul>
+        </section>
       </div>
-    </div>
+    </main>
   </body>
 </html>
