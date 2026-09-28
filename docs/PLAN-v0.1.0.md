@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328` on `phase6/thin-local-ui`; Phase 6B is CLOSED after successful physical macOS QA at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4`; the Phase 6C architecture and plan are approved, and 6C.1 — Steer + Planning Master integration is implemented pending independent review. Next checkpoint: independent 6C.1 review; do not start 6C.2 before review.**
+Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328` on `phase6/thin-local-ui`; Phase 6B is CLOSED after successful physical macOS QA at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4`; Phase 6C.1 — Steer + Planning Master integration is CLOSED / PASS at approved implementation baseline `c5a4a683af63f988b06ded852a9462e05f9e92c8` on `phase6/thin-local-ui`. Next checkpoint: Phase 6C.2 — RunCoordinator + local API/dashboard controls.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -207,7 +207,7 @@ This is the single mutable implementation plan for v0.1. Complete phases sequent
 
 ## Phase 6 — Thin local UI
 
-**Status:** 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`. 6B is CLOSED after physical macOS QA **PASS** at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4`. The 6C architecture and implementation plan are approved; 6C.1 — Steer + Planning Master integration is implemented pending independent review. Next checkpoint: **independent 6C.1 review, then 6C.2**.
+**Status:** 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`. 6B is CLOSED after physical macOS QA **PASS** at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4`. 6C.1 — Steer + Planning Master integration is CLOSED / **PASS** at approved implementation baseline `c5a4a683af63f988b06ded852a9462e05f9e92c8`. Next checkpoint: **6C.2 — RunCoordinator + local API/dashboard controls**.
 
 **Objective:** Expose the proven headless loop in a small local dashboard while keeping command authority, durable state, and provider logic in the existing KerbsFlow process/core.
 
@@ -330,5 +330,5 @@ For a real nonterminal attempt, cancellation follows `requestRealCancellation()`
 ## Current gate
 
 - Phase 5 is independently confirmed **PASS** at approved baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported.
-- Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`; Phase 6B is CLOSED at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4` after physical macOS QA **PASS**; Phase 6C architecture is planned and approved, and 6C.1 is implemented pending independent review.
-- Next action: independent 6C.1 review; do not start 6C.2 before review.
+- Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`; Phase 6B is CLOSED at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4` after physical macOS QA **PASS**; Phase 6C.1 is CLOSED / **PASS** at approved implementation baseline `c5a4a683af63f988b06ded852a9462e05f9e92c8`.
+- Next action: implement Phase 6C.2 — RunCoordinator + local API/dashboard controls.
