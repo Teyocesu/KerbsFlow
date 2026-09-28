@@ -16,6 +16,7 @@ import {
   type ExecutionRequest,
   type SemanticReviewHandle,
   type SemanticReviewRequest,
+  asInstructionId,
   asAttemptId,
   asRunId,
   asTaskId,
@@ -27,13 +28,13 @@ import { KerbsFlowCore } from "../src/core.js";
 import { KerbsFlowError } from "../src/errors.js";
 import { GitWorktreeManager } from "../src/git.js";
 import { Phase2Loop, type Phase2LoopRequest } from "../src/phase2.js";
-import { createPhase2PlanningDecision } from "../src/planning.js";
+import { createPhase2PlanningDecision, type PlanningMaster } from "../src/planning.js";
 import { StateStore } from "../src/persistence.js";
 import { ProcessSupervisor } from "../src/process.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { FocusedVerifier } from "../src/verifier.js";
 import { IndependentSemanticReviewer } from "../src/reviewer.js";
-import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery } from "../src/routing.js";
+import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery, type TrustedRoutingDecision } from "../src/routing.js";
 import { createFakeCodex, createGitRepository, git } from "./phase2-helpers.js";
 import { createFixture, primeExecute } from "./helpers.js";
 
@@ -126,6 +127,182 @@ test("the real Phase 4 loop persists distinct OpenCode and Codex escalation prov
     store.close();
     rmSync(runtime, { recursive: true, force: true });
     rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
+test("Planning Master retries stale Steer and carries current Phase 4 authority through rework escalation", async () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-phase4-planning-master-"));
+  const ids = new SequenceIdSource("phase4_planning_master");
+  const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
+  const codex = new CodexAdapter({ cliPath: createFakeCodex(runtime), runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+  const open = invariantOpenCodeAdapter();
+  const routedAdapter = new RoutedExecutorAdapter([open, codex]);
+  const core = codexCore(store, routedAdapter, ids);
+  const runId = asRunId("run_phase4_planning_master");
+  const taskId = asTaskId("task_phase4_planning_master");
+  const discovery = await new RoutingDiscovery([
+    { adapter: "opencode", implementation: open },
+    { adapter: "codex", implementation: codex },
+  ], { now: () => "2026-09-22T12:00:00.000Z" }).discover({
+    workingDirectory: repository.root,
+    models: [
+      { adapter: "opencode", provider: "opencode", model: "opencode/muse-fixture", family: "muse" },
+      { adapter: "codex", provider: "openai", model: "fixture-model", family: "sol", reasoning: "high" },
+    ],
+  });
+  const router = new PolicyRouter();
+  const routeDecision = (decisionId: string, kind: "implementation" | "rework", classification: "normal" | "difficult") => {
+    const base = createPhase2PlanningDecision({
+      decisionId,
+      runId,
+      taskId,
+      objective: "SCENARIO=success prove current Planning Master routing provenance",
+      acceptance: ["the bounded Codex correction passes verification"],
+      positiveScope: ["result.txt", "test/example.test.ts"],
+      negativeScope: ["README.md"],
+      model: "placeholder",
+      canonicalContext: "phase4 planning master",
+    });
+    const proposal = parsePlanningDecision({
+      ...base,
+      selectedSkills: ["ponytail"],
+      action: { ...base.action, kind },
+    });
+    return router.route({ planningDecision: proposal, classification, discovery });
+  };
+  const initialStale = routeDecision("decision_pm_initial_stale", "implementation", "normal");
+  const initialAccepted = routeDecision("decision_pm_initial_accepted", "implementation", "normal");
+  const reworkStale = routeDecision("decision_pm_rework_stale", "rework", "difficult");
+  const reworkAccepted = routeDecision("decision_pm_rework_accepted", "rework", "difficult");
+  let initialCalls = 0;
+  let reworkCalls = 0;
+  let initialSteerId: ReturnType<typeof asInstructionId> | undefined;
+  let reworkSteerId: ReturnType<typeof asInstructionId> | undefined;
+  const planningMaster: PlanningMaster = {
+    planInitial(input) {
+      initialCalls += 1;
+      if (initialCalls === 1) {
+        assert.deepEqual(input.steer, { instructionId: null, text: null });
+        const command = core.steer(runId, store.getRun(runId)!.stateVersion, "pm:steer:initial", "keep the original Muse selection in the plan");
+        initialSteerId = asInstructionId((command.details as { instructionId: string }).instructionId);
+        return { decision: initialStale.planningDecision, routingDecision: initialStale.routingDecision };
+      }
+      assert.equal(input.steer.instructionId, initialSteerId);
+      assert.equal(input.steer.text, "keep the original Muse selection in the plan");
+      return { decision: initialAccepted.planningDecision, routingDecision: initialAccepted.routingDecision };
+    },
+    planRework(input) {
+      reworkCalls += 1;
+      assert.equal(input.priorDecision.decisionId, initialAccepted.planningDecision.decisionId);
+      assert.equal(input.failure.failureClass, "invariant_violation");
+      assert.match(input.failure.summary, /failed|invariant/i);
+      if (reworkCalls === 1) {
+        assert.deepEqual(input.steer, { instructionId: null, text: null });
+        const command = core.steer(runId, store.getRun(runId)!.stateVersion, "pm:steer:rework", "escalate only within the existing approved scope");
+        reworkSteerId = asInstructionId((command.details as { instructionId: string }).instructionId);
+        return { decision: reworkStale.planningDecision, routingDecision: reworkStale.routingDecision };
+      }
+      assert.equal(input.steer.instructionId, reworkSteerId);
+      assert.equal(input.steer.text, "escalate only within the existing approved scope");
+      return { decision: reworkAccepted.planningDecision, routingDecision: reworkAccepted.routingDecision };
+    },
+  };
+  const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+  try {
+    const result = await new Phase2Loop(
+      core,
+      store,
+      gitManager,
+      new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids),
+      ids,
+      undefined,
+      planningMaster,
+    ).run({
+      runId,
+      taskId,
+      objective: "Planning Master current routing authority",
+      repositoryPath: repository.root,
+      expectedBaseOid: repository.head,
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      phaseCheck: { level: "phase", commandId: "phase4-pm", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      executionTimeoutMs: 5000,
+      failurePolicy: { higherCodexRoute: { model: "fixture-model", reasoning: "high" } },
+    });
+
+    assert.equal(result.verdict, "PASS");
+    assert.equal(result.attempts, 2);
+    assert.equal(initialCalls, 2);
+    assert.equal(reworkCalls, 2);
+    assert.equal(store.getRoutingDecision(initialStale.planningDecision.decisionId), undefined);
+    assert.equal(store.getRoutingDecision(reworkStale.planningDecision.decisionId), undefined);
+    assert.ok(store.getRoutingDecision(initialAccepted.planningDecision.decisionId));
+    assert.ok(store.getRoutingDecision(reworkAccepted.planningDecision.decisionId));
+    assert.equal(store.getSteerInstruction(initialSteerId!)?.planningDecisionId, initialAccepted.planningDecision.decisionId);
+    assert.equal(store.getSteerInstruction(reworkSteerId!)?.planningDecisionId, reworkAccepted.planningDecision.decisionId);
+    assert.equal(store.getPendingSteerInstruction(runId), undefined);
+
+    const accepted = store.getTask(taskId)?.decision;
+    assert.equal(accepted?.decisionId, reworkAccepted.planningDecision.decisionId);
+    assert.deepEqual(accepted?.selectedSkills, ["ponytail"]);
+    const provenance = store.listAttemptRoutingProvenance(runId, taskId).map((entry) => entry.provenance);
+    assert.deepEqual(provenance.map((entry) => entry.selected.adapter), ["opencode", "codex"]);
+    assert.deepEqual(provenance.map((entry) => entry.planningDecisionId), [initialAccepted.planningDecision.decisionId, reworkAccepted.planningDecision.decisionId]);
+    assert.deepEqual(provenance.map((entry) => entry.selected.model), ["opencode/muse-fixture", "fixture-model"]);
+  } finally {
+    store.close();
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
+test("Planning Master rejects run and task identity mismatches before READY", async () => {
+  for (const mismatch of ["runId", "taskId"] as const) {
+    const fixture = integratedLoopFixture(`planning-master-wrong-${mismatch}`);
+    try {
+      const decision = parsePlanningDecision({
+        ...fixture.decision,
+        ...(mismatch === "runId" ? { runId: asRunId("run_planning_master_other") } : { taskId: asTaskId("task_planning_master_other") }),
+      });
+      const planningMaster: PlanningMaster = {
+        planInitial: () => ({ decision }),
+        planRework: () => ({ decision }),
+      };
+      await assert.rejects(fixture.run({ planningMaster }), (error: unknown) => error instanceof KerbsFlowError && error.code === "COMMAND_SCOPE_MISMATCH");
+      assert.equal(fixture.store.getRun(fixture.runId)?.state, "PLAN");
+      assert.equal(fixture.store.getTask(fixture.taskId), undefined);
+      assert.equal(fixture.store.listTaskAttempts(fixture.runId, fixture.taskId).length, 0);
+    } finally {
+      fixture.close();
+    }
+  }
+});
+
+test("Planning Master cannot pass a structurally cloned Phase 4 routing decision", async () => {
+  const fixture = integratedLoopFixture("planning-master-fake-route");
+  try {
+    const discovery = await new RoutingDiscovery([{ adapter: "codex", implementation: fixture.adapter }]).discover({
+      workingDirectory: fixture.repository.root,
+      models: [{ adapter: "codex", provider: "openai", model: "fixture-model", family: "sol", reasoning: "high" }],
+    });
+    const routed = new PolicyRouter().route({ planningDecision: fixture.decision, classification: "difficult", discovery });
+    const planningMaster: PlanningMaster = {
+      planInitial: () => ({
+        decision: routed.planningDecision,
+        routingDecision: { ...routed.routingDecision } as TrustedRoutingDecision,
+      }),
+      planRework: () => ({ decision: routed.planningDecision, routingDecision: routed.routingDecision }),
+    };
+    await assert.rejects(
+      fixture.run({ planningMaster }),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "ROUTING_AUTHORITY_REQUIRED",
+    );
+    assert.equal(fixture.store.getRun(fixture.runId)?.state, "PLAN");
+    assert.equal(fixture.store.getTask(fixture.taskId), undefined);
+    assert.equal(fixture.store.getRoutingDecision(routed.planningDecision.decisionId), undefined);
+    assert.equal(fixture.store.listTaskAttempts(fixture.runId, fixture.taskId).length, 0);
+  } finally {
+    fixture.close();
   }
 });
 
@@ -945,20 +1122,21 @@ function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopReque
     runId,
     taskId,
     decision,
-    run: ({ reviewer, sandbox }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox }) => new Phase2Loop(
+    run: ({ reviewer, sandbox, planningMaster }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox; planningMaster?: PlanningMaster }) => new Phase2Loop(
       codexCore(store, adapter, ids),
       store,
       gitManager,
       new FocusedVerifier(gitManager, sandbox ?? new VerificationSandbox(new ProcessSupervisor()), ids),
       ids,
       reviewer,
+      planningMaster,
     ).run({
       runId,
       taskId,
       objective: `integrated ${scenario}`,
       repositoryPath: repository.root,
       expectedBaseOid: repository.head,
-      planningDecision: decision,
+      ...(planningMaster === undefined ? { planningDecision: decision } : {}),
       focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
       phaseCheck: { level: "phase", commandId: `phase-${scenario}`, name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
       executionTimeoutMs: 5000,

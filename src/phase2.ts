@@ -6,7 +6,9 @@ import {
   type ReviewDecision,
   type RunId,
   type TaskId,
+  asDecisionId,
   asReviewId,
+  parsePlanningDecision,
   parseExecutorResult,
 } from "./contracts.js";
 import { CanonicalIntentGuard } from "./canonical.js";
@@ -18,12 +20,14 @@ import {
   buildExecutorPrompt,
   noneSteerObservation,
   type PlanningMaster,
+  type PlanningMasterResult,
   type PlanningSteerObservation,
 } from "./planning.js";
 import {
   PHASE4_ROUTING_POLICY,
   assertTrustedRoutingDecision,
   createAttemptRoutingProvenance,
+  PolicyRouter,
   type TrustedRoutingDecision,
 } from "./routing.js";
 import { StateStore, type StoredFailureOccurrence } from "./persistence.js";
@@ -37,7 +41,7 @@ export interface Phase2LoopRequest {
   objective: string;
   repositoryPath: string;
   expectedBaseOid?: string;
-  planningDecision: PlanningDecision;
+  planningDecision?: PlanningDecision;
   focusedCheck: FocusedCheckCommand;
   phaseCheck?: PhaseCheckCommand;
   executionTimeoutMs: number;
@@ -92,20 +96,22 @@ export class Phase2Loop {
     this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
     const planned = await this.acceptInitialPlan(request, command.stateVersion);
     command = planned.command;
-    if (request.routingDecision !== undefined) this.store.recordRoutingDecision(request.routingDecision);
     let decision = planned.decision;
+    let currentRoutingDecision = planned.routingDecision;
+    this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
     let attempts = 0;
-    let nextSelectionReason = request.routingDecision?.selectionReason ?? "pre-Phase-4 planning route";
+    let nextSelectionReason = currentRoutingDecision?.selectionReason ?? "pre-Phase-4 planning route";
     let nextEscalationReason: string | undefined;
 
     while (true) {
+      this.assertRoutingForPlanningDecision(decision, currentRoutingDecision);
       attempts += 1;
       command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
-      if (request.routingDecision !== undefined) {
+      if (currentRoutingDecision !== undefined) {
         const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
         if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing provenance requires the prepared attempt");
         this.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
-          routingDecision: request.routingDecision,
+          routingDecision: currentRoutingDecision,
           planningDecision: decision,
           attemptId,
           selectionReason: nextSelectionReason,
@@ -146,9 +152,11 @@ export class Phase2Loop {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after focused verification`;
         }
-        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: focused.bundle.summary }, `${request.runId}:continue:${attempts}`);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: focused.bundle.summary }, `${request.runId}:continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
         command = reworked.command;
         decision = reworked.decision;
+        currentRoutingDecision = reworked.routingDecision;
+        this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
         continue;
       }
 
@@ -190,9 +198,11 @@ export class Phase2Loop {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after phase verification`;
         }
-        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: phase.verification.bundle.summary }, `${request.runId}:phase-continue:${attempts}`);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: phase.verification.bundle.summary }, `${request.runId}:phase-continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
         command = reworked.command;
         decision = reworked.decision;
+        currentRoutingDecision = reworked.routingDecision;
+        this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
         continue;
       }
 
@@ -226,21 +236,67 @@ export class Phase2Loop {
   }
 
   private assertRequest(request: Phase2LoopRequest): void {
-    if (request.planningDecision.runId !== request.runId || request.planningDecision.taskId !== request.taskId) throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "planning decision IDs do not match the Phase 3 loop request");
-    if (request.planningDecision.policyVersion === PHASE4_ROUTING_POLICY && request.routingDecision === undefined) {
-      throw new KerbsFlowError("ROUTING_AUTHORITY_REQUIRED", "Phase 4 execution requires its trusted routing decision");
+    if (this.planningMaster !== undefined) {
+      if (request.planningDecision !== undefined || request.routingDecision !== undefined) {
+        throw new KerbsFlowError("PLANNING_AUTHORITY_CONFLICT", "Planning Master runs receive their decision and routing authority only from PlanningMasterResult");
+      }
+      return;
     }
+    if (request.planningDecision === undefined) {
+      throw new KerbsFlowError("PLANNING_DECISION_REQUIRED", "legacy Phase2Loop requests require a precomputed planning decision");
+    }
+    const decision = parsePlanningDecision(request.planningDecision);
+    this.assertPlanningIdentity(decision, request);
     const routing = request.routingDecision === undefined ? undefined : assertTrustedRoutingDecision(request.routingDecision);
-    if (routing !== undefined && (
-      routing.runId !== request.runId
-      || routing.taskId !== request.taskId
-      || routing.planningDecisionId !== request.planningDecision.decisionId
-      || routing.selected.adapter !== request.planningDecision.route.adapter
-      || routing.selected.model !== request.planningDecision.route.model
-      || routing.selected.reasoning !== request.planningDecision.route.reasoning
-    )) {
-      throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "routing metadata does not match the Phase 4 loop request");
+    this.assertRoutingForPlanningDecision(decision, routing);
+  }
+
+  private assertPlanningIdentity(decision: PlanningDecision, request: Phase2LoopRequest): void {
+    if (decision.runId !== request.runId || decision.taskId !== request.taskId) {
+      throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "planning decision runId/taskId do not match the Phase2Loop request");
     }
+  }
+
+  private assertRoutingForPlanningDecision(decision: PlanningDecision, routing: TrustedRoutingDecision | undefined): void {
+    if (routing === undefined) {
+      if (decision.policyVersion === PHASE4_ROUTING_POLICY) {
+        throw new KerbsFlowError("ROUTING_AUTHORITY_REQUIRED", "Phase 4 execution requires trusted routing authority for the accepted planning decision");
+      }
+      return;
+    }
+    const trusted = assertTrustedRoutingDecision(routing);
+    if (trusted.runId !== decision.runId
+      || trusted.taskId !== decision.taskId
+      || trusted.planningDecisionId !== decision.decisionId
+      || trusted.selected.adapter !== decision.route.adapter
+      || trusted.selected.model !== decision.route.model
+      || trusted.selected.reasoning !== decision.route.reasoning) {
+      throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "trusted routing identity and selected route must exactly match the current planning decision");
+    }
+    const candidate = trusted.consideredRoutes.find((route) => (
+      route.adapter === decision.route.adapter
+      && route.model === decision.route.model
+      && route.reasoning === decision.route.reasoning
+      && route.available
+      && route.suitable
+      && route.capabilityHash !== undefined
+    ));
+    if (candidate === undefined) {
+      throw new KerbsFlowError("ROUTING_CAPABILITY_MISMATCH", "the selected planning route lacks suitable trusted capability provenance");
+    }
+  }
+
+  private assertRoutingDecisionCanBePersisted(routing: TrustedRoutingDecision | undefined): void {
+    if (routing === undefined) return;
+    const existing = this.store.getRoutingDecision(routing.planningDecisionId);
+    if (existing !== undefined && JSON.stringify(existing.decision) !== JSON.stringify(routing)) {
+      throw new KerbsFlowError("ROUTING_DECISION_CONFLICT", `planning decision ${routing.planningDecisionId} already has different persisted routing authority`);
+    }
+  }
+
+  private persistAcceptedRoutingDecision(decision: PlanningDecision, routing: TrustedRoutingDecision | undefined): void {
+    this.assertRoutingForPlanningDecision(decision, routing);
+    if (routing !== undefined) this.store.recordRoutingDecision(routing);
   }
 
   private recordFailure(request: Phase2LoopRequest, decision: PlanningDecision, executorResult: ExecutorResult, verification: FocusedVerificationResult, category: "focused_verification" | "phase_verification"): StoredFailureOccurrence {
@@ -277,18 +333,28 @@ export class Phase2Loop {
     return { instructionId: pending.instructionId, text: pending.text };
   }
 
-  private async acceptInitialPlan(request: Phase2LoopRequest, stateVersion: number): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision }> {
+  private async acceptInitialPlan(request: Phase2LoopRequest, stateVersion: number): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
     if (this.planningMaster === undefined) {
-      const command = this.core.plan(request.runId, stateVersion, `${request.runId}:plan`, request.planningDecision);
-      return { command, decision: request.planningDecision };
+      if (request.planningDecision === undefined) throw new KerbsFlowError("PLANNING_DECISION_REQUIRED", "legacy Phase2Loop requests require a precomputed planning decision");
+      const decision = parsePlanningDecision(request.planningDecision);
+      this.assertPlanningIdentity(decision, request);
+      const routingDecision = request.routingDecision === undefined ? undefined : assertTrustedRoutingDecision(request.routingDecision);
+      this.assertRoutingForPlanningDecision(decision, routingDecision);
+      this.assertRoutingDecisionCanBePersisted(routingDecision);
+      const command = this.core.plan(request.runId, stateVersion, `${request.runId}:plan`, decision);
+      return { command, decision, ...(routingDecision === undefined ? {} : { routingDecision }) };
     }
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const steer = this.observeSteer(request.runId);
-      const decision = await this.planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer });
+      const result = parsePlanningMasterResult(await this.planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer }));
+      const decision = result.decision;
+      this.assertPlanningIdentity(decision, request);
+      this.assertRoutingForPlanningDecision(decision, result.routingDecision);
+      this.assertRoutingDecisionCanBePersisted(result.routingDecision);
       try {
         const command = this.core.plan(request.runId, stateVersion, attempt === 0 ? `${request.runId}:plan` : `${request.runId}:plan:retry`, decision, { instructionId: steer.instructionId, text: steer.text });
-        return { command, decision };
+        return { command, decision, ...(result.routingDecision === undefined ? {} : { routingDecision: result.routingDecision }) };
       } catch (error) {
         if (!(error instanceof KerbsFlowError) || error.code !== "PLANNING_STEER_STALE") throw error;
         lastError = error;
@@ -303,20 +369,45 @@ export class Phase2Loop {
     baseDecision: PlanningDecision,
     failure: { failureClass: string; reasonCode: string; summary: string },
     idempotencyKey: string,
-  ): Promise<{ command: ReturnType<KerbsFlowCore["reworkToReady"]>; decision: PlanningDecision }> {
+    currentRoutingDecision: TrustedRoutingDecision | undefined,
+    selectionReason: string,
+  ): Promise<{ command: ReturnType<KerbsFlowCore["reworkToReady"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
     if (this.planningMaster === undefined) {
-      const command = this.core.reworkToReady(request.runId, stateVersion, idempotencyKey, baseDecision);
+      let decision = parsePlanningDecision(baseDecision);
+      this.assertPlanningIdentity(decision, request);
+      let routingDecision = currentRoutingDecision;
+      if (routingDecision !== undefined && !routingMatchesPlanningDecision(routingDecision, decision)) {
+        if (decision.decisionId === routingDecision.planningDecisionId) {
+          decision = parsePlanningDecision({ ...decision, decisionId: asDecisionId(this.ids.next("decision")) });
+        }
+        routingDecision = new PolicyRouter().rebindTrustedSelection({ previous: routingDecision, planningDecision: decision, selectionReason });
+      }
+      this.assertRoutingForPlanningDecision(decision, routingDecision);
+      this.assertRoutingDecisionCanBePersisted(routingDecision);
+      const command = this.core.reworkToReady(request.runId, stateVersion, idempotencyKey, decision);
       const stored = this.store.getTask(request.taskId);
-      return { command, decision: stored?.decision ?? baseDecision };
+      const acceptedDecision = stored?.decision ?? decision;
+      this.assertPlanningIdentity(acceptedDecision, request);
+      this.assertRoutingForPlanningDecision(acceptedDecision, routingDecision);
+      return { command, decision: acceptedDecision, ...(routingDecision === undefined ? {} : { routingDecision }) };
     }
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
       const steer = this.observeSteer(request.runId);
       const prior = this.store.getTask(request.taskId)?.decision ?? baseDecision;
-      const corrected = await this.planningMaster.planRework({ runId: request.runId, taskId: request.taskId, priorDecision: prior, failure, steer });
+      const result = parsePlanningMasterResult(await this.planningMaster.planRework({ runId: request.runId, taskId: request.taskId, priorDecision: prior, failure, steer }));
+      const corrected = result.decision;
+      this.assertPlanningIdentity(corrected, request);
+      let routingDecision = result.routingDecision;
+      if (routingDecision !== undefined) this.assertRoutingForPlanningDecision(corrected, routingDecision);
+      if (currentRoutingDecision !== undefined && routingMatchesPlanningDecision(currentRoutingDecision, corrected)) {
+        routingDecision = currentRoutingDecision;
+      }
+      this.assertRoutingForPlanningDecision(corrected, routingDecision);
+      this.assertRoutingDecisionCanBePersisted(routingDecision);
       try {
         const command = this.core.reworkToReady(request.runId, stateVersion, attempt === 0 ? idempotencyKey : `${idempotencyKey}:retry`, corrected, { instructionId: steer.instructionId, text: steer.text });
-        return { command, decision: corrected };
+        return { command, decision: corrected, ...(routingDecision === undefined ? {} : { routingDecision }) };
       } catch (error) {
         if (!(error instanceof KerbsFlowError) || error.code !== "PLANNING_STEER_STALE") throw error;
         lastError = error;
@@ -324,6 +415,37 @@ export class Phase2Loop {
     }
     throw lastError;
   }
+}
+
+function parsePlanningMasterResult(value: unknown): PlanningMasterResult {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new KerbsFlowError("PLANNING_MASTER_RESULT_INVALID", "Planning Master must return a decision and optional trusted routing decision");
+  }
+  const result = value as Record<string, unknown>;
+  for (const key of Object.keys(result)) {
+    if (key !== "decision" && key !== "routingDecision") {
+      throw new KerbsFlowError("PLANNING_MASTER_RESULT_INVALID", `Planning Master returned unknown field ${key}`);
+    }
+  }
+  if (result.decision === undefined) {
+    throw new KerbsFlowError("PLANNING_MASTER_RESULT_INVALID", "Planning Master result is missing its decision");
+  }
+  const decision = parsePlanningDecision(result.decision);
+  if (result.routingDecision === undefined) return { decision };
+  if (result.routingDecision === null || typeof result.routingDecision !== "object" || Array.isArray(result.routingDecision)) {
+    throw new KerbsFlowError("PLANNING_MASTER_RESULT_INVALID", "Planning Master routingDecision must be a runtime-trusted routing decision");
+  }
+  const routingDecision = assertTrustedRoutingDecision(result.routingDecision as TrustedRoutingDecision);
+  return { decision, routingDecision };
+}
+
+function routingMatchesPlanningDecision(routing: TrustedRoutingDecision, decision: PlanningDecision): boolean {
+  return routing.runId === decision.runId
+    && routing.taskId === decision.taskId
+    && routing.planningDecisionId === decision.decisionId
+    && routing.selected.adapter === decision.route.adapter
+    && routing.selected.model === decision.route.model
+    && routing.selected.reasoning === decision.route.reasoning;
 }
 
 function categoryLabel(category: "focused_verification" | "phase_verification"): string {

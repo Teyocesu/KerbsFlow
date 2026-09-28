@@ -14,10 +14,12 @@ import {
   type AdapterDescriptor,
   type AttemptHandle,
   type ExecutionRequest,
+  asDecisionId,
   asReviewId,
   asRunId,
   asTaskId,
   asValidationId,
+  parsePlanningDecision,
 } from "../src/contracts.js";
 import { KerbsFlowCore } from "../src/core.js";
 import { FakeArtifactStore } from "../src/fake.js";
@@ -306,16 +308,31 @@ test("routing decision and separate provenance for every attempt persist without
       evidenceRefs: [],
       reasonCode: "synthetic_route_escalation",
     });
-    const escalated = escalatePlanningRoute(routed.planningDecision, { model: "openai/sol-current", reasoning: "high" });
+    const escalated = parsePlanningDecision({
+      ...escalatePlanningRoute(routed.planningDecision, { model: "openai/sol-current", reasoning: "high" }),
+      decisionId: asDecisionId("decision_route_escalated"),
+    });
     command = core.reworkToReady(routed.planningDecision.runId, command.stateVersion, "ready-routing-2", escalated);
+    const escalatedRouting = new PolicyRouter().rebindTrustedSelection({
+      previous: routed.routingDecision,
+      planningDecision: escalated,
+      selectionReason: "failure policy escalated to the suitable Codex route",
+    });
+    store.recordRoutingDecision(escalatedRouting);
     command = core.prepareExecution(routed.planningDecision.runId, command.stateVersion, "prepare-routing-2");
     assert.equal(JSON.parse(store.readModel(routed.planningDecision.runId)?.activeAttempt?.adapterDescriptorJson ?? "{}").adapter, "codex");
     const secondAttempt = store.readModel(routed.planningDecision.runId)?.run.activeAttemptId;
     assert.ok(secondAttempt);
     await assert.rejects(() => core.beginAttempt(routed.planningDecision.runId, command.stateVersion, "begin-routing-2-missing", root), /attempt routing provenance|routing authority/i);
     assert.equal(starts.count, 1, "provenance from the first attempt cannot authorize the second attempt");
-    store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+    assert.throws(() => createAttemptRoutingProvenance({
       routingDecision: routed.routingDecision,
+      planningDecision: escalated,
+      attemptId: secondAttempt!,
+      selectionReason: "stale OpenCode authority",
+    }), /attempt routing identity|planning decision identity|selected route/i);
+    store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+      routingDecision: escalatedRouting,
       planningDecision: escalated,
       attemptId: secondAttempt!,
       selectionReason: "failure policy escalated",
@@ -337,11 +354,21 @@ test("routing decision and separate provenance for every attempt persist without
   }
 });
 
-test("an escalated attempt cannot use a route absent from the trusted discovery snapshot", async () => {
+test("an escalated attempt cannot be rebound to or use a route absent from the trusted discovery snapshot", async () => {
   const actual = await discover();
   const routed = new PolicyRouter().route({ planningDecision: baseDecision(), classification: "normal", discovery: actual.discovery });
   const absent = escalatePlanningRoute(routed.planningDecision, { model: "openai/unseen", reasoning: "high" });
-  assert.throws(() => createAttemptRoutingProvenance({ routingDecision: routed.routingDecision, planningDecision: absent, attemptId: "attempt_absent" as never, selectionReason: "untrusted escalation" }), /not an available and suitable route/i);
+  assert.throws(() => new PolicyRouter().rebindTrustedSelection({
+    previous: routed.routingDecision,
+    planningDecision: absent,
+    selectionReason: "untrusted escalation",
+  }), /no suitable capability-backed candidate/i);
+  assert.throws(() => createAttemptRoutingProvenance({
+    routingDecision: routed.routingDecision,
+    planningDecision: absent,
+    attemptId: "attempt_absent" as never,
+    selectionReason: "untrusted escalation",
+  }), /attempt routing identity|not an available and suitable route/i);
 });
 
 function baseDecision(suffix = "route") {

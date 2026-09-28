@@ -354,6 +354,56 @@ export class PolicyRouter {
     };
   }
 
+  rebindTrustedSelection(input: {
+    previous: TrustedRoutingDecision;
+    planningDecision: PlanningDecision;
+    selectionReason: string;
+  }): TrustedRoutingDecision {
+    const previous = assertTrustedRoutingDecision(input.previous);
+    const planning = parsePlanningDecision(input.planningDecision);
+    if (planning.policyVersion !== PHASE4_ROUTING_POLICY) {
+      throw new KerbsFlowError("ROUTING_DECISION_INVALID", "trusted route rebinding requires a Phase 4 planning decision");
+    }
+    if (previous.runId !== planning.runId || previous.taskId !== planning.taskId) {
+      throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "trusted route rebinding cannot change run or task identity");
+    }
+    if (previous.planningDecisionId === planning.decisionId
+      && previous.selected.adapter === planning.route.adapter
+      && previous.selected.model === planning.route.model
+      && previous.selected.reasoning === planning.route.reasoning) {
+      return previous;
+    }
+
+    const selected = previous.consideredRoutes.find((candidate) => (
+      candidate.adapter === planning.route.adapter
+      && candidate.model === planning.route.model
+      && candidate.reasoning === planning.route.reasoning
+      && candidate.available
+      && candidate.suitable
+      && candidate.capabilityHash !== undefined
+    ));
+    if (selected === undefined) {
+      throw new KerbsFlowError("ROUTE_UNAVAILABLE", "the current trusted discovery snapshot has no suitable capability-backed candidate for the planning decision");
+    }
+    if (input.selectionReason.trim().length === 0) {
+      throw new KerbsFlowError("ROUTING_DECISION_INVALID", "trusted route rebinding requires a selection reason");
+    }
+    return createTrustedRoutingDecision({
+      ...previous,
+      planningDecisionId: planning.decisionId,
+      runId: planning.runId,
+      taskId: planning.taskId,
+      selected: {
+        adapter: selected.adapter,
+        provider: selected.provider,
+        model: selected.model,
+        family: selected.family,
+        ...(selected.reasoning === undefined ? {} : { reasoning: selected.reasoning }),
+      },
+      selectionReason: input.selectionReason,
+    });
+  }
+
   private consider(candidate: RouteCandidate, classification: WorkClassification, requiresShell: boolean, requiredIsolation: IsolationRequirement): ConsideredRoute {
     const reasons: string[] = [];
     let suitable = true;
@@ -441,7 +491,12 @@ export function createAttemptRoutingProvenance(input: {
 }): TrustedAttemptRoutingProvenance {
   const routing = assertTrustedRoutingDecision(input.routingDecision);
   const planning = parsePlanningDecision(input.planningDecision);
-  if (planning.decisionId !== routing.planningDecisionId || planning.runId !== routing.runId || planning.taskId !== routing.taskId) {
+  if (planning.decisionId !== routing.planningDecisionId
+    || planning.runId !== routing.runId
+    || planning.taskId !== routing.taskId
+    || planning.route.adapter !== routing.selected.adapter
+    || planning.route.model !== routing.selected.model
+    || planning.route.reasoning !== routing.selected.reasoning) {
     throw new KerbsFlowError("ATTEMPT_ROUTING_INVALID", "attempt routing identity does not match the trusted routing decision");
   }
   const selected = routing.consideredRoutes.find((candidate) => candidate.adapter === planning.route.adapter && candidate.model === planning.route.model && candidate.reasoning === planning.route.reasoning);
@@ -507,6 +562,9 @@ export function assertAttemptRoutingBinding(input: AttemptRoutingBinding): Attem
     || routing.runId !== planning.runId
     || routing.taskId !== planning.taskId
     || routing.planningDecisionId !== planning.decisionId
+    || routing.selected.adapter !== planning.route.adapter
+    || routing.selected.model !== planning.route.model
+    || routing.selected.reasoning !== planning.route.reasoning
   ) {
     throw new KerbsFlowError("ROUTING_SCOPE_MISMATCH", "attempt routing authority does not match the prepared attempt and persisted planning scope");
   }

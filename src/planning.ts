@@ -13,6 +13,7 @@ import {
   parseSteerText,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
+import type { TrustedRoutingDecision } from "./routing.js";
 
 export interface Phase2ActionInput {
   decisionId: string;
@@ -156,9 +157,14 @@ export interface ReworkPlanningInput {
   steer: PlanningSteerObservation;
 }
 
+export interface PlanningMasterResult {
+  decision: PlanningDecision;
+  routingDecision?: TrustedRoutingDecision;
+}
+
 export interface PlanningMaster {
-  planInitial(input: InitialPlanningInput): PlanningDecision | Promise<PlanningDecision>;
-  planRework(input: ReworkPlanningInput): PlanningDecision | Promise<PlanningDecision>;
+  planInitial(input: InitialPlanningInput): PlanningMasterResult | Promise<PlanningMasterResult>;
+  planRework(input: ReworkPlanningInput): PlanningMasterResult | Promise<PlanningMasterResult>;
 }
 
 export function assertReworkDecisionBounds(prior: PlanningDecision, corrected: PlanningDecision, allowedAdapters: readonly string[]): void {
