@@ -25,7 +25,9 @@ import {
 import { KerbsFlowCore } from "../src/core.js";
 import { FakeAdapter } from "../src/fake.js";
 import { LocalApiServer, type ArtifactReader } from "../src/local-api.js";
+import { KerbsFlowError } from "../src/errors.js";
 import { StateStore } from "../src/persistence.js";
+import type { CoordinatorCancelRequest, CoordinatorControlRequest, CoordinatorStartRequest, RunCoordinator } from "../src/run-coordinator.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 
 interface ApiFixture {
@@ -56,7 +58,8 @@ interface RequestOptions {
   chunked?: boolean;
 }
 
-type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "startRun" | "pause" | "resume" | "cancel" | "resolveGateScoped">;
+type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "steer" | "resolveGateScoped">;
+type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel">;
 
 interface RunningApi {
   fixture: ApiFixture;
@@ -139,11 +142,17 @@ function createFixture(): ApiFixture {
 
 async function withApi(
   run: (context: RunningApi) => Promise<void>,
-  options: { pollIntervalMs?: number; artifactReader?: (fixture: ApiFixture) => ArtifactReader; core?: (fixture: ApiFixture) => Partial<LocalApiCore> } = {},
+  options: {
+    pollIntervalMs?: number;
+    artifactReader?: (fixture: ApiFixture) => ArtifactReader;
+    core?: (fixture: ApiFixture) => Partial<LocalApiCore>;
+    coordinator?: (fixture: ApiFixture) => Partial<LocalApiCoordinator>;
+  } = {},
 ): Promise<void> {
   const fixture = createFixture();
   const api = new LocalApiServer({
     core: localApiCore(fixture, options.core?.(fixture)),
+    coordinator: localApiCoordinator(fixture, options.coordinator?.(fixture)),
     store: fixture.store,
     artifacts: options.artifactReader?.(fixture) ?? fixture.artifacts,
   }, options.pollIntervalMs === undefined ? {} : { pollIntervalMs: options.pollIntervalMs });
@@ -161,11 +170,38 @@ async function withApi(
 function localApiCore(fixture: ApiFixture, overrides: Partial<LocalApiCore> = {}): LocalApiCore {
   return {
     readModel: (runId) => (overrides.readModel ?? fixture.core.readModel.bind(fixture.core))(runId),
-    startRun: (...args) => (overrides.startRun ?? fixture.core.startRun.bind(fixture.core))(...args),
-    pause: (...args) => (overrides.pause ?? fixture.core.pause.bind(fixture.core))(...args),
-    resume: (...args) => (overrides.resume ?? fixture.core.resume.bind(fixture.core))(...args),
-    cancel: (...args) => (overrides.cancel ?? fixture.core.cancel.bind(fixture.core))(...args),
+    steer: (...args) => (overrides.steer ?? fixture.core.steer.bind(fixture.core))(...args),
     resolveGateScoped: (...args) => (overrides.resolveGateScoped ?? fixture.core.resolveGateScoped.bind(fixture.core))(...args),
+  };
+}
+
+function localApiCoordinator(fixture: ApiFixture, overrides: Partial<LocalApiCoordinator> = {}): LocalApiCoordinator {
+  return {
+    start: (request) => (overrides.start ?? ((value: CoordinatorStartRequest) => fixture.core.startRun(
+      value.runId,
+      value.objective,
+      value.idempotencyKey,
+      value.commandId,
+    )))(request),
+    pause: (request) => (overrides.pause ?? ((value: CoordinatorControlRequest) => Promise.resolve(fixture.core.pause(
+      value.runId,
+      value.expectedStateVersion,
+      value.idempotencyKey,
+      value.commandId,
+    ))))(request),
+    resume: (request) => (overrides.resume ?? ((value: CoordinatorControlRequest) => Promise.resolve(fixture.core.resume(
+      value.runId,
+      value.expectedStateVersion,
+      value.idempotencyKey,
+      value.commandId,
+    ))))(request),
+    cancel: (request) => (overrides.cancel ?? ((value: CoordinatorCancelRequest) => Promise.resolve(fixture.core.cancel(
+      value.runId,
+      value.expectedStateVersion,
+      value.idempotencyKey,
+      value.reason,
+      value.commandId,
+    ))))(request),
   };
 }
 
@@ -429,7 +465,7 @@ test("POST mutations require exact Host, token, and same-origin Origin", async (
   });
 });
 
-test("mutation bodies reject malformed, non-object, unknown, and oversized input before core invocation", async () => {
+test("mutation bodies reject malformed, non-object, unknown, and oversized input before coordinator invocation", async () => {
   let startCalls = 0;
   await withApi(async ({ api, token }) => {
     const valid = mutationEnvelope("command_http_body", "http:body", 0, {
@@ -437,7 +473,7 @@ test("mutation bodies reject malformed, non-object, unknown, and oversized input
       objective: "synthetic mutation body check",
     });
     const unknownTopLevel = { ...valid, unexpected: true };
-    const unknownPayload = { ...valid, payload: { ...(valid.payload as Record<string, unknown>), unexpected: true } };
+    const unknownPayload = { ...valid, payload: { ...(valid.payload as Record<string, unknown>), canonicalRepositoryPath: "/Users/synthetic/private-repository" } };
     assert.equal((await postMutation(api, "/v1/runs", token, "{")).status, 400);
     assert.equal((await postMutation(api, "/v1/runs", token, "[]")).status, 400);
     assert.equal((await postMutation(api, "/v1/runs", token, unknownTopLevel)).status, 400);
@@ -448,16 +484,22 @@ test("mutation bodies reject malformed, non-object, unknown, and oversized input
     assert.equal((await postMutation(api, "/v1/runs", token, oversized, { chunked: true })).status, 413);
     assert.equal(startCalls, 0);
   }, {
-    core: (fixture) => ({
-      startRun(...args) {
+    coordinator: (fixture) => ({
+      start(request) {
         startCalls += 1;
-        return fixture.core.startRun(...args);
+        return fixture.core.startRun(
+          request.runId,
+          request.objective,
+          request.idempotencyKey,
+          request.commandId,
+        );
       },
     }),
   });
 });
 
 test("start persists the supplied command ID and retains idempotent replay", async () => {
+  const coordinatorRequests: CoordinatorStartRequest[] = [];
   await withApi(async ({ fixture, api, token }) => {
     const runId = asRunId("run_local_api_post_start");
     const path = "/v1/runs";
@@ -467,6 +509,7 @@ test("start persists the supplied command ID and retains idempotent replay", asy
     });
     assert.equal((await postMutation(api, path, token, invalidVersion)).status, 400);
     assert.equal(fixture.core.readModel(asRunId("run_local_api_bad_version")), undefined);
+    assert.equal(coordinatorRequests.length, 0);
 
     const body = mutationEnvelope("command_http_start", "http:start", 0, {
       runId,
@@ -474,6 +517,13 @@ test("start persists the supplied command ID and retains idempotent replay", asy
     });
     const started = await postMutation(api, path, token, body);
     assert.equal(started.status, 200);
+    assert.deepEqual(coordinatorRequests[0], {
+      runId,
+      objective: "synthetic HTTP start objective",
+      commandId: "command_http_start",
+      idempotencyKey: "http:start",
+      expectedStateVersion: 0,
+    }, "Start delegates only browser task data and command identity; trusted launch context is injected host-side");
     const result = JSON.parse(started.body) as { commandId: string; replayed: boolean; stateVersion: number };
     assert.equal(result.commandId, "command_http_start");
     assert.equal(result.replayed, false);
@@ -507,11 +557,48 @@ test("start persists the supplied command ID and retains idempotent replay", asy
     });
     assert.equal((await postMutation(api, path, token, changed)).status, 409);
     assert.equal(fixture.store.listTransitions(runId).length, 1);
+  }, {
+    coordinator: (fixture) => ({
+      start(request) {
+        coordinatorRequests.push(request);
+        return fixture.core.startRun(request.runId, request.objective, request.idempotencyKey, request.commandId);
+      },
+    }),
   });
 });
 
-test("command ID collision rejects cancel before Core or adapter cancellation", async () => {
-  let coreCancelCalls = 0;
+test("coordinator Start conflicts return bounded 409 envelopes without launch diagnostics", async () => {
+  await withApi(async ({ api, token }) => {
+    const active = await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_active_conflict", "http:active-conflict", 0, {
+      runId: "run_local_api_active_conflict",
+      objective: "synthetic active conflict",
+    }));
+    assert.equal(active.status, 409);
+    assert.deepEqual(JSON.parse(active.body), {
+      error: { code: "ACTIVE_RUN_CONFLICT", message: "command conflicts with the current state" },
+    });
+
+    const continuation = await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_continuation_conflict", "http:continuation-conflict", 0, {
+      runId: "run_local_api_continuation_conflict",
+      objective: "synthetic continuation conflict",
+    }));
+    assert.equal(continuation.status, 409);
+    assert.deepEqual(JSON.parse(continuation.body), {
+      error: { code: "RUN_CONTINUATION_UNAVAILABLE", message: "command conflicts with the current state" },
+    });
+    assert.doesNotMatch(active.body + continuation.body, /\/Users\/private|Bearer synthetic|provider diagnostic/u);
+  }, {
+    coordinator: () => ({
+      start(request) {
+        const code = request.objective.includes("continuation") ? "RUN_CONTINUATION_UNAVAILABLE" : "ACTIVE_RUN_CONFLICT";
+        throw new KerbsFlowError(code, "provider diagnostic at /Users/private/repository with Bearer synthetic-secret");
+      },
+    }),
+  });
+});
+
+test("command ID collision rejects cancel before coordinator or adapter cancellation", async () => {
+  let coordinatorCancelCalls = 0;
   let adapterCancelCalls = 0;
   await withApi(async ({ fixture, api, token }) => {
     const clock = new FixedClock("2026-09-25T12:00:00.000Z");
@@ -558,7 +645,7 @@ test("command ID collision rejects cancel before Core or adapter cancellation", 
         message: "command identifier conflicts with an earlier command",
       },
     });
-    assert.equal(coreCancelCalls, 0);
+    assert.equal(coordinatorCancelCalls, 0);
     assert.equal(adapterCancelCalls, 0);
     const after = fixture.core.readModel(runId);
     assert.equal(after?.run.state, before.run.state);
@@ -566,16 +653,23 @@ test("command ID collision rejects cancel before Core or adapter cancellation", 
     assert.equal(after?.activeAttempt?.lifecycle, before.activeAttempt.lifecycle);
     assert.deepEqual(fixture.store.listTransitions(runId), transitionsBefore);
   }, {
-    core: (fixture) => ({
-      cancel(...args) {
-        coreCancelCalls += 1;
-        return fixture.core.cancel(...args);
+    coordinator: (fixture) => ({
+      cancel(request) {
+        coordinatorCancelCalls += 1;
+        return Promise.resolve(fixture.core.cancel(
+          request.runId,
+          request.expectedStateVersion,
+          request.idempotencyKey,
+          request.reason,
+          request.commandId,
+        ));
       },
     }),
   });
 });
 
-test("pause and resume mutations use Core state versions and the persisted resume target", async () => {
+test("pause and resume mutations delegate their external command identity through RunCoordinator", async () => {
+  const controlRequests: Array<{ kind: "pause" | "resume"; request: CoordinatorControlRequest }> = [];
   await withApi(async ({ fixture, api, token }) => {
     const runId = asRunId("run_local_api_post_pause");
     const start = await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_pause_start", "http:pause:start", 0, {
@@ -588,6 +682,7 @@ test("pause and resume mutations use Core state versions and the persisted resum
     const paused = await postMutation(api, `/v1/runs/${runId}/pause`, token, pauseBody);
     assert.equal(paused.status, 200);
     const pauseResult = JSON.parse(paused.body) as { commandId: string; replayed: boolean; to: string; stateVersion: number; details?: { resumeTarget?: string } };
+    assert.equal(pauseResult.commandId, "command_http_pause");
     assert.equal(pauseResult.to, "PAUSED");
     assert.equal(pauseResult.details?.resumeTarget, "INTAKE");
     assert.equal(pauseResult.replayed, false);
@@ -601,8 +696,11 @@ test("pause and resume mutations use Core state versions and the persisted resum
     assert.equal((await postMutation(api, `/v1/runs/${runId}/pause`, token, mutationEnvelope("command_http_pause_stale", "http:pause:stale", 1, {}))).status, 409);
     const resumed = await postMutation(api, `/v1/runs/${runId}/resume`, token, mutationEnvelope("command_http_resume", "http:resume", pauseResult.stateVersion, {}));
     assert.equal(resumed.status, 200);
-    assert.equal(JSON.parse(resumed.body).to, "INTAKE");
-    assert.equal(fixture.store.listTransitions(runId).at(-1)?.commandId, "command_http_resume");
+    const resumeResult = JSON.parse(resumed.body) as { commandId: string; idempotencyKey: string; to: string };
+    assert.equal(resumeResult.commandId, "command_http_resume");
+    assert.equal(resumeResult.idempotencyKey, "http:resume");
+    assert.equal(resumeResult.to, "INTAKE");
+    assert.equal(fixture.store.listTransitions(runId).at(-1)?.commandId, resumeResult.commandId);
     assert.equal(fixture.core.readModel(runId)?.run.state, "INTAKE");
 
     const illegalRunId = asRunId("run_local_api_post_resume_illegal");
@@ -614,6 +712,85 @@ test("pause and resume mutations use Core state versions and the persisted resum
     assert.equal(illegalResume.status, 409);
     assert.equal(fixture.core.readModel(illegalRunId)?.run.state, "INTAKE");
     assert.equal((await postMutation(api, "/v1/runs/run_local_api_missing/pause", token, mutationEnvelope("command_http_pause_missing", "http:pause:missing", 0, {}))).status, 404);
+    assert.deepEqual(controlRequests[0], {
+      kind: "pause",
+      request: {
+        runId,
+        commandId: "command_http_pause",
+        idempotencyKey: "http:pause",
+        expectedStateVersion: 1,
+      },
+    });
+    assert.deepEqual(controlRequests.find((entry) => entry.kind === "resume"), {
+      kind: "resume",
+      request: {
+        runId,
+        commandId: "command_http_resume",
+        idempotencyKey: "http:resume",
+        expectedStateVersion: pauseResult.stateVersion,
+      },
+    });
+  }, {
+    coordinator: (fixture) => ({
+      pause(request) {
+        controlRequests.push({ kind: "pause", request });
+        return Promise.resolve(fixture.core.pause(request.runId, request.expectedStateVersion, request.idempotencyKey, request.commandId));
+      },
+      resume(request) {
+        controlRequests.push({ kind: "resume", request });
+        return Promise.resolve(fixture.core.resume(request.runId, request.expectedStateVersion, request.idempotencyKey, request.commandId));
+      },
+    }),
+  });
+});
+
+test("Steer reaches Core with the exact envelope and snapshots expose pending metadata only", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_steer");
+    const start = await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_steer_start", "http:steer:start", 0, {
+      runId,
+      objective: "synthetic Steer API objective",
+    }));
+    assert.equal(start.status, 200);
+    const instruction = "focus on the synthetic local API boundary";
+    const body = mutationEnvelope("command_http_steer", "http:steer", 1, { text: instruction });
+    const response = await postMutation(api, `/v1/runs/${runId}/steer`, token, body);
+    assert.equal(response.status, 200);
+    const result = JSON.parse(response.body) as { commandId: string; replayed: boolean; details: { instructionId: string; pending: boolean } };
+    assert.equal(result.commandId, "command_http_steer");
+    assert.equal(result.replayed, false);
+    assert.equal(result.details.pending, true);
+    assert.equal(fixture.store.getPendingSteerInstruction(runId)?.text, instruction);
+    assert.equal(fixture.store.getPendingSteerInstruction(runId)?.commandId, "command_http_steer");
+    assert.equal(fixture.store.listTransitions(runId).length, 1, "Steer queues work without a state transition");
+
+    const snapshotResponse = await sendRequest(api, `/v1/runs/${runId}/snapshot`, { token });
+    assert.equal(snapshotResponse.status, 200);
+    const snapshot = JSON.parse(snapshotResponse.body) as { pendingSteer: Record<string, unknown> | null };
+    assert.deepEqual(Object.keys(snapshot.pendingSteer ?? {}).sort(), ["createdAt", "instructionId", "pending"]);
+    assert.equal(snapshot.pendingSteer?.instructionId, result.details.instructionId);
+    assert.equal(snapshot.pendingSteer?.pending, true);
+    assert.doesNotMatch(snapshotResponse.body, /focus on the synthetic local API boundary/u);
+
+    const replay = await postMutation(api, `/v1/runs/${runId}/steer`, token, body);
+    assert.equal(replay.status, 200);
+    assert.equal(JSON.parse(replay.body).replayed, true);
+    assert.equal(fixture.store.listTransitions(runId).length, 1);
+    const secret = "AWS_SECRET_ACCESS_KEY=synthetic-credential-value";
+    const secretResponse = await postMutation(api, `/v1/runs/${runId}/steer`, token, mutationEnvelope(
+      "command_http_steer_secret",
+      "http:steer:secret",
+      1,
+      { text: secret },
+    ));
+    assert.equal(secretResponse.status, 400);
+    assert.deepEqual(JSON.parse(secretResponse.body), {
+      error: { code: "STEER_SECRET_REJECTED", message: "Steer text cannot be accepted." },
+    });
+    assert.doesNotMatch(secretResponse.body, /synthetic-credential-value/u);
+    assert.equal(fixture.store.getPendingSteerInstruction(runId)?.text, instruction);
+    const extraField = mutationEnvelope("command_http_steer_extra", "http:steer:extra", 1, { text: "another instruction", runId });
+    assert.equal((await postMutation(api, `/v1/runs/${runId}/steer`, token, extraField)).status, 400);
   });
 });
 
@@ -637,7 +814,9 @@ test("gate resolution is run-scoped, versioned, replayable, and persists the sup
     const otherGateId = fixture.core.readModel(otherRunId)?.currentGate?.gateId;
     assert.ok(otherGateId);
     assert.equal((await postMutation(api, `/v1/runs/${runId}/gates/${otherGateId}/resolve`, token, mutationEnvelope("command_http_gate_wrong_scope", "http:gate:wrong-scope", 2, { optionId: "fail" }))).status, 409);
+    const beforeStaleResolution = fixture.store.listTransitions(runId).length;
     assert.equal((await postMutation(api, path, token, mutationEnvelope("command_http_gate_stale", "http:gate:stale", 1, { optionId: "fail" }))).status, 409);
+    assert.equal(fixture.store.listTransitions(runId).length, beforeStaleResolution, "stale gate resolution must not transition the run");
     const maximumNote = `${"€".repeat(1_365)}a`;
     assert.equal(Buffer.byteLength(maximumNote, "utf8"), 4_096);
     assert.equal((await postMutation(api, path, token, mutationEnvelope("command_http_gate_note_too_long", "http:gate:long-note", 2, { optionId: "fail", note: "€".repeat(1_366) }))).status, 400);
@@ -659,7 +838,8 @@ test("gate resolution is run-scoped, versioned, replayable, and persists the sup
   });
 });
 
-test("cancel delegates to Core and blocks real-adapter cancellation before any adapter signal", async () => {
+test("Cancel delegates external identity through RunCoordinator without returning internal cancellation IDs", async () => {
+  const cancelRequests: CoordinatorCancelRequest[] = [];
   await withApi(async ({ fixture, api, token }) => {
     const fakeRunId = asRunId("run_local_api_post_cancel_fake");
     assert.equal((await postMutation(api, "/v1/runs", token, mutationEnvelope("command_http_cancel_start", "http:cancel:start", 0, {
@@ -669,7 +849,13 @@ test("cancel delegates to Core and blocks real-adapter cancellation before any a
     const cancelBody = mutationEnvelope("command_http_cancel", "http:cancel", 1, { reason: "synthetic cancellation request" });
     const cancelled = await postMutation(api, `/v1/runs/${fakeRunId}/cancel`, token, cancelBody);
     assert.equal(cancelled.status, 200);
-    assert.equal(JSON.parse(cancelled.body).to, "CANCELLED");
+    const cancelResult = JSON.parse(cancelled.body) as { commandId: string; idempotencyKey: string; to: string };
+    assert.equal(cancelResult.commandId, "command_http_cancel");
+    assert.equal(cancelResult.idempotencyKey, "http:cancel");
+    assert.equal(cancelResult.to, "CANCELLED");
+    assert.equal("transitionId" in cancelResult, false);
+    assert.equal("details" in cancelResult, false);
+    assert.doesNotMatch(cancelled.body, /internal-cancellation-id|attempt_internal_cancel/u);
     assert.equal(fixture.store.listTransitions(fakeRunId).at(-1)?.commandId, "command_http_cancel");
     const replayed = await postMutation(api, `/v1/runs/${fakeRunId}/cancel`, token, cancelBody);
     assert.equal(replayed.status, 200);
@@ -718,6 +904,29 @@ test("cancel delegates to Core and blocks real-adapter cancellation before any a
     assert.deepEqual(JSON.parse(realCancel.body), { error: { code: "REAL_CANCEL_REQUIRES_DURABLE_INTENT", message: "command conflicts with the current state" } });
     assert.equal(adapterCancelCalls, 0);
     assert.equal(fixture.core.readModel(realRunId)?.run.state, "EXECUTE");
+    assert.deepEqual(cancelRequests[0], {
+      runId: fakeRunId,
+      commandId: "command_http_cancel",
+      idempotencyKey: "http:cancel",
+      expectedStateVersion: 1,
+      reason: "synthetic cancellation request",
+    });
+  }, {
+    coordinator: (fixture) => ({
+      cancel(request) {
+        cancelRequests.push(request);
+        return Promise.resolve(fixture.core.cancel(
+          request.runId,
+          request.expectedStateVersion,
+          request.idempotencyKey,
+          request.reason,
+          request.commandId,
+        )).then((result) => ({
+          ...result,
+          details: { internalCancellationId: "internal-cancellation-id", attemptId: "attempt_internal_cancel" },
+        }));
+      },
+    }),
   });
 });
 
@@ -765,13 +974,15 @@ test("snapshot returns a bounded persisted projection and omits artifact paths",
       run: { runId: string; stateVersion: number };
       currentTask: { action: { positiveScope: string[] }; route: { adapter: string; model: string } };
       activeAttempt: { adapter: string; model: string };
+      pendingSteer: null;
       recentTransitions: Array<{ sequence: number }>;
       artifacts: Array<Record<string, unknown>>;
       transitionCursor: number;
     };
-    assert.deepEqual(Object.keys(snapshot).sort(), ["activeAttempt", "artifacts", "currentGate", "currentTask", "latestReview", "latestValidation", "recentTransitions", "run", "schemaVersion", "transitionCursor"].sort());
+    assert.deepEqual(Object.keys(snapshot).sort(), ["activeAttempt", "artifacts", "currentGate", "currentTask", "latestReview", "latestValidation", "pendingSteer", "recentTransitions", "run", "schemaVersion", "transitionCursor"].sort());
     assert.equal(snapshot.schemaVersion, "kerbsflow.local-snapshot/v1");
     assert.equal(snapshot.run.runId, runId);
+    assert.equal(snapshot.pendingSteer, null);
     assert.equal(snapshot.run.stateVersion, fixture.core.readModel(runId)?.run.stateVersion);
     assert.equal(snapshot.currentTask.route.adapter, "[redacted]");
     assert.equal(snapshot.currentTask.route.model, "[path redacted]");

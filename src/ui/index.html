@@ -22,6 +22,7 @@
         <p id="connection-status" class="connection-status" data-state="idle" role="status" aria-live="polite">Not connected</p>
         <div id="run-switcher" class="run-switcher" hidden>
           <code id="selected-run-id" class="identifier">—</code>
+          <button id="new-run" class="quiet-button" type="button">New run</button>
           <button id="switch-run" class="quiet-button" type="button" aria-controls="run-form" aria-expanded="false">Switch run</button>
         </div>
       </div>
@@ -37,13 +38,20 @@
       <p id="page-status" class="page-status" role="status" aria-live="polite" hidden></p>
 
       <section id="empty-view" class="empty-view" aria-labelledby="empty-title">
-        <h1 id="empty-title">Open a run</h1>
-        <form id="empty-run-form" class="run-selector empty-selector">
-          <label for="empty-run-id">Run ID</label>
-          <input id="empty-run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="run_…">
-          <button type="submit">Open</button>
+        <h1 id="empty-title">Start or open a run</h1>
+        <form id="start-form" class="start-form">
+          <label for="start-run-id">Run ID <span>(optional)</span></label>
+          <input id="start-run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="Generated if empty">
+          <label for="start-objective">Objective</label>
+          <textarea id="start-objective" name="objective" rows="3" maxlength="10000" required></textarea>
+          <button id="start-run" type="submit">Start run</button>
         </form>
-        <p>Runs stay local to this KerbsFlow process.</p>
+        <p class="start-note">The configured local launch profile supplies repository and execution settings.</p>
+        <form id="empty-run-form" class="run-selector empty-selector">
+          <label for="empty-run-id">Open existing run</label>
+          <input id="empty-run-id" name="runId" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="run_…">
+          <button type="submit" class="quiet-button">Open</button>
+        </form>
       </section>
 
       <div id="run-content" class="run-content" aria-busy="false" hidden>
@@ -65,6 +73,28 @@
           <section id="human-gate" class="content-section gate-section" data-open="false" aria-labelledby="human-gate-title">
             <h2 id="human-gate-title">Human gate</h2>
             <div id="human-gate-content"></div>
+          </section>
+
+          <section class="content-section controls-section" aria-labelledby="controls-title">
+            <h2 id="controls-title">Run controls</h2>
+            <div class="control-buttons">
+              <button id="pause-control" type="button" data-mutation disabled>Pause</button>
+              <button id="resume-control" type="button" data-mutation disabled>Resume</button>
+            </div>
+            <form id="steer-form" class="control-form">
+              <label for="steer-text">Steer for the next safe planning boundary</label>
+              <textarea id="steer-text" rows="2" maxlength="4096" required></textarea>
+              <div class="control-form-footer">
+                <span id="steer-byte-count" class="field-hint" aria-live="polite">0 / 4096 bytes</span>
+                <button id="steer-submit" type="submit" data-mutation disabled>Queue Steer</button>
+              </div>
+            </form>
+            <form id="cancel-form" class="control-form cancel-form">
+              <label for="cancel-reason">Brief cancellation reason</label>
+              <input id="cancel-reason" type="text" maxlength="1000" required>
+              <button id="cancel-submit" type="submit" class="danger-button" data-mutation disabled>Cancel run</button>
+            </form>
+            <p id="pending-steer-status" class="pending-steer-status" aria-live="polite"></p>
           </section>
 
           <section class="content-section scope-section" aria-labelledby="scope-title">

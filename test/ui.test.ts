@@ -45,7 +45,17 @@ function get(
 test("LocalApiServer serves fixed dashboard assets with the bootstrap and security boundary", async () => {
   const fixture = createFixture();
   const api = new LocalApiServer({
-    core: fixture.core,
+    core: {
+      readModel: () => undefined,
+      steer: () => { throw new Error("unexpected UI asset test Steer call"); },
+      resolveGateScoped: () => { throw new Error("unexpected UI asset test gate call"); },
+    },
+    coordinator: {
+      start: () => { throw new Error("unexpected UI asset test Start call"); },
+      pause: async () => { throw new Error("unexpected UI asset test Pause call"); },
+      resume: async () => { throw new Error("unexpected UI asset test Resume call"); },
+      cancel: async () => { throw new Error("unexpected UI asset test Cancel call"); },
+    },
     store: fixture.store,
     artifacts: {
       get(artifactId) {
@@ -117,7 +127,7 @@ test("LocalApiServer serves fixed dashboard assets with the bootstrap and securi
   }
 });
 
-test("dashboard module keeps snapshot text inert and stays within the read-only CSP", () => {
+test("dashboard keeps untrusted text inert and does not persist browser state", () => {
   const html = readFileSync(new URL("../../src/ui/index.html", import.meta.url), "utf8");
   const app = readFileSync(new URL("../../src/ui/app.js", import.meta.url), "utf8");
   const styles = readFileSync(new URL("../../src/ui/styles.css", import.meta.url), "utf8");
@@ -125,7 +135,6 @@ test("dashboard module keeps snapshot text inert and stays within the read-only 
   for (const sink of forbiddenSinks) assert.equal(app.includes(sink), false, "forbidden rendering sink: " + sink);
   assert.match(app, /function setText\(element, value\) \{[\s\S]*?element\.textContent = valueText\(value\);/u);
   assert.doesNotMatch(app, /\b(?:localStorage|sessionStorage)\b/u);
-  assert.doesNotMatch(app, /method\s*:\s*["']POST["']/u);
   assert.doesNotMatch(html, /https?:\/\//iu);
   assert.doesNotMatch(html, /<style\b|style=/iu);
   assert.doesNotMatch(styles, /https?:\/\/|@import\b|@font-face\b/iu);

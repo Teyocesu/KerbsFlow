@@ -11,12 +11,14 @@ import {
   ContractValidationError,
   type ArtifactId,
   type CommandId,
+  type CommandResult,
   type RunId,
 } from "./contracts.js";
 import type { KerbsFlowCore } from "./core.js";
 import { IdempotencyConflictError, KerbsFlowError, NotFoundError, StateVersionConflictError } from "./errors.js";
 import { containsLikelySecret, redactDiagnostic } from "./secrets.js";
-import { StateStore, type ReadModel, type StoredArtifact, type StoredTransition } from "./persistence.js";
+import { StateStore, type ReadModel, type StoredArtifact, type StoredSteerInstruction, type StoredTransition } from "./persistence.js";
+import type { RunCoordinator } from "./run-coordinator.js";
 import { StateMachineError } from "./state-machine.js";
 
 export interface ArtifactReader {
@@ -28,7 +30,8 @@ export interface LocalApiServerOptions {
 }
 
 export interface LocalApiServerDependencies {
-  core: Pick<KerbsFlowCore, "readModel" | "startRun" | "pause" | "resume" | "cancel" | "resolveGateScoped">;
+  core: Pick<KerbsFlowCore, "readModel" | "steer" | "resolveGateScoped">;
+  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel">;
   store: StateStore;
   artifacts: ArtifactReader;
 }
@@ -230,7 +233,13 @@ export class LocalApiServer {
       const runId = asRunId(requiredMutationString(envelope.payload.runId, 120));
       const objective = requiredMutationString(envelope.payload.objective, 10_000);
       if (envelope.expectedStateVersion !== 0) throw invalidRequest("run creation requires expectedStateVersion zero");
-      this.sendCommandResult(response, this.dependencies.core.startRun(runId, objective, envelope.idempotencyKey, envelope.commandId));
+      this.sendCommandResult(response, this.dependencies.coordinator.start({
+        runId,
+        objective,
+        commandId: envelope.commandId,
+        idempotencyKey: envelope.idempotencyKey,
+        expectedStateVersion: envelope.expectedStateVersion,
+      }));
       return;
     }
     if (segments.length >= 3 && segments[1] === "runs") {
@@ -250,23 +259,43 @@ export class LocalApiServer {
         this.sendArtifact(response, runId, parseArtifactId(segments[4]));
         return;
       }
+      if (segments.length === 4 && segments[3] === "steer") {
+        if (method !== "POST") return this.methodNotAllowed(response, "POST");
+        const envelope = parseMutationEnvelope(await readMutationBody(request));
+        this.assertCommandIdAvailable(envelope);
+        assertExactKeys(envelope.payload, ["text"]);
+        const text = requiredMutationValue(envelope.payload.text);
+        this.sendCommandResult(response, this.dependencies.core.steer(
+          runId,
+          envelope.expectedStateVersion,
+          envelope.idempotencyKey,
+          text,
+          envelope.commandId,
+        ));
+        return;
+      }
       if (segments.length === 4 && ["pause", "resume", "cancel"].includes(segments[3]!)) {
         if (method !== "POST") return this.methodNotAllowed(response, "POST");
         const envelope = parseMutationEnvelope(await readMutationBody(request));
         this.assertCommandIdAvailable(envelope);
         assertExactKeys(envelope.payload, segments[3] === "cancel" ? ["reason"] : []);
-        const result = segments[3] === "pause"
-          ? this.dependencies.core.pause(runId, envelope.expectedStateVersion, envelope.idempotencyKey, envelope.commandId)
-          : segments[3] === "resume"
-            ? this.dependencies.core.resume(runId, envelope.expectedStateVersion, envelope.idempotencyKey, envelope.commandId)
-            : this.dependencies.core.cancel(
-              runId,
-              envelope.expectedStateVersion,
-              envelope.idempotencyKey,
-              requiredMutationString(envelope.payload.reason, 1_000),
-              envelope.commandId,
-            );
-        this.sendCommandResult(response, result);
+        const control = {
+          runId,
+          commandId: envelope.commandId,
+          idempotencyKey: envelope.idempotencyKey,
+          expectedStateVersion: envelope.expectedStateVersion,
+        };
+        if (segments[3] === "pause") {
+          this.sendCommandResult(response, await this.dependencies.coordinator.pause(control));
+        } else if (segments[3] === "resume") {
+          this.sendCommandResult(response, await this.dependencies.coordinator.resume(control));
+        } else {
+          const result = await this.dependencies.coordinator.cancel({
+            ...control,
+            reason: requiredMutationString(envelope.payload.reason, 1_000),
+          });
+          this.sendCancelResult(response, result);
+        }
         return;
       }
       if (segments.length === 6 && segments[3] === "gates" && segments[5] === "resolve") {
@@ -318,6 +347,7 @@ export class LocalApiServer {
       currentTask: snapshotTask(model.currentTask),
       activeAttempt: snapshotAttempt(model),
       currentGate: snapshotGate(model),
+      pendingSteer: snapshotPendingSteer(this.dependencies.store.getPendingSteerInstruction(runId)),
       latestValidation: snapshotValidation(model),
       latestReview: snapshotReview(model),
       recentTransitions: transitions.map(snapshotTransition),
@@ -349,11 +379,19 @@ export class LocalApiServer {
     response.end(content);
   }
 
-  private sendCommandResult(response: ServerResponse, result: ReturnType<KerbsFlowCore["startRun"]>): void {
+  private sendCommandResult(response: ServerResponse, result: CommandResult): void {
     response.statusCode = 200;
     response.setHeader("Content-Type", "application/json; charset=utf-8");
     response.setHeader("Cache-Control", "no-store");
     response.end(JSON.stringify(result));
+  }
+
+  private sendCancelResult(response: ServerResponse, result: CommandResult): void {
+    const { schemaVersion, commandId, idempotencyKey, runId, accepted, replayed, from, to, stateVersion } = result;
+    response.statusCode = 200;
+    response.setHeader("Content-Type", "application/json; charset=utf-8");
+    response.setHeader("Cache-Control", "no-store");
+    response.end(JSON.stringify({ schemaVersion, commandId, idempotencyKey, runId, accepted, replayed, from, to, stateVersion }));
   }
 
   private assertCommandIdAvailable(envelope: MutationEnvelope): void {
@@ -631,6 +669,11 @@ function requiredMutationString(value: unknown, maximumLength: number): string {
   return value;
 }
 
+function requiredMutationValue(value: unknown): string {
+  if (typeof value !== "string") throw invalidRequest("request text field is invalid");
+  return value;
+}
+
 function optionalMutationText(value: unknown, maximumBytes: number): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string" || value.length > 2_000 || Buffer.byteLength(value, "utf8") > maximumBytes) {
@@ -701,6 +744,15 @@ function snapshotGate(model: ReadModel): unknown {
       consequence: safeSnapshotText(option.consequence, 300),
       target: option.target,
     })),
+  };
+}
+
+function snapshotPendingSteer(instruction: StoredSteerInstruction | undefined): unknown {
+  if (instruction === undefined) return null;
+  return {
+    instructionId: instruction.instructionId,
+    createdAt: instruction.createdAt,
+    pending: true,
   };
 }
 
@@ -796,24 +848,43 @@ function invalidRequest(message: string): LocalApiRequestError {
 function mapRequestError(error: unknown): LocalApiErrorShape {
   if (error instanceof LocalApiRequestError) return error.shape;
   if (error instanceof ContractValidationError) return { status: 400, code: "INVALID_REQUEST", message: "request input is invalid" };
-  if (error instanceof NotFoundError || (error instanceof KerbsFlowError && error.code === "NOT_FOUND")) {
+  if (error instanceof NotFoundError || (error instanceof KerbsFlowError && ["NOT_FOUND", "RUN_NOT_FOUND"].includes(error.code))) {
     return { status: 404, code: "NOT_FOUND", message: "run or gate not found" };
   }
   if (error instanceof StateVersionConflictError) return { status: 409, code: "STATE_VERSION_CONFLICT", message: "run state changed; refresh before retrying" };
   if (error instanceof IdempotencyConflictError) return { status: 409, code: "IDEMPOTENCY_CONFLICT", message: "idempotency key conflicts with an earlier command" };
   if (error instanceof StateMachineError) return { status: 409, code: error.code, message: "command conflicts with the current state" };
   if (error instanceof KerbsFlowError) {
+    if (error.code === "STEER_SECRET_REJECTED") {
+      return { status: 400, code: "STEER_SECRET_REJECTED", message: "Steer text cannot be accepted." };
+    }
     if (error.code === "PERSISTENCE_SECRET_REJECTED") {
       return { status: 400, code: "INVALID_REQUEST", message: "request input is invalid" };
     }
     if ([
+      "ACTIVE_RUN_CONFLICT",
       "RUN_EXISTS",
+      "RUN_CONTINUATION_UNAVAILABLE",
+      "RUN_DRIVE_NOT_PAUSABLE",
+      "RUN_DRIVE_NOT_RESUMABLE",
+      "RUN_NOT_OWNED",
+      "CONTROL_COMMAND_IN_PROGRESS",
+      "PAUSE_SUPERSEDED",
+      "PAUSE_REQUIRES_QUIESCENT_RUN",
+      "PAUSE_NOT_ALLOWED",
+      "CANCEL_ALREADY_CLAIMED",
+      "CANCEL_COMMAND_INCOMPLETE",
+      "CANCELLATION_COMMAND_CONFLICT",
+      "CANCELLATION_INTENT_REQUIRED",
+      "CANCELLATION_SIGNAL_AMBIGUOUS",
+      "STEER_TERMINAL",
+      "STEER_PENDING_EXISTS",
+      "GATE_SCOPE_MISMATCH",
       "INVALID_COMMAND_STATE",
       "RESUME_NOT_PAUSED",
       "RESUME_REQUIRES_RECOVERY",
       "GATE_NOT_OPEN",
       "GATE_OPTION_INVALID",
-      "GATE_SCOPE_MISMATCH",
       "REAL_CANCEL_REQUIRES_DURABLE_INTENT",
       "CANCEL_NOT_ALLOWED",
     ].includes(error.code)) {

@@ -5,7 +5,12 @@ const elements = {
   connection: document.getElementById("connection-status"),
   form: document.getElementById("run-form"),
   runInput: document.getElementById("run-id"),
+  startForm: document.getElementById("start-form"),
+  startRunInput: document.getElementById("start-run-id"),
+  startObjective: document.getElementById("start-objective"),
+  startButton: document.getElementById("start-run"),
   runSwitcher: document.getElementById("run-switcher"),
+  newRun: document.getElementById("new-run"),
   selectedRunId: document.getElementById("selected-run-id"),
   switchRun: document.getElementById("switch-run"),
   cancelRunSelection: document.getElementById("cancel-run-selection"),
@@ -22,6 +27,16 @@ const elements = {
   tabs: [...document.querySelectorAll('[role="tab"]')],
   views: [...document.querySelectorAll('[role="tabpanel"]')],
   currentWork: document.getElementById("current-work-content"),
+  pauseControl: document.getElementById("pause-control"),
+  resumeControl: document.getElementById("resume-control"),
+  steerForm: document.getElementById("steer-form"),
+  steerText: document.getElementById("steer-text"),
+  steerByteCount: document.getElementById("steer-byte-count"),
+  steerSubmit: document.getElementById("steer-submit"),
+  cancelForm: document.getElementById("cancel-form"),
+  cancelReason: document.getElementById("cancel-reason"),
+  cancelSubmit: document.getElementById("cancel-submit"),
+  pendingSteer: document.getElementById("pending-steer-status"),
   validation: document.getElementById("validation-content"),
   gateSection: document.getElementById("human-gate"),
   gateTitle: document.getElementById("human-gate-title"),
@@ -34,6 +49,14 @@ const elements = {
 };
 
 let currentSession;
+let startInFlight = false;
+
+class MutationIdentityError extends Error {
+  constructor() {
+    super("secure random command identity unavailable");
+    this.name = "MutationIdentityError";
+  }
+}
 
 function isCurrent(session) {
   return currentSession === session && !session.controller.signal.aborted;
@@ -62,9 +85,117 @@ function setPageStatus(message, state) {
 }
 
 function clearPageStatus() {
+  if (currentSession?.notice !== undefined) {
+    setPageStatus(currentSession.notice.message, currentSession.notice.state);
+    return;
+  }
   elements.pageStatus.hidden = true;
   elements.pageStatus.dataset.state = "";
   setText(elements.pageStatus, "");
+}
+
+function setSessionNotice(session, message, state = "error") {
+  session.notice = { message, state };
+  if (isCurrent(session)) setPageStatus(message, state);
+}
+
+function clearSessionNotice(session) {
+  delete session.notice;
+  if (isCurrent(session)) clearPageStatus();
+}
+
+function randomHex() {
+  if (typeof crypto === "undefined" || typeof crypto.getRandomValues !== "function") {
+    throw new Error("secure browser randomness is unavailable");
+  }
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+async function postMutation(path, runId, expectedStateVersion, payload) {
+  let identity;
+  try {
+    identity = {
+      commandId: "command_" + randomHex(),
+      idempotencyKey: "local-ui:" + randomHex(),
+      runId,
+    };
+  } catch {
+    throw new MutationIdentityError();
+  }
+  const response = await fetch(path, {
+    method: "POST",
+    cache: "no-store",
+    headers: {
+      "Content-Type": "application/json",
+      "X-KerbsFlow-Token": apiToken,
+    },
+    body: JSON.stringify({
+      schemaVersion: "kerbsflow.local-command/v1",
+      commandId: identity.commandId,
+      idempotencyKey: identity.idempotencyKey,
+      expectedStateVersion,
+      payload,
+    }),
+  });
+  return { response, identity };
+}
+
+function parseMutationResult(value, identity) {
+  const result = asObject(value);
+  if (result.accepted !== true || result.commandId !== identity.commandId
+    || result.idempotencyKey !== identity.idempotencyKey || result.runId !== identity.runId
+    || typeof result.to !== "string" || !Number.isSafeInteger(result.stateVersion)) {
+    throw new Error("mutation response is not authoritative");
+  }
+  return result;
+}
+
+async function safeMutationError(response) {
+  let code = "";
+  try {
+    const body = asObject(await response.json());
+    code = valueText(asObject(body.error).code);
+  } catch {
+    // The response body is untrusted; status still maps to a safe message.
+  }
+  const messages = {
+    ACTIVE_RUN_CONFLICT: "Another run owns the local coordinator. Open the active run before starting a different one.",
+    RUN_CONTINUATION_UNAVAILABLE: "This run has no proven live drive to continue. Refresh its snapshot and inspect its state.",
+    STATE_VERSION_CONFLICT: "The run changed before this command was accepted. Review the latest run state before trying again.",
+    IDEMPOTENCY_CONFLICT: "This command conflicts with an earlier command. Review the current run state before trying again.",
+    COMMAND_ID_CONFLICT: "This command identity conflicts with an earlier command. Review the current run state before trying again.",
+    CONTROL_COMMAND_IN_PROGRESS: "Another control command already owns this run. Review the latest state and wait before acting again.",
+    PAUSE_SUPERSEDED: "The pause was superseded before it could be committed. Review the latest run state.",
+    CANCEL_COMMAND_INCOMPLETE: "This cancellation identity has an incomplete result and cannot be replaced. Review the latest run state.",
+    CANCELLATION_COMMAND_CONFLICT: "This attempt already belongs to a different cancellation request. Review the latest run state.",
+    STEER_PENDING_EXISTS: "A Steer instruction is already waiting for the next safe planning boundary.",
+    STEER_SECRET_REJECTED: "Steer was rejected because it may contain a secret. Remove the sensitive value and try again.",
+    STEER_TERMINAL: "A terminal run cannot accept Steer.",
+    GATE_NOT_OPEN: "This human gate is already resolved or no longer open. Review its latest state.",
+    GATE_OPTION_INVALID: "That gate option is no longer available. Review its latest state.",
+    GATE_SCOPE_MISMATCH: "That gate no longer belongs to this run. Review the latest run state.",
+    PAUSE_NOT_ALLOWED: "The run cannot be paused from its current state.",
+    PAUSE_REQUIRES_QUIESCENT_RUN: "The active operation has not reached a safe pause boundary.",
+    RUN_DRIVE_NOT_PAUSABLE: "The coordinator has no live drive that can be safely paused.",
+    RUN_DRIVE_NOT_RESUMABLE: "The coordinator cannot prove a safe continuation point for this run.",
+    RUN_NOT_OWNED: "This process does not own the run's coordinator drive.",
+    RUN_EXISTS: "That run ID is already in use. Open the existing run or choose a new ID.",
+    RESUME_NOT_PAUSED: "The run is no longer paused. Review its latest state.",
+    RESUME_REQUIRES_RECOVERY: "The run requires Recovery before it can resume.",
+    CANCEL_ALREADY_CLAIMED: "Another cancellation already owns this run's control boundary.",
+    CANCEL_NOT_ALLOWED: "The run cannot be cancelled from its current state.",
+    REAL_CANCEL_REQUIRES_DURABLE_INTENT: "Cancellation could not be safely coordinated. Inspect the latest run state.",
+  };
+  if (Object.hasOwn(messages, code)) return { code, message: messages[code] };
+  if (response.status === 401) return { code, message: "The local session is invalid. Reload this page to start a new session." };
+  if (response.status === 403) return { code, message: "The local API rejected this request origin." };
+  if (response.status === 404) return { code, message: "The run or human gate is no longer available. Check the ID and refresh the dashboard." };
+  if (response.status === 409) return { code, message: "The requested action was not confirmed because the run or gate state conflicts with it. Review the current state before trying again." };
+  if (response.status === 413) return { code, message: "The request exceeds the local API size limit." };
+  if (response.status === 400) return { code, message: "The local API rejected the request as invalid." };
+  return { code, message: "The local API could not confirm this command. Its outcome may be unknown; inspect the latest snapshot before trying again." };
 }
 
 function makeText(tagName, value, className) {
@@ -155,7 +286,7 @@ function renderEvidence(snapshot) {
   }
 }
 
-function renderHumanGate(snapshot) {
+function renderHumanGate(snapshot, session) {
   elements.humanGate.replaceChildren();
   const gate = snapshot.currentGate;
   if (gate === null || gate === undefined) {
@@ -205,6 +336,15 @@ function renderHumanGate(snapshot) {
     addEmpty(elements.humanGate, "No options are recorded.", "p");
     return;
   }
+  const noteLabel = makeText("label", "Optional note", "gate-note-label");
+  const note = document.createElement("textarea");
+  note.id = "gate-resolution-note";
+  note.rows = 2;
+  note.maxLength = 2_000;
+  note.setAttribute("aria-label", "Optional note for this human gate resolution");
+  note.className = "gate-resolution-note";
+  noteLabel.htmlFor = note.id;
+  elements.humanGate.append(noteLabel, note);
   const optionList = document.createElement("ul");
   optionList.className = "gate-options";
   for (const optionValue of options) {
@@ -216,6 +356,19 @@ function renderHumanGate(snapshot) {
     const target = makeText("p", "Target: ", "gate-target");
     target.append(makeText("code", option.target, "identifier"));
     row.append(target);
+    if (typeof option.id === "string") {
+      const choose = document.createElement("button");
+      choose.type = "button";
+      choose.className = "gate-action";
+      choose.dataset.mutation = "gate";
+      choose.setAttribute("aria-label", "Choose gate option " + valueText(option.label));
+      choose.textContent = "Choose this option";
+      choose.disabled = session.mutationInFlight === true;
+      choose.addEventListener("click", () => {
+        void resolveGate(session, valueText(item.gateId), option.id, note.value);
+      });
+      row.append(choose);
+    }
     optionList.append(row);
   }
   elements.humanGate.append(optionList);
@@ -373,6 +526,39 @@ function renderActivity(snapshot) {
   }
 }
 
+function updateSteerByteCount() {
+  const bytes = new TextEncoder().encode(elements.steerText.value).length;
+  setText(elements.steerByteCount, bytes + " / 4096 bytes");
+  elements.steerByteCount.dataset.state = bytes > 4096 ? "error" : "";
+  return bytes;
+}
+
+function updateMutationControls(session) {
+  const state = session.currentState;
+  const terminal = state === "IDLE" || state === "FAILED" || state === "CANCELLED" || state === "DONE";
+  const busy = session.mutationInFlight === true;
+  elements.pauseControl.disabled = busy || terminal || state === "PAUSED";
+  elements.resumeControl.disabled = busy || state !== "PAUSED";
+  elements.steerText.disabled = busy || terminal;
+  elements.steerSubmit.disabled = busy || terminal || elements.steerText.value.length === 0 || updateSteerByteCount() > 4096;
+  elements.cancelReason.disabled = busy || terminal;
+  elements.cancelSubmit.disabled = busy || terminal || elements.cancelReason.value.trim() === "";
+  const gateOpen = session.currentGateStatus === "open";
+  for (const note of elements.humanGate.querySelectorAll(".gate-resolution-note")) note.disabled = busy || !gateOpen;
+  for (const button of elements.humanGate.querySelectorAll('[data-mutation="gate"]')) {
+    button.disabled = busy || !gateOpen;
+  }
+
+  const pending = asObject(asObject(session.snapshot).pendingSteer);
+  if (pending.pending === true && typeof pending.instructionId === "string") {
+    setText(elements.pendingSteer, "Steer queued for a safe planning boundary · " + pending.instructionId);
+    elements.pendingSteer.title = valueText(pending.createdAt);
+  } else {
+    setText(elements.pendingSteer, "");
+    elements.pendingSteer.removeAttribute("title");
+  }
+}
+
 function renderSnapshot(snapshot, session) {
   const run = asObject(snapshot.run);
   const task = asObject(snapshot.currentTask);
@@ -381,6 +567,11 @@ function renderSnapshot(snapshot, session) {
   setText(elements.runState, displayLabel(run.state));
   elements.runState.dataset.state = valueText(run.state);
   elements.runState.title = valueText(run.state);
+  session.currentState = valueText(run.state);
+  session.stateVersion = run.stateVersion;
+  session.currentGateId = asObject(snapshot.currentGate).gateId;
+  session.currentGateStatus = asObject(snapshot.currentGate).status;
+  session.snapshot = snapshot;
   elements.runMeta.replaceChildren(
     makeText("code", session.runId, "run-meta-id identifier"),
     document.createTextNode(" · State v" + valueText(run.stateVersion)),
@@ -390,7 +581,8 @@ function renderSnapshot(snapshot, session) {
   renderExecutionContext(snapshot);
   renderCurrentWork(snapshot);
   renderEvidence(snapshot);
-  renderHumanGate(snapshot);
+  renderHumanGate(snapshot, session);
+  updateMutationControls(session);
   renderScope(snapshot);
   renderArtifacts(snapshot, session);
   renderActivity(snapshot);
@@ -417,6 +609,235 @@ function showApiFailure(status, session, keepConnection) {
   }
   if (!keepConnection) setConnection("Not connected", "error");
   setPageStatus("The local API returned an error (HTTP " + status + ").", "error");
+}
+
+async function refreshAfterMutationFailure(session, response) {
+  const failure = await safeMutationError(response);
+  if (!isCurrent(session)) return;
+  if (response.status === 401) {
+    session.sessionInvalid = true;
+    setConnection("Session invalid", "error");
+    setSessionNotice(session, failure.message);
+    return;
+  }
+  setSessionNotice(session, failure.message);
+  if (response.status === 404 || response.status === 409 || response.status >= 500) {
+    const refreshed = await refreshSnapshot(session);
+    if (isCurrent(session)) {
+      const message = refreshed
+        ? failure.message
+        : failure.message + " The authoritative snapshot could not be refreshed; the current state is unknown.";
+      setSessionNotice(session, message, refreshed ? "error" : "warning");
+    }
+  }
+}
+
+async function refreshAfterAmbiguousMutation(session, message) {
+  if (!isCurrent(session)) return;
+  setSessionNotice(session, message, "warning");
+  const refreshed = await refreshSnapshot(session);
+  if (isCurrent(session) && !refreshed) {
+    setSessionNotice(session, message + " The snapshot refresh also failed.", "warning");
+  }
+}
+
+function commandPath(session, command) {
+  return "/v1/runs/" + encodeURIComponent(session.runId) + "/" + command;
+}
+
+async function submitRunMutation(session, command, payload, kind, gateId) {
+  if (!isCurrent(session) || session.mutationInFlight) return;
+  if (!Number.isSafeInteger(session.stateVersion)) {
+    setSessionNotice(session, "A current snapshot is required before sending a command.");
+    return;
+  }
+
+  clearSessionNotice(session);
+  session.mutationInFlight = true;
+  updateMutationControls(session);
+  try {
+    let sent;
+    try {
+      sent = await postMutation(commandPath(session, command), session.runId, session.stateVersion, payload);
+    } catch (error) {
+      if (error instanceof MutationIdentityError) {
+        setSessionNotice(session, "Secure random command IDs are unavailable, so the command was not sent.");
+        return;
+      }
+      await refreshAfterAmbiguousMutation(
+        session,
+        "No response was received. The command outcome is unknown; no automatic retry was sent.",
+      );
+      return;
+    }
+
+    if (!sent.response.ok) {
+      await refreshAfterMutationFailure(session, sent.response);
+      return;
+    }
+
+    let result;
+    try {
+      result = parseMutationResult(await sent.response.json(), sent.identity);
+    } catch {
+      await refreshAfterAmbiguousMutation(
+        session,
+        "The command response could not be confirmed. Its outcome may be unknown; no automatic retry was sent.",
+      );
+      return;
+    }
+
+    if (kind === "steer") elements.steerText.value = "";
+    if (kind === "cancel") elements.cancelReason.value = "";
+    const refreshed = await refreshSnapshot(session);
+    if (!isCurrent(session)) return;
+    if (!refreshed) {
+      setSessionNotice(session, "The API accepted the command, but a fresh snapshot is unavailable. Review the run before taking another action.", "warning");
+      return;
+    }
+
+    if (kind === "pause") {
+      if (session.currentState === "PAUSED" && session.stateVersion >= result.stateVersion) {
+        setSessionNotice(session, "Run is paused.", "success");
+      } else {
+        setSessionNotice(session, "Pause returned, but the fresh snapshot shows " + valueText(session.currentState) + "; PAUSED was not confirmed.", "warning");
+      }
+    } else if (kind === "resume") {
+      if (session.currentState === result.to && session.stateVersion >= result.stateVersion) {
+        setSessionNotice(session, "Run resumed to " + displayLabel(result.to) + ".", "success");
+      } else {
+        setSessionNotice(session, "Resume returned, but the fresh snapshot shows " + valueText(session.currentState) + "; the response state was not confirmed.", "warning");
+      }
+    } else if (kind === "cancel") {
+      if (session.currentState === "CANCELLED") {
+        setSessionNotice(session, "Run cancelled.", "success");
+      } else if (session.currentState === "RECOVERY") {
+        setSessionNotice(session, "Cancellation left the run in Recovery. Review its persisted recovery state.", "warning");
+      } else {
+        setSessionNotice(session, "Cancel returned, but the fresh snapshot shows " + valueText(session.currentState) + "; cancellation is not confirmed.", "warning");
+      }
+    } else if (kind === "steer") {
+      setSessionNotice(session, "Steer accepted for the next safe planning boundary.", "success");
+    } else if (kind === "gate") {
+      if (session.currentGateId !== gateId || session.currentGateStatus !== "open") {
+        setSessionNotice(session, "The human gate resolution is recorded in the fresh snapshot.", "success");
+      } else {
+        setSessionNotice(session, "The response arrived, but the fresh snapshot still shows this gate open.", "warning");
+      }
+    }
+  } finally {
+    session.mutationInFlight = false;
+    if (isCurrent(session)) updateMutationControls(session);
+  }
+}
+
+function utf8Length(value) {
+  return new TextEncoder().encode(value).length;
+}
+
+async function resolveGate(session, gateId, optionId, note) {
+  if (typeof gateId !== "string" || typeof optionId !== "string") return;
+  if (utf8Length(note) > 4096) {
+    setSessionNotice(session, "The optional gate note exceeds 4096 UTF-8 bytes.");
+    return;
+  }
+  await submitRunMutation(
+    session,
+    "gates/" + encodeURIComponent(gateId) + "/resolve",
+    { optionId, ...(note === "" ? {} : { note }) },
+    "gate",
+    gateId,
+  );
+}
+
+async function startRun(event) {
+  event.preventDefault();
+  if (startInFlight) return;
+  const objective = elements.startObjective.value;
+  if (objective.trim() === "") {
+    elements.startObjective.focus();
+    setPageStatus("Enter an objective before starting a run.", "error");
+    return;
+  }
+
+  let runId = elements.startRunInput.value.trim();
+  try {
+    if (runId === "") runId = "run_" + randomHex();
+  } catch {
+    setPageStatus("Secure random IDs are unavailable, so Start was not sent.", "error");
+    return;
+  }
+  elements.startRunInput.value = runId;
+  startInFlight = true;
+  elements.startButton.disabled = true;
+  clearPageStatus();
+  try {
+    let sent;
+    try {
+      sent = await postMutation("/v1/runs", runId, 0, { runId, objective });
+    } catch (error) {
+      if (error instanceof MutationIdentityError) {
+        setPageStatus("Secure random command IDs are unavailable, so Start was not sent.", "error");
+        return;
+      }
+      const session = await loadRun(runId);
+      const message = session?.hasSnapshot
+        ? "Start received no response. The latest snapshot is loaded, but coordinator acceptance cannot be inferred; no automatic retry was sent."
+        : session?.runUnavailable
+          ? "Start received no response and the latest snapshot reports this run unavailable. Coordinator acceptance remains unknown; no automatic retry was sent."
+          : "Start received no response and the latest snapshot could not be loaded. Coordinator acceptance is unknown; no automatic retry was sent.";
+      if (session !== undefined) setSessionNotice(session, message, "warning");
+      else setPageStatus(message, "warning");
+      return;
+    }
+
+    if (!sent.response.ok) {
+      const failure = await safeMutationError(sent.response);
+      if (sent.response.status === 409 && [
+        "RUN_CONTINUATION_UNAVAILABLE",
+        "RUN_EXISTS",
+        "STATE_VERSION_CONFLICT",
+        "IDEMPOTENCY_CONFLICT",
+        "COMMAND_ID_CONFLICT",
+      ].includes(failure.code)) {
+        const session = await loadRun(runId);
+        if (session !== undefined) {
+          const message = session.hasSnapshot
+            ? failure.message
+            : failure.message + " The requested run snapshot is unavailable.";
+          setSessionNotice(session, message, session.hasSnapshot ? "error" : "warning");
+        }
+        else setPageStatus(failure.message, "error");
+      } else {
+        setPageStatus(failure.message, "error");
+      }
+      return;
+    }
+
+    let result;
+    try {
+      result = parseMutationResult(await sent.response.json(), sent.identity);
+      if (result.to !== "INTAKE") throw new Error("Start response did not confirm INTAKE");
+    } catch {
+      const session = await loadRun(runId);
+      const message = session?.hasSnapshot
+        ? "The Start response could not confirm coordinator acceptance. The latest snapshot is loaded, but acceptance remains unknown; no automatic retry was sent."
+        : "The Start response could not confirm coordinator acceptance, and the latest snapshot is unavailable. Acceptance remains unknown; no automatic retry was sent.";
+      if (session !== undefined) setSessionNotice(session, message, "warning");
+      else setPageStatus(message, "warning");
+      return;
+    }
+
+    elements.startObjective.value = "";
+    elements.startRunInput.value = "";
+    const session = await loadRun(runId, { message: "Start accepted by the local coordinator.", state: "success" });
+    if (session !== undefined && !session.hasSnapshot) {
+      setSessionNotice(session, "Start was accepted by the local coordinator, but the latest snapshot is unavailable.", "warning");
+    }
+  } finally {
+    startInFlight = false;
+    elements.startButton.disabled = false;
+  }
 }
 
 async function fetchSnapshot(session) {
@@ -634,6 +1055,10 @@ function resetDashboard() {
   elements.currentWork.replaceChildren();
   elements.validation.replaceChildren();
   elements.humanGate.replaceChildren();
+  elements.steerText.value = "";
+  elements.cancelReason.value = "";
+  setText(elements.pendingSteer, "");
+  updateSteerByteCount();
   elements.positiveScope.replaceChildren();
   elements.negativeScope.replaceChildren();
   elements.artifactHead.hidden = true;
@@ -641,7 +1066,7 @@ function resetDashboard() {
   elements.activity.replaceChildren();
 }
 
-async function loadRun(runId) {
+async function loadRun(runId, notice) {
   stopSession();
   resetDashboard();
   elements.runInput.value = runId;
@@ -650,7 +1075,7 @@ async function loadRun(runId) {
   if (runId === "") {
     setConnection("Not connected", "idle");
     clearPageStatus();
-    return;
+    return undefined;
   }
 
   const session = {
@@ -660,6 +1085,7 @@ async function loadRun(runId) {
     artifactControllers: new Set(),
     hasSnapshot: false,
     refreshPending: false,
+    ...(notice === undefined ? {} : { notice }),
   };
   currentSession = session;
   elements.runContent.setAttribute("aria-busy", "true");
@@ -667,9 +1093,10 @@ async function loadRun(runId) {
   setPageStatus("Loading the authoritative run snapshot.", "");
 
   const loaded = await refreshSnapshot(session);
-  if (!isCurrent(session) || !loaded || session.sessionInvalid || session.runUnavailable) return;
+  if (!isCurrent(session) || !loaded || session.sessionInvalid || session.runUnavailable) return session;
   setConnection("Connecting", "loading");
-  await runEventStream(session);
+  void runEventStream(session);
+  return session;
 }
 
 function selectView(name) {
@@ -712,6 +1139,10 @@ elements.switchRun.addEventListener("click", () => {
   elements.runInput.focus();
   elements.runInput.select();
 });
+elements.newRun.addEventListener("click", () => {
+  elements.startRunInput.value = "";
+  void loadRun("").then(() => elements.startObjective.focus());
+});
 elements.cancelRunSelection.addEventListener("click", closeRunSelector);
 elements.form.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") return;
@@ -727,6 +1158,52 @@ elements.form.addEventListener("submit", (event) => {
 elements.emptyForm.addEventListener("submit", (event) => {
   event.preventDefault();
   void loadRun(elements.emptyRunInput.value.trim());
+});
+
+elements.startForm.addEventListener("submit", (event) => {
+  void startRun(event);
+});
+
+elements.pauseControl.addEventListener("click", () => {
+  if (currentSession !== undefined) void submitRunMutation(currentSession, "pause", {}, "pause");
+});
+
+elements.resumeControl.addEventListener("click", () => {
+  if (currentSession !== undefined) void submitRunMutation(currentSession, "resume", {}, "resume");
+});
+
+elements.steerText.addEventListener("input", () => {
+  updateSteerByteCount();
+  if (currentSession !== undefined) updateMutationControls(currentSession);
+});
+
+elements.steerForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const session = currentSession;
+  if (session === undefined) return;
+  const bytes = updateSteerByteCount();
+  if (bytes > 4096) {
+    setSessionNotice(session, "Steer must be at most 4096 UTF-8 bytes.");
+    return;
+  }
+  void submitRunMutation(session, "steer", { text: elements.steerText.value }, "steer");
+});
+
+elements.cancelReason.addEventListener("input", () => {
+  if (currentSession !== undefined) updateMutationControls(currentSession);
+});
+
+elements.cancelForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  const session = currentSession;
+  if (session === undefined) return;
+  const reason = elements.cancelReason.value.trim();
+  if (reason === "") {
+    elements.cancelReason.focus();
+    setSessionNotice(session, "Enter a brief reason before cancelling the run.");
+    return;
+  }
+  void submitRunMutation(session, "cancel", { reason }, "cancel");
 });
 
 if (apiToken === "") {
