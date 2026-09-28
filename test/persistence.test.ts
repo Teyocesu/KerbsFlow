@@ -34,13 +34,14 @@ test("failed migration rolls back its DDL and preserves the prior schema", () =>
   const db = new DatabaseSync(":memory:");
   const clock = new FixedClock("2026-09-21T12:00:00.000Z");
   try {
+    const nextVersion = (MIGRATIONS.at(-1)?.version ?? 0) + 1;
     const brokenMigrations = [
       ...MIGRATIONS,
-      { version: 10, name: "broken", sql: "CREATE TABLE should_rollback (id INTEGER); INSERT INTO missing_table VALUES (1);" },
+      { version: nextVersion, name: "broken", sql: "CREATE TABLE should_rollback (id INTEGER); INSERT INTO missing_table VALUES (1);" },
     ];
     assert.throws(() => applyMigrations(db, brokenMigrations, clock));
     assert.equal((db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'").get() as unknown), undefined);
-    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count, 9);
+    assert.equal((db.prepare("SELECT COUNT(*) AS count FROM schema_migrations").get() as { count: number }).count, MIGRATIONS.length);
   } finally {
     db.close();
   }
@@ -61,13 +62,14 @@ test("forward migration creates and verifies an owner-only bounded backup", { sk
     const databaseBackup = backups.find((path) => path.endsWith(".sqlite"));
     const metadataBackup = backups.find((path) => path.endsWith(".json"));
     assert.ok(databaseBackup && metadataBackup);
-    assert.match(databaseBackup, /v8-to-v9/);
+    const targetVersion = MIGRATIONS.at(-1)?.version ?? 9;
+    assert.match(databaseBackup, new RegExp(`v8-to-v${targetVersion}`));
     assert.equal(lstatSync(dbPath).mode & 0o777, 0o600);
     assert.equal(lstatSync(join(root, "backups")).mode & 0o777, 0o700);
     assert.equal(lstatSync(join(root, "backups", databaseBackup)).mode & 0o777, 0o600);
     assert.equal(lstatSync(join(root, "backups", metadataBackup)).mode & 0o777, 0o600);
     const metadata = JSON.parse(readFileSync(join(root, "backups", metadataBackup), "utf8")) as { sourceVersion: number; targetVersion: number; sha256: string };
-    assert.deepEqual({ sourceVersion: metadata.sourceVersion, targetVersion: metadata.targetVersion, hashLength: metadata.sha256.length }, { sourceVersion: 8, targetVersion: 9, hashLength: 64 });
+    assert.deepEqual({ sourceVersion: metadata.sourceVersion, targetVersion: metadata.targetVersion, hashLength: metadata.sha256.length }, { sourceVersion: 8, targetVersion, hashLength: 64 });
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

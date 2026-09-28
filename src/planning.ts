@@ -2,12 +2,17 @@ import { createHash } from "node:crypto";
 
 import {
   CONTRACT_VERSIONS,
+  type InstructionId,
   type PlanningDecision,
   type RunId,
   type TaskId,
+  type ValidationLevel,
   asDecisionId,
+  asInstructionId,
   parsePlanningDecision,
+  parseSteerText,
 } from "./contracts.js";
+import { KerbsFlowError } from "./errors.js";
 
 export interface Phase2ActionInput {
   decisionId: string;
@@ -78,3 +83,123 @@ export function buildExecutorPrompt(decision: PlanningDecision): string {
 }
 
 export const buildCodexPrompt = buildExecutorPrompt;
+
+export interface PlanningSteerObservation {
+  instructionId: InstructionId | null;
+  text: string | null;
+}
+
+export function noneSteerObservation(): PlanningSteerObservation {
+  return { instructionId: null, text: null };
+}
+
+export function parsePlanningSteerObservation(value: unknown, path = "observedSteer"): PlanningSteerObservation {
+  if (value === undefined) {
+    return noneSteerObservation();
+  }
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path} must be an object with instructionId and text`);
+  }
+  const record = value as Record<string, unknown>;
+  const keys = new Set(Object.keys(record));
+  for (const key of keys) {
+    if (key !== "instructionId" && key !== "text") {
+      throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path}.${key} is an unknown field`);
+    }
+  }
+  const rawId = record.instructionId ?? null;
+  const rawText = record.text ?? null;
+  if (rawId === null || rawId === undefined) {
+    if (rawText !== null && rawText !== undefined) {
+      throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path} cannot carry text without an instruction ID`);
+    }
+    return noneSteerObservation();
+  }
+  if (typeof rawId !== "string") {
+    throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path}.instructionId must be a string`);
+  }
+  let instructionId: InstructionId;
+  try {
+    instructionId = asInstructionId(rawId);
+  } catch {
+    throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path}.instructionId is not a valid instruction ID`);
+  }
+  if (typeof rawText !== "string") {
+    throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path}.text must be bounded instruction text when an instruction is observed`);
+  }
+  try {
+    parseSteerText(rawText, `${path}.text`);
+  } catch {
+    throw new KerbsFlowError("PLANNING_STEER_INVALID", `${path}.text must be non-empty and at most 4096 UTF-8 bytes`);
+  }
+  return { instructionId, text: rawText };
+}
+
+export interface InitialPlanningInput {
+  runId: RunId;
+  taskId: TaskId;
+  objective: string;
+  steer: PlanningSteerObservation;
+}
+
+export interface ReworkFailureContext {
+  failureClass: string;
+  reasonCode: string;
+  summary: string;
+}
+
+export interface ReworkPlanningInput {
+  runId: RunId;
+  taskId: TaskId;
+  priorDecision: PlanningDecision;
+  failure: ReworkFailureContext;
+  steer: PlanningSteerObservation;
+}
+
+export interface PlanningMaster {
+  planInitial(input: InitialPlanningInput): PlanningDecision | Promise<PlanningDecision>;
+  planRework(input: ReworkPlanningInput): PlanningDecision | Promise<PlanningDecision>;
+}
+
+export function assertReworkDecisionBounds(prior: PlanningDecision, corrected: PlanningDecision, allowedAdapters: readonly string[]): void {
+  if (corrected.runId !== prior.runId || corrected.taskId !== prior.taskId) {
+    throw new KerbsFlowError("REWORK_SCOPE_MISMATCH", "rework must preserve run and task identity without a human gate");
+  }
+  if (corrected.canonicalContextHash !== prior.canonicalContextHash) {
+    throw new KerbsFlowError("REWORK_CANONICAL_DRIFT", "rework must preserve the canonical context binding without a human gate");
+  }
+  if (corrected.policyVersion !== prior.policyVersion) {
+    throw new KerbsFlowError("REWORK_POLICY_MISMATCH", "rework must preserve the policy version without a human gate");
+  }
+  if (JSON.stringify(corrected.action.acceptance) !== JSON.stringify(prior.action.acceptance)) {
+    throw new KerbsFlowError("REWORK_ACCEPTANCE_CHANGED", "rework must preserve acceptance criteria without a human gate");
+  }
+  if (JSON.stringify(corrected.action.negativeScope) !== JSON.stringify(prior.action.negativeScope)) {
+    throw new KerbsFlowError("REWORK_NEGATIVE_SCOPE_CHANGED", "rework must preserve negative scope without a human gate");
+  }
+  if (validationRank(corrected.action.validationLevel) < validationRank(prior.action.validationLevel)) {
+    throw new KerbsFlowError("REWORK_VALIDATION_WEAKENED", "rework must not weaken the validation level without a human gate");
+  }
+  if (JSON.stringify(corrected.requiredCapabilities) !== JSON.stringify(prior.requiredCapabilities)) {
+    throw new KerbsFlowError("REWORK_CAPABILITIES_CHANGED", "rework must preserve required capabilities without a human gate");
+  }
+  if (JSON.stringify(corrected.selectedSkills) !== JSON.stringify(prior.selectedSkills)) {
+    throw new KerbsFlowError("REWORK_SKILLS_CHANGED", "rework must preserve selected skills without a human gate");
+  }
+  const priorScope = new Set(prior.action.positiveScope);
+  for (const entry of corrected.action.positiveScope) {
+    if (!priorScope.has(entry)) {
+      throw new KerbsFlowError("REWORK_SCOPE_BROADENED", "rework must not broaden positive scope without a human gate");
+    }
+  }
+  if (corrected.action.kind !== prior.action.kind && corrected.action.kind !== "rework") {
+    throw new KerbsFlowError("REWORK_KIND_INVALID", "a corrected rework decision may only retain its action kind or move to rework");
+  }
+  if (!allowedAdapters.includes(corrected.route.adapter)) {
+    throw new KerbsFlowError("ROUTE_NOT_ALLOWED", `adapter ${corrected.route.adapter} is not enabled by project policy`);
+  }
+}
+
+function validationRank(level: ValidationLevel): number {
+  return level === "focused" ? 1 : level === "phase" ? 2 : 3;
+}

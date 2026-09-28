@@ -22,10 +22,12 @@ import {
   asAttemptId,
   asCommandId,
   asGateId,
+  asInstructionId,
   asReviewId,
   asRunId,
   asTaskId,
   asValidationId,
+  isTerminalState,
   parseAdapterDescriptor,
   parseExecutorResult,
   parseExecutionRequest,
@@ -35,6 +37,7 @@ import {
   parsePlanningDecision,
   parseRecoveryDecision,
   parseReviewDecision,
+  parseSteerText,
   parseValidationBundle,
   parseCommand,
   canonicalJson,
@@ -75,6 +78,12 @@ import {
   EffectiveConfiguration,
   mergeConfiguration,
 } from "./contracts.js";
+import { containsLikelySecret, SENSITIVE_RESULT_REJECTION } from "./secrets.js";
+import {
+  assertReworkDecisionBounds,
+  parsePlanningSteerObservation,
+  type PlanningSteerObservation,
+} from "./planning.js";
 
 export interface CoreOptions {
   store: StateStore;
@@ -186,8 +195,56 @@ export class KerbsFlowCore {
     });
   }
 
-  plan(runId: RunId, expectedStateVersion: number, idempotencyKey: string, value: unknown): CommandResult {
+  steer(runId: RunId, expectedStateVersion: number, idempotencyKey: string, text: string, commandId?: CommandId): CommandResult {
+    const parsedText = parseSteerText(text, "text");
+    if (containsLikelySecret(parsedText)) {
+      throw new KerbsFlowError("STEER_SECRET_REJECTED", SENSITIVE_RESULT_REJECTION);
+    }
+    const command = parseCommand({
+      schemaVersion: CONTRACT_VERSIONS.command,
+      commandId: commandId ?? this.nextCommandId(),
+      idempotencyKey,
+      runId,
+      expectedStateVersion,
+      kind: "steer",
+      text: parsedText,
+    });
+    if (command.kind !== "steer") {
+      throw new KerbsFlowError("INTERNAL_COMMAND_ERROR", "steer command did not parse as steer");
+    }
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (isTerminalState(run.state)) {
+        throw new KerbsFlowError("STEER_TERMINAL", `cannot steer terminal run at ${run.state}`);
+      }
+      if (containsLikelySecret(command.text)) {
+        throw new KerbsFlowError("STEER_SECRET_REJECTED", SENSITIVE_RESULT_REJECTION);
+      }
+      const pending = tx.get("SELECT instruction_id FROM steer_instructions WHERE run_id = ? AND consumed_at IS NULL", runId) as Record<string, unknown> | undefined;
+      if (pending !== undefined) {
+        throw new KerbsFlowError("STEER_PENDING_EXISTS", `run ${runId} already has a pending steer instruction`);
+      }
+      const instructionId = asInstructionId(nextId("instruction"));
+      tx.run(
+        "INSERT INTO steer_instructions (instruction_id, run_id, command_id, text, actor, created_at, consumed_at, planning_command_id, planning_decision_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        instructionId,
+        runId,
+        command.commandId,
+        command.text,
+        "human",
+        now,
+        null,
+        null,
+        null,
+      );
+      return {
+        details: { instructionId, pending: true },
+      } satisfies CommandMutation;
+    });
+  }
+
+  plan(runId: RunId, expectedStateVersion: number, idempotencyKey: string, value: unknown, observedSteer?: unknown): CommandResult {
     const decision = parsePlanningDecision(value);
+    const observation = parsePlanningSteerObservation(observedSteer);
     if (decision.runId !== runId) {
       throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "planning decision runId does not match the command run");
     }
@@ -199,6 +256,7 @@ export class KerbsFlowCore {
       if (run.state !== "PLAN") {
         throw new KerbsFlowError("INVALID_COMMAND_STATE", `planning requires PLAN, found ${run.state}`);
       }
+      this.consumeObservedSteer(tx, runId, observation, command.commandId, decision.decisionId, now);
       const existing = tx.get("SELECT task_id FROM tasks WHERE task_id = ?", decision.taskId) as Record<string, unknown> | undefined;
       if (existing === undefined) {
         tx.run(
@@ -863,20 +921,22 @@ export class KerbsFlowCore {
     });
   }
 
-  reworkToReady(runId: RunId, expectedStateVersion: number, idempotencyKey: string, routeDecision?: unknown): CommandResult {
-    const decision = routeDecision === undefined ? undefined : parsePlanningDecision(routeDecision);
-    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "READY", "core", "rework_action_ready", { target: "READY", ...(decision === undefined ? {} : { route: decision.route }) });
+  reworkToReady(runId: RunId, expectedStateVersion: number, idempotencyKey: string, routeDecision?: unknown, observedSteer?: unknown): CommandResult {
+    const corrected = routeDecision === undefined ? undefined : parsePlanningDecision(routeDecision);
+    const observation = parsePlanningSteerObservation(observedSteer);
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "READY", "core", "rework_action_ready", { target: "READY", ...(corrected === undefined ? {} : { route: corrected.route }) });
     return this.store.executeCommand(command, ({ tx, run, now }) => {
       if (run.state !== "REWORK" || run.currentTaskId === null) {
         throw new KerbsFlowError("INVALID_COMMAND_STATE", "rework readiness requires REWORK with a current task");
       }
       const task = this.taskInTransaction(tx, run.currentTaskId);
-      if (decision !== undefined) {
-        if (decision.runId !== runId || decision.taskId !== task.taskId || canonicalJson({ ...decision, route: task.decision.route }) !== canonicalJson(task.decision)) {
-          throw new KerbsFlowError("ESCALATION_SCOPE_MISMATCH", "rework escalation may change only adapter/model/reasoning route metadata");
-        }
+      const finalDecision = corrected ?? task.decision;
+      if (finalDecision.runId !== runId || finalDecision.taskId !== task.taskId) {
+        throw new KerbsFlowError("REWORK_SCOPE_MISMATCH", "rework decision does not match the persisted run and task");
       }
-      tx.run("UPDATE tasks SET status = ?, decision_json = ?, updated_at = ? WHERE task_id = ?", "ready", JSON.stringify(decision ?? task.decision), now, run.currentTaskId);
+      assertReworkDecisionBounds(task.decision, finalDecision, this.configuration.projectPolicy.allowedAdapters);
+      this.consumeObservedSteer(tx, runId, observation, command.commandId, finalDecision.decisionId, now);
+      tx.run("UPDATE tasks SET status = ?, decision_json = ?, updated_at = ? WHERE task_id = ?", "ready", JSON.stringify(finalDecision), now, run.currentTaskId);
       return {
         transition: { to: "READY", actor: "core", reasonCode: "rework_action_ready", taskId: run.currentTaskId, payload: { target: "READY" } },
         runPatch: { recoveryRequired: false, recoveryReason: null },
@@ -1359,6 +1419,41 @@ export class KerbsFlowCore {
 
   private nextCommandId(): ReturnType<typeof asCommandId> {
     return asCommandId(this.ids.next("command"));
+  }
+
+  private consumeObservedSteer(
+    tx: SqlTransaction,
+    runId: RunId,
+    observation: PlanningSteerObservation,
+    planningCommandId: CommandId,
+    planningDecisionId: { toString(): string },
+    now: string,
+  ): void {
+    const pending = tx.get("SELECT instruction_id, text FROM steer_instructions WHERE run_id = ? AND consumed_at IS NULL", runId) as Record<string, unknown> | undefined;
+    if (observation.instructionId === null) {
+      if (pending !== undefined) {
+        throw new KerbsFlowError("PLANNING_STEER_STALE", "planning observed no steer instruction but a pending instruction exists");
+      }
+      return;
+    }
+    if (pending === undefined) {
+      throw new KerbsFlowError("PLANNING_STEER_STALE", `planning observed ${observation.instructionId} but no pending steer instruction exists`);
+    }
+    const currentId = String(pending.instruction_id);
+    const currentText = String(pending.text);
+    if (currentId !== observation.instructionId || (observation.text !== null && observation.text !== currentText)) {
+      throw new KerbsFlowError("PLANNING_STEER_STALE", "planning observed a stale steer instruction");
+    }
+    const result = tx.run(
+      "UPDATE steer_instructions SET consumed_at = ?, planning_command_id = ?, planning_decision_id = ? WHERE instruction_id = ? AND consumed_at IS NULL",
+      now,
+      planningCommandId,
+      String(planningDecisionId),
+      currentId,
+    );
+    if (result.changes !== 1 && result.changes !== 1n) {
+      throw new KerbsFlowError("PLANNING_STEER_STALE", "steer instruction was consumed concurrently");
+    }
   }
 
   private requiredModel(runId: RunId): ReadModel {

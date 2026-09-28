@@ -8,7 +8,9 @@ import {
   CONTRACT_VERSIONS,
   Command,
   CommandResult,
+  DecisionId,
   IdPrefix,
+  InstructionId,
   JsonValue,
   PauseContract,
   PlanningDecision,
@@ -29,7 +31,9 @@ import {
   asArtifactId,
   asAttemptId,
   asCommandId,
+  asDecisionId,
   asGateId,
+  asInstructionId,
   asRunId,
   asTaskId,
   asTransitionId,
@@ -384,6 +388,29 @@ export const MIGRATIONS: readonly Migration[] = [
         CHECK (retention_category IN ('active_run', 'retained_failure_recovery', 'terminal_clean_eligible', 'public_synthetic_fixture'));
     `,
   },
+  {
+    version: 10,
+    name: "phase6c-steer-instructions",
+    sql: `
+      CREATE TABLE steer_instructions (
+        instruction_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        command_id TEXT NOT NULL UNIQUE,
+        text TEXT NOT NULL CHECK (length(CAST(text AS BLOB)) BETWEEN 1 AND 4096),
+        actor TEXT NOT NULL CHECK (actor = 'human'),
+        created_at TEXT NOT NULL,
+        consumed_at TEXT,
+        planning_command_id TEXT,
+        planning_decision_id TEXT,
+        CHECK (
+          (consumed_at IS NULL AND planning_command_id IS NULL AND planning_decision_id IS NULL)
+          OR (consumed_at IS NOT NULL AND planning_command_id IS NOT NULL AND planning_decision_id IS NOT NULL)
+        )
+      ) STRICT;
+
+      CREATE UNIQUE INDEX steer_one_pending_per_run_idx ON steer_instructions(run_id) WHERE consumed_at IS NULL;
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -602,6 +629,18 @@ export interface StoredGate {
   resolvedAt: string | null;
 }
 
+export interface StoredSteerInstruction {
+  instructionId: InstructionId;
+  runId: RunId;
+  commandId: CommandId;
+  text: string;
+  actor: "human";
+  createdAt: string;
+  consumedAt: string | null;
+  planningCommandId: CommandId | null;
+  planningDecisionId: DecisionId | null;
+}
+
 export interface ReadModel {
   run: StoredRun;
   currentTask?: StoredTask;
@@ -760,6 +799,20 @@ export class StateStore {
   getGate(gateId: GateId): StoredGate | undefined {
     this.assertOpen();
     return this.readGate(this.db.prepare("SELECT * FROM human_gates WHERE gate_id = ?").get(gateId) as Row | undefined);
+  }
+
+  getPendingSteerInstruction(runId: RunId): StoredSteerInstruction | undefined {
+    this.assertOpen();
+    const safeRunId = asRunId(runId);
+    const row = this.db.prepare("SELECT * FROM steer_instructions WHERE run_id = ? AND consumed_at IS NULL").get(safeRunId) as Row | undefined;
+    return row === undefined ? undefined : parseSteerInstructionRow(row);
+  }
+
+  getSteerInstruction(instructionId: InstructionId): StoredSteerInstruction | undefined {
+    this.assertOpen();
+    const safeId = asInstructionId(instructionId);
+    const row = this.db.prepare("SELECT * FROM steer_instructions WHERE instruction_id = ?").get(safeId) as Row | undefined;
+    return row === undefined ? undefined : parseSteerInstructionRow(row);
   }
 
   getWorktree(runId: RunId): StoredWorktree | undefined {
@@ -2080,6 +2133,30 @@ function parseGateRow(row: Row): StoredGate {
     gate: parseHumanGate(JSON.parse(stringValue(row.gate_json, "human_gates.gate_json")), "human_gates.gate_json"),
     createdAt: stringValue(row.created_at, "human_gates.created_at"),
     resolvedAt: nullableString(row.resolved_at, "human_gates.resolved_at"),
+  };
+}
+
+function parseSteerInstructionRow(row: Row): StoredSteerInstruction {
+  const consumedAt = nullableString(row.consumed_at, "steer_instructions.consumed_at");
+  const planningCommandId = nullableString(row.planning_command_id, "steer_instructions.planning_command_id");
+  const planningDecisionId = nullableString(row.planning_decision_id, "steer_instructions.planning_decision_id");
+  if ((consumedAt === null) !== (planningCommandId === null) || (consumedAt === null) !== (planningDecisionId === null)) {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "steer consumption columns must be all NULL or all non-NULL");
+  }
+  const actor = stringValue(row.actor, "steer_instructions.actor");
+  if (actor !== "human") {
+    throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "steer actor must be human");
+  }
+  return {
+    instructionId: asInstructionId(stringValue(row.instruction_id, "steer_instructions.instruction_id")),
+    runId: asRunId(stringValue(row.run_id, "steer_instructions.run_id")),
+    commandId: asCommandId(stringValue(row.command_id, "steer_instructions.command_id")),
+    text: stringValue(row.text, "steer_instructions.text"),
+    actor: "human",
+    createdAt: stringValue(row.created_at, "steer_instructions.created_at"),
+    consumedAt,
+    planningCommandId: planningCommandId === null ? null : asCommandId(planningCommandId),
+    planningDecisionId: planningDecisionId === null ? null : asDecisionId(planningDecisionId),
   };
 }
 

@@ -5,6 +5,7 @@ export const CONTRACT_VERSIONS = {
   commandResult: "kerbsflow.command-result/v1",
   pause: "kerbsflow.pause-contract/v1",
   planningDecision: "kerbsflow.planning-decision/v1",
+  steerInstruction: "kerbsflow.steer-instruction/v1",
   adapterDescriptor: "kerbsflow.adapter-descriptor/v1",
   normalizedEvent: "kerbsflow.normalized-event/v1",
   executionRequest: "kerbsflow.execution-request/v1",
@@ -45,6 +46,7 @@ export type GateId = BrandedId<"GateId">;
 export type TransitionId = BrandedId<"TransitionId">;
 export type CommandId = BrandedId<"CommandId">;
 export type DecisionId = BrandedId<"DecisionId">;
+export type InstructionId = BrandedId<"InstructionId">;
 export type ValidationId = BrandedId<"ValidationId">;
 export type ReviewId = BrandedId<"ReviewId">;
 
@@ -57,6 +59,7 @@ const ID_PREFIXES = {
   transition: "transition_",
   command: "command_",
   decision: "decision_",
+  instruction: "instruction_",
   validation: "validation_",
   review: "review_",
 } as const;
@@ -98,6 +101,10 @@ export function asCommandId(value: string): CommandId {
 
 export function asDecisionId(value: string): DecisionId {
   return asId(value, ID_PREFIXES.decision, "decisionId") as DecisionId;
+}
+
+export function asInstructionId(value: string): InstructionId {
+  return asId(value, ID_PREFIXES.instruction, "instructionId") as InstructionId;
 }
 
 export function asValidationId(value: string): ValidationId {
@@ -208,7 +215,7 @@ export function parseActor(value: unknown, path = "actor"): Actor {
   throw new ContractValidationError(path, "unknown actor");
 }
 
-export type CommandKind = "start" | "transition" | "pause" | "resume" | "cancel" | "begin_attempt" | "complete_attempt" | "validation" | "review" | "phase" | "gate_resolution" | "recovery";
+export type CommandKind = "start" | "transition" | "pause" | "resume" | "cancel" | "steer" | "begin_attempt" | "complete_attempt" | "validation" | "review" | "phase" | "gate_resolution" | "recovery";
 
 export interface CommandBase {
   schemaVersion: typeof CONTRACT_VERSIONS.command;
@@ -244,12 +251,19 @@ export interface CancelCommand extends CommandBase {
   reason: string;
 }
 
+export const STEER_TEXT_MAX_UTF8_BYTES = 4096;
+
+export interface SteerCommand extends CommandBase {
+  kind: "steer";
+  text: string;
+}
+
 export interface SpecializedCommand extends CommandBase {
-  kind: Exclude<CommandKind, "start" | "transition" | "pause" | "resume" | "cancel">;
+  kind: Exclude<CommandKind, "start" | "transition" | "pause" | "resume" | "cancel" | "steer">;
   payload: JsonValue;
 }
 
-export type Command = TransitionCommand | StartCommand | PauseCommand | ResumeCommand | CancelCommand | SpecializedCommand;
+export type Command = TransitionCommand | StartCommand | PauseCommand | ResumeCommand | CancelCommand | SteerCommand | SpecializedCommand;
 
 export interface CommandResult {
   schemaVersion: typeof CONTRACT_VERSIONS.commandResult;
@@ -739,6 +753,9 @@ export function parseCommand(value: unknown, path = "command"): Command {
     case "cancel":
       assertKeys(object, ["schemaVersion", "commandId", "idempotencyKey", "runId", "expectedStateVersion", "kind", "reason"], path);
       return { ...base, kind, reason: boundedString(object.reason, `${path}.reason`, 1000) };
+    case "steer":
+      assertKeys(object, ["schemaVersion", "commandId", "idempotencyKey", "runId", "expectedStateVersion", "kind", "text"], path);
+      return { ...base, kind, text: parseSteerText(object.text, `${path}.text`) };
     case "begin_attempt":
     case "complete_attempt":
     case "validation":
@@ -1448,6 +1465,17 @@ function requiredString(object: Record<string, unknown>, key: string, path: stri
 function boundedString(value: unknown, path: string, maxLength: number): string {
   if (typeof value !== "string" || value.length === 0 || value.length > maxLength) {
     throw new ContractValidationError(path, `must be a non-empty string of at most ${maxLength} characters`);
+  }
+  return value;
+}
+
+export function parseSteerText(value: unknown, path = "text"): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ContractValidationError(path, "must be a non-empty string");
+  }
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength > STEER_TEXT_MAX_UTF8_BYTES) {
+    throw new ContractValidationError(path, `must be at most ${STEER_TEXT_MAX_UTF8_BYTES} UTF-8 bytes`);
   }
   return value;
 }

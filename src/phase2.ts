@@ -14,7 +14,12 @@ import { KerbsFlowCore } from "./core.js";
 import { KerbsFlowError } from "./errors.js";
 import { GitWorktreeManager, type RepositoryIntake, type WorktreeRecord } from "./git.js";
 import { FailurePolicyCoordinator, escalatePlanningRoute } from "./phase3.js";
-import { buildExecutorPrompt } from "./planning.js";
+import {
+  buildExecutorPrompt,
+  noneSteerObservation,
+  type PlanningMaster,
+  type PlanningSteerObservation,
+} from "./planning.js";
 import {
   PHASE4_ROUTING_POLICY,
   assertTrustedRoutingDecision,
@@ -63,6 +68,7 @@ export class Phase2Loop {
     private readonly verifier: FocusedVerifier,
     private readonly ids: IdSource,
     private readonly semanticReviewer?: IndependentSemanticReviewer,
+    private readonly planningMaster?: PlanningMaster,
   ) {}
 
   async run(request: Phase2LoopRequest): Promise<Phase2LoopResult> {
@@ -84,9 +90,10 @@ export class Phase2Loop {
     command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     const worktree = this.git.create(intake, request.runId);
     this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
-    command = this.core.plan(request.runId, command.stateVersion, `${request.runId}:plan`, request.planningDecision);
+    const planned = await this.acceptInitialPlan(request, command.stateVersion);
+    command = planned.command;
     if (request.routingDecision !== undefined) this.store.recordRoutingDecision(request.routingDecision);
-    let decision = request.planningDecision;
+    let decision = planned.decision;
     let attempts = 0;
     let nextSelectionReason = request.routingDecision?.selectionReason ?? "pre-Phase-4 planning route";
     let nextEscalationReason: string | undefined;
@@ -139,7 +146,9 @@ export class Phase2Loop {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after focused verification`;
         }
-        command = this.core.reworkToReady(request.runId, command.stateVersion, `${request.runId}:continue:${attempts}`, decision);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: focused.bundle.summary }, `${request.runId}:continue:${attempts}`);
+        command = reworked.command;
+        decision = reworked.decision;
         continue;
       }
 
@@ -181,7 +190,9 @@ export class Phase2Loop {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after phase verification`;
         }
-        command = this.core.reworkToReady(request.runId, command.stateVersion, `${request.runId}:phase-continue:${attempts}`, decision);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: phase.verification.bundle.summary }, `${request.runId}:phase-continue:${attempts}`);
+        command = reworked.command;
+        decision = reworked.decision;
         continue;
       }
 
@@ -256,6 +267,62 @@ export class Phase2Loop {
 
   private policyTerminalResult(state: string, intake: RepositoryIntake, worktree: WorktreeRecord, executorResult: ExecutorResult, verification: FocusedVerificationResult, attempts: number, stateVersion: number): Phase2LoopResult | undefined {
     return state === "REWORK" ? undefined : { verdict: state === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification, attempts, stateVersion };
+  }
+
+  private observeSteer(runId: RunId): PlanningSteerObservation {
+    const pending = this.store.getPendingSteerInstruction(runId);
+    if (pending === undefined) {
+      return noneSteerObservation();
+    }
+    return { instructionId: pending.instructionId, text: pending.text };
+  }
+
+  private async acceptInitialPlan(request: Phase2LoopRequest, stateVersion: number): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision }> {
+    if (this.planningMaster === undefined) {
+      const command = this.core.plan(request.runId, stateVersion, `${request.runId}:plan`, request.planningDecision);
+      return { command, decision: request.planningDecision };
+    }
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const steer = this.observeSteer(request.runId);
+      const decision = await this.planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer });
+      try {
+        const command = this.core.plan(request.runId, stateVersion, attempt === 0 ? `${request.runId}:plan` : `${request.runId}:plan:retry`, decision, { instructionId: steer.instructionId, text: steer.text });
+        return { command, decision };
+      } catch (error) {
+        if (!(error instanceof KerbsFlowError) || error.code !== "PLANNING_STEER_STALE") throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private async acceptRework(
+    request: Phase2LoopRequest,
+    stateVersion: number,
+    baseDecision: PlanningDecision,
+    failure: { failureClass: string; reasonCode: string; summary: string },
+    idempotencyKey: string,
+  ): Promise<{ command: ReturnType<KerbsFlowCore["reworkToReady"]>; decision: PlanningDecision }> {
+    if (this.planningMaster === undefined) {
+      const command = this.core.reworkToReady(request.runId, stateVersion, idempotencyKey, baseDecision);
+      const stored = this.store.getTask(request.taskId);
+      return { command, decision: stored?.decision ?? baseDecision };
+    }
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const steer = this.observeSteer(request.runId);
+      const prior = this.store.getTask(request.taskId)?.decision ?? baseDecision;
+      const corrected = await this.planningMaster.planRework({ runId: request.runId, taskId: request.taskId, priorDecision: prior, failure, steer });
+      try {
+        const command = this.core.reworkToReady(request.runId, stateVersion, attempt === 0 ? idempotencyKey : `${idempotencyKey}:retry`, corrected, { instructionId: steer.instructionId, text: steer.text });
+        return { command, decision: corrected };
+      } catch (error) {
+        if (!(error instanceof KerbsFlowError) || error.code !== "PLANNING_STEER_STALE") throw error;
+        lastError = error;
+      }
+    }
+    throw lastError;
   }
 }
 
