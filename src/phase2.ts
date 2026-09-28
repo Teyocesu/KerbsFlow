@@ -15,11 +15,12 @@ import { CanonicalIntentGuard } from "./canonical.js";
 import { KerbsFlowCore } from "./core.js";
 import { KerbsFlowError } from "./errors.js";
 import { GitWorktreeManager, type RepositoryIntake, type WorktreeRecord } from "./git.js";
-import { FailurePolicyCoordinator, escalatePlanningRoute } from "./phase3.js";
+import { FailurePolicyCoordinator, escalatePlanningRoute, type FailureAction } from "./phase3.js";
 import {
   buildExecutorPrompt,
   noneSteerObservation,
   type PlanningMaster,
+  type ReworkFailureContext,
   type PlanningMasterResult,
   type PlanningSteerObservation,
 } from "./planning.js";
@@ -142,17 +143,15 @@ export class Phase2Loop {
         command = this.core.review(request.runId, command.stateVersion, `${request.runId}:focused-policy:${attempts}`, this.reviewForPolicy(request, policy));
         const terminal = this.policyTerminalResult(command.to, intake, worktree, executorResult, focused, attempts, command.stateVersion);
         if (terminal !== undefined) return terminal;
+        const reworkFailure = this.reworkFailureContext(request, policy, focused.bundle.summary);
         if (policy.resultingAction === "escalate") {
-          const higher = request.failurePolicy?.higherCodexRoute;
-          if (higher === undefined) throw new KerbsFlowError("ESCALATION_ROUTE_REQUIRED", "policy selected escalation without an eligible Codex route");
-          decision = escalatePlanningRoute(decision, higher);
-          nextEscalationReason = policy.escalationReason ?? "failure policy selected an eligible higher Codex route";
+          nextEscalationReason = reworkFailure.resultingAction === "escalate" ? reworkFailure.escalationReason : undefined;
           nextSelectionReason = `escalated after ${categoryLabel("focused_verification")}`;
         } else {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after focused verification`;
         }
-        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: focused.bundle.summary }, `${request.runId}:continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, reworkFailure, `${request.runId}:continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
         command = reworked.command;
         decision = reworked.decision;
         currentRoutingDecision = reworked.routingDecision;
@@ -188,17 +187,15 @@ export class Phase2Loop {
         command = this.core.applyPhaseFailurePolicy(request.runId, command.stateVersion, `${request.runId}:phase-policy:${attempts}`, policy.fingerprint);
         const terminal = this.policyTerminalResult(command.to, intake, worktree, executorResult, phase.verification, attempts, command.stateVersion);
         if (terminal !== undefined) return terminal;
+        const reworkFailure = this.reworkFailureContext(request, policy, phase.verification.bundle.summary);
         if (policy.resultingAction === "escalate") {
-          const higher = request.failurePolicy?.higherCodexRoute;
-          if (higher === undefined) throw new KerbsFlowError("ESCALATION_ROUTE_REQUIRED", "policy selected escalation without an eligible Codex route");
-          decision = escalatePlanningRoute(decision, higher);
-          nextEscalationReason = policy.escalationReason ?? "failure policy selected an eligible higher Codex route";
+          nextEscalationReason = reworkFailure.resultingAction === "escalate" ? reworkFailure.escalationReason : undefined;
           nextSelectionReason = `escalated after ${categoryLabel("phase_verification")}`;
         } else {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after phase verification`;
         }
-        const reworked = await this.acceptRework(request, command.stateVersion, decision, { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary: phase.verification.bundle.summary }, `${request.runId}:phase-continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, reworkFailure, `${request.runId}:phase-continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
         command = reworked.command;
         decision = reworked.decision;
         currentRoutingDecision = reworked.routingDecision;
@@ -333,6 +330,26 @@ export class Phase2Loop {
     return { instructionId: pending.instructionId, text: pending.text };
   }
 
+  private reworkFailureContext(request: Phase2LoopRequest, policy: StoredFailureOccurrence, summary: string): ReworkFailureContext {
+    const resultingAction = parseFailureAction(policy.resultingAction);
+    const base = { failureClass: policy.failureClass, reasonCode: policy.reasonCode, summary };
+    if (resultingAction === "escalate") {
+      const higher = request.failurePolicy?.higherCodexRoute;
+      if (higher === undefined) throw new KerbsFlowError("ESCALATION_ROUTE_REQUIRED", "policy selected escalation without an eligible Codex route");
+      return Object.freeze({
+        ...base,
+        resultingAction,
+        escalationReason: policy.escalationReason ?? "failure policy selected an eligible higher Codex route",
+        requiredRoute: Object.freeze({
+          adapter: "codex" as const,
+          model: higher.model,
+          ...(higher.reasoning === undefined ? {} : { reasoning: higher.reasoning }),
+        }),
+      });
+    }
+    return Object.freeze({ ...base, resultingAction });
+  }
+
   private async acceptInitialPlan(request: Phase2LoopRequest, stateVersion: number): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
     if (this.planningMaster === undefined) {
       if (request.planningDecision === undefined) throw new KerbsFlowError("PLANNING_DECISION_REQUIRED", "legacy Phase2Loop requests require a precomputed planning decision");
@@ -367,7 +384,7 @@ export class Phase2Loop {
     request: Phase2LoopRequest,
     stateVersion: number,
     baseDecision: PlanningDecision,
-    failure: { failureClass: string; reasonCode: string; summary: string },
+    failure: ReworkFailureContext,
     idempotencyKey: string,
     currentRoutingDecision: TrustedRoutingDecision | undefined,
     selectionReason: string,
@@ -375,6 +392,10 @@ export class Phase2Loop {
     if (this.planningMaster === undefined) {
       let decision = parsePlanningDecision(baseDecision);
       this.assertPlanningIdentity(decision, request);
+      if (failure.resultingAction === "escalate") {
+        decision = escalatePlanningRoute(decision, failure.requiredRoute);
+      }
+      assertFailurePolicyRoute(baseDecision, decision, failure);
       let routingDecision = currentRoutingDecision;
       if (routingDecision !== undefined && !routingMatchesPlanningDecision(routingDecision, decision)) {
         if (decision.decisionId === routingDecision.planningDecisionId) {
@@ -392,7 +413,7 @@ export class Phase2Loop {
       return { command, decision: acceptedDecision, ...(routingDecision === undefined ? {} : { routingDecision }) };
     }
     let lastError: unknown;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
       const steer = this.observeSteer(request.runId);
       const prior = this.store.getTask(request.taskId)?.decision ?? baseDecision;
       const result = parsePlanningMasterResult(await this.planningMaster.planRework({ runId: request.runId, taskId: request.taskId, priorDecision: prior, failure, steer }));
@@ -406,15 +427,45 @@ export class Phase2Loop {
       this.assertRoutingForPlanningDecision(corrected, routingDecision);
       this.assertRoutingDecisionCanBePersisted(routingDecision);
       try {
-        const command = this.core.reworkToReady(request.runId, stateVersion, attempt === 0 ? idempotencyKey : `${idempotencyKey}:retry`, corrected, { instructionId: steer.instructionId, text: steer.text });
+        assertFailurePolicyRoute(prior, corrected, failure);
+        const attemptIdempotencyKey = attempt === 0 ? idempotencyKey : attempt === 1 ? `${idempotencyKey}:retry` : `${idempotencyKey}:retry:${attempt}`;
+        const command = this.core.reworkToReady(request.runId, stateVersion, attemptIdempotencyKey, corrected, { instructionId: steer.instructionId, text: steer.text });
         return { command, decision: corrected, ...(routingDecision === undefined ? {} : { routingDecision }) };
       } catch (error) {
-        if (!(error instanceof KerbsFlowError) || error.code !== "PLANNING_STEER_STALE") throw error;
+        if (!(error instanceof KerbsFlowError) || (error.code !== "PLANNING_STEER_STALE" && error.code !== "PLANNING_FAILURE_POLICY_ROUTE_MISMATCH")) throw error;
         lastError = error;
       }
     }
     throw lastError;
   }
+}
+
+function parseFailureAction(value: string): FailureAction {
+  switch (value) {
+    case "retry_same_route":
+    case "rework":
+    case "escalate":
+    case "human_gate":
+    case "failed":
+      return value;
+    default:
+      throw new KerbsFlowError("FAILURE_POLICY_ACTION_INVALID", `failure policy returned unsupported action ${value}`);
+  }
+}
+
+function assertFailurePolicyRoute(prior: PlanningDecision, corrected: PlanningDecision, failure: ReworkFailureContext): void {
+  const requiredRoute = failure.resultingAction === "escalate"
+    ? failure.requiredRoute
+    : failure.resultingAction === "retry_same_route"
+      ? prior.route
+      : undefined;
+  if (requiredRoute !== undefined && !samePlanningRoute(corrected.route, requiredRoute)) {
+    throw new KerbsFlowError("PLANNING_FAILURE_POLICY_ROUTE_MISMATCH", `rework must use the exact route required by ${failure.resultingAction} failure policy`);
+  }
+}
+
+function samePlanningRoute(left: PlanningDecision["route"], right: { adapter: string; model: string; reasoning?: string }): boolean {
+  return left.adapter === right.adapter && left.model === right.model && left.reasoning === right.reasoning;
 }
 
 function parsePlanningMasterResult(value: unknown): PlanningMasterResult {

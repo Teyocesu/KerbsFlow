@@ -130,7 +130,7 @@ test("the real Phase 4 loop persists distinct OpenCode and Codex escalation prov
   }
 });
 
-test("Planning Master retries stale Steer and carries current Phase 4 authority through rework escalation", async () => {
+test("Planning Master retries stale Steer and enforces Phase 4 rework escalation authority", async () => {
   const repository = createGitRepository();
   const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-phase4-planning-master-"));
   const ids = new SequenceIdSource("phase4_planning_master");
@@ -173,7 +173,7 @@ test("Planning Master retries stale Steer and carries current Phase 4 authority 
   };
   const initialStale = routeDecision("decision_pm_initial_stale", "implementation", "normal");
   const initialAccepted = routeDecision("decision_pm_initial_accepted", "implementation", "normal");
-  const reworkStale = routeDecision("decision_pm_rework_stale", "rework", "difficult");
+  const reworkStaysOnCurrentRoute = routeDecision("decision_pm_rework_same_route", "rework", "normal");
   const reworkAccepted = routeDecision("decision_pm_rework_accepted", "rework", "difficult");
   let initialCalls = 0;
   let reworkCalls = 0;
@@ -197,14 +197,35 @@ test("Planning Master retries stale Steer and carries current Phase 4 authority 
       assert.equal(input.priorDecision.decisionId, initialAccepted.planningDecision.decisionId);
       assert.equal(input.failure.failureClass, "invariant_violation");
       assert.match(input.failure.summary, /failed|invariant/i);
+      assert.equal(input.failure.resultingAction, "escalate");
+      assert.equal(input.failure.escalationReason, "invariant_violation_escalation");
+      assert.deepEqual(input.failure.requiredRoute, { adapter: "codex", model: "fixture-model", reasoning: "high" });
       if (reworkCalls === 1) {
         assert.deepEqual(input.steer, { instructionId: null, text: null });
+        assert.deepEqual(reworkStaysOnCurrentRoute.planningDecision.route, initialAccepted.planningDecision.route);
+        return { decision: reworkStaysOnCurrentRoute.planningDecision, routingDecision: reworkStaysOnCurrentRoute.routingDecision };
+      }
+      if (reworkCalls === 2) {
+        assert.deepEqual(input.steer, { instructionId: null, text: null });
+        assert.equal(store.getRun(runId)?.state, "REWORK");
+        assert.equal(store.getTask(taskId)?.decision.decisionId, initialAccepted.planningDecision.decisionId);
+        assert.equal(store.listTaskAttempts(runId, taskId).length, 1, "the rejected old-route decision must not prepare a second attempt");
+        assert.equal(store.getRoutingDecision(reworkStaysOnCurrentRoute.planningDecision.decisionId), undefined);
+        assert.deepEqual(store.listFailureOccurrences(runId, taskId).map((failure) => failure.resultingAction), ["escalate"]);
         const command = core.steer(runId, store.getRun(runId)!.stateVersion, "pm:steer:rework", "escalate only within the existing approved scope");
         reworkSteerId = asInstructionId((command.details as { instructionId: string }).instructionId);
-        return { decision: reworkStale.planningDecision, routingDecision: reworkStale.routingDecision };
+        return { decision: reworkAccepted.planningDecision, routingDecision: reworkAccepted.routingDecision };
       }
       assert.equal(input.steer.instructionId, reworkSteerId);
       assert.equal(input.steer.text, "escalate only within the existing approved scope");
+      assert.equal(store.getRun(runId)?.state, "REWORK");
+      assert.equal(store.getTask(taskId)?.decision.decisionId, initialAccepted.planningDecision.decisionId);
+      assert.equal(store.listTaskAttempts(runId, taskId).length, 1, "the non-escalated decision must not prepare a second attempt");
+      assert.equal(store.getRoutingDecision(reworkStaysOnCurrentRoute.planningDecision.decisionId), undefined);
+      assert.equal(store.getRoutingDecision(reworkAccepted.planningDecision.decisionId), undefined);
+      assert.deepEqual(store.listFailureOccurrences(runId, taskId).map((failure) => failure.resultingAction), ["escalate"]);
+      assert.deepEqual(reworkAccepted.planningDecision.route, { adapter: "codex", model: "fixture-model", reasoning: "high" });
+      assert.deepEqual(reworkAccepted.routingDecision.selected, { adapter: "codex", provider: "openai", model: "fixture-model", family: "sol", reasoning: "high" });
       return { decision: reworkAccepted.planningDecision, routingDecision: reworkAccepted.routingDecision };
     },
   };
@@ -233,9 +254,9 @@ test("Planning Master retries stale Steer and carries current Phase 4 authority 
     assert.equal(result.verdict, "PASS");
     assert.equal(result.attempts, 2);
     assert.equal(initialCalls, 2);
-    assert.equal(reworkCalls, 2);
+    assert.equal(reworkCalls, 3);
     assert.equal(store.getRoutingDecision(initialStale.planningDecision.decisionId), undefined);
-    assert.equal(store.getRoutingDecision(reworkStale.planningDecision.decisionId), undefined);
+    assert.equal(store.getRoutingDecision(reworkStaysOnCurrentRoute.planningDecision.decisionId), undefined);
     assert.ok(store.getRoutingDecision(initialAccepted.planningDecision.decisionId));
     assert.ok(store.getRoutingDecision(reworkAccepted.planningDecision.decisionId));
     assert.equal(store.getSteerInstruction(initialSteerId!)?.planningDecisionId, initialAccepted.planningDecision.decisionId);

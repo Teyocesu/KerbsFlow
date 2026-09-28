@@ -13,6 +13,7 @@ import {
   parseSteerText,
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
+import type { FailureAction } from "./phase3.js";
 import type { TrustedRoutingDecision } from "./routing.js";
 
 export interface Phase2ActionInput {
@@ -143,11 +144,24 @@ export interface InitialPlanningInput {
   steer: PlanningSteerObservation;
 }
 
-export interface ReworkFailureContext {
+interface ReworkFailureContextBase {
   failureClass: string;
   reasonCode: string;
   summary: string;
 }
+
+export type ReworkFailureContext = Readonly<ReworkFailureContextBase & (
+  | {
+    resultingAction: "escalate";
+    escalationReason: string;
+    requiredRoute: Readonly<{ adapter: "codex"; model: string; reasoning?: string }>;
+  }
+  | {
+    resultingAction: Exclude<FailureAction, "escalate">;
+    escalationReason?: string;
+    requiredRoute?: never;
+  }
+)>;
 
 export interface ReworkPlanningInput {
   runId: RunId;

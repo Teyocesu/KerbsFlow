@@ -1,6 +1,6 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328` on `phase6/thin-local-ui`; Phase 6B is CLOSED after successful physical macOS QA at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4`; the Phase 6C architecture and plan are approved, but implementation has not started. Next checkpoint: Phase 6C.1 — Steer + Planning Master integration.**
+Status: **Phase 5 is complete and independently confirmed PASS at approved implementation baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd` on `phase5/isolation-operational-hardening`. Official v0.1 host support is macOS only; Linux is unsupported preview and does not block Phase 5 or v0.1 release readiness. Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328` on `phase6/thin-local-ui`; Phase 6B is CLOSED after successful physical macOS QA at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4`; the Phase 6C architecture and plan are approved, and 6C.1 — Steer + Planning Master integration is implemented pending independent review. Next checkpoint: independent 6C.1 review; do not start 6C.2 before review.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
@@ -247,7 +247,7 @@ Map malformed/schema errors to `400`, missing/wrong token to `401`, Host/Origin 
 
 **Steer contract:** Steer does not exist in the current core. 6C adds only a bounded, run-bound, durable, idempotent human instruction, with actor recorded as human. It must not rewrite an active prompt or mutate an in-flight attempt/state; the Planning Master consumes it once at the next safe boundary. Keep at most one pending human instruction and persist consumed status/evidence. Material scope, security, or permission implications still go through the normal human gate; Steer cannot grant permissions or broaden scope automatically. Do not add chat history, arbitrary agent messages, or a prompt editor.
 
-**Approved Phase 6C implementation plan (planned, not started):**
+**Approved Phase 6C implementation plan:**
 
 1. **6C.1 — Steer + Planning Master integration.** Establish the Steer contract, persistence invariant, and initial/rework Planning Master boundaries.
 2. **6C.2 — RunCoordinator + local API/dashboard controls.** Add truthful Start and coordinated Pause/Resume/Cancel, then wire the approved controls through the existing API and dashboard.
