@@ -14,7 +14,7 @@ const elements = {
   emptyView: document.getElementById("empty-view"),
   runContent: document.getElementById("run-content"),
   pageStatus: document.getElementById("page-status"),
-  runId: document.getElementById("snapshot-run-id"),
+  taskSummary: document.getElementById("snapshot-task-summary"),
   runState: document.getElementById("snapshot-state"),
   runMeta: document.getElementById("snapshot-run-meta"),
   context: document.getElementById("execution-context"),
@@ -115,19 +115,18 @@ function makeTime(value) {
 }
 
 function renderCurrentWork(snapshot) {
-  const task = asObject(snapshot.currentTask);
-  const action = asObject(task.action);
-  const route = asObject(task.route);
+  const currentTask = asObject(snapshot.currentTask);
+  const action = asObject(currentTask.action);
+  const route = asObject(currentTask.route);
   const attempt = asObject(snapshot.activeAttempt);
   elements.currentWork.replaceChildren();
-  const summary = makeText("p", action.summary ?? "No task recorded", "task-description");
   const metadata = document.createElement("dl");
   metadata.className = "task-metadata";
   addDetail(metadata, "Adapter", attempt.adapter ?? route.adapter);
   addDetail(metadata, "Model", attempt.model ?? route.model);
   addDetail(metadata, "Attempt", attempt.attemptId, true);
   addDetail(metadata, "Lifecycle", attempt.lifecycle === undefined ? undefined : displayLabel(attempt.lifecycle));
-  elements.currentWork.append(summary, metadata);
+  elements.currentWork.append(metadata);
 }
 
 function renderEvidence(snapshot) {
@@ -175,6 +174,31 @@ function renderHumanGate(snapshot) {
   summary.append(makeText("code", item.reasonCode, "gate-reason identifier"));
   summary.append(makeText("p", item.summary, "gate-description"));
   elements.humanGate.append(summary);
+
+  const evidenceRows = [];
+  if (snapshot.latestValidation !== null && snapshot.latestValidation !== undefined) {
+    const validation = asObject(snapshot.latestValidation);
+    const values = [validation.outcome, validation.level]
+      .filter((value) => typeof value === "string")
+      .map(displayLabel);
+    if (values.length > 0) evidenceRows.push(["Validation", values.join(" · ")]);
+  }
+  if (snapshot.latestReview !== null && snapshot.latestReview !== undefined) {
+    const review = asObject(snapshot.latestReview);
+    if (typeof review.outcome === "string") evidenceRows.push(["Review", displayLabel(review.outcome)]);
+  }
+  if (evidenceRows.length > 0) {
+    const evidence = document.createElement("div");
+    evidence.className = "gate-evidence";
+    evidence.append(makeText("h3", "Evidence"));
+    for (const [label, value] of evidenceRows) {
+      const row = document.createElement("p");
+      row.className = "gate-evidence-row";
+      row.append(makeText("span", label), makeText("span", value));
+      evidence.append(row);
+    }
+    elements.humanGate.append(evidence);
+  }
 
   const options = asArray(item.options);
   if (options.length === 0) {
@@ -273,7 +297,7 @@ function renderArtifacts(snapshot, session) {
     row.className = "artifact-item";
     addArtifactField(row, "Artifact ID", makeText("code", artifact.artifactId, "identifier"));
     addArtifactField(row, "Kind", makeText("span", displayLabel(artifact.kind)));
-    addArtifactField(row, "Size", makeText("span", valueText(artifact.sizeBytes) + " B"));
+    addArtifactField(row, "Size", makeText("span", valueText(artifact.sizeBytes) + " B", "artifact-size-value"));
     addArtifactField(row, "Redaction", makeText("span", displayLabel(artifact.redactionState)));
     addArtifactField(row, "Created", makeTime(artifact.createdAt));
     const link = document.createElement("a");
@@ -311,7 +335,6 @@ function renderExecutionContext(snapshot) {
     addDetail(elements.context, "Latest transition", "No transitions recorded");
     return;
   }
-  addDetail(elements.context, "Previous state", displayLabel(latest.from));
   addDetail(elements.context, "Latest transition", displayLabel(latest.from) + " → " + displayLabel(latest.to));
   const recorded = document.createElement("div");
   const time = document.createElement("dd");
@@ -338,9 +361,13 @@ function renderActivity(snapshot) {
     row.append(makeText("code", transition.reasonCode, "activity-code identifier"));
     const metadata = document.createElement("p");
     metadata.className = "activity-meta";
-    metadata.append(makeText("span", displayLabel(transition.actor)));
-    metadata.append(makeText("span", "State v" + valueText(transition.stateVersionAfter), "identifier"));
-    metadata.append(makeTime(transition.createdAt));
+    metadata.append(
+      makeText("span", displayLabel(transition.actor)),
+      document.createTextNode(" · "),
+      makeText("span", "State v" + valueText(transition.stateVersionAfter), "identifier"),
+      document.createTextNode(" · "),
+      makeTime(transition.createdAt),
+    );
     row.append(metadata);
     elements.activity.append(row);
   }
@@ -348,11 +375,16 @@ function renderActivity(snapshot) {
 
 function renderSnapshot(snapshot, session) {
   const run = asObject(snapshot.run);
-  setText(elements.runId, session.runId);
+  const task = asObject(snapshot.currentTask);
+  const action = asObject(task.action);
+  setText(elements.taskSummary, typeof action.summary === "string" && action.summary !== "" ? action.summary : "No task recorded");
   setText(elements.runState, displayLabel(run.state));
   elements.runState.dataset.state = valueText(run.state);
   elements.runState.title = valueText(run.state);
-  setText(elements.runMeta, "State v" + valueText(run.stateVersion));
+  elements.runMeta.replaceChildren(
+    makeText("code", session.runId, "run-meta-id identifier"),
+    document.createTextNode(" · State v" + valueText(run.stateVersion)),
+  );
   setText(elements.selectedRunId, session.runId);
   elements.selectedRunId.title = session.runId;
   renderExecutionContext(snapshot);
@@ -592,10 +624,10 @@ function resetDashboard() {
   elements.switchRun.setAttribute("aria-expanded", "false");
   selectView("overview");
   elements.runContent.setAttribute("aria-busy", "false");
-  setText(elements.runId, "—");
+  setText(elements.taskSummary, "No task recorded");
   setText(elements.runState, "—");
   elements.runState.dataset.state = "idle";
-  setText(elements.runMeta, "State v—");
+  elements.runMeta.replaceChildren();
   setText(elements.selectedRunId, "—");
   elements.context.replaceChildren();
   elements.gateSection.dataset.open = "false";
