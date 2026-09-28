@@ -2,6 +2,7 @@ import {
   CONTRACT_VERSIONS,
   type ExecutorResult,
   type FailureClassification,
+  type CommandResult,
   type PlanningDecision,
   type ReviewDecision,
   type RunId,
@@ -65,6 +66,11 @@ export interface Phase2LoopResult {
   stateVersion: number;
 }
 
+export interface Phase2DriveControls {
+  checkpoint?: () => Promise<number | void>;
+  planningMaster?: PlanningMaster;
+}
+
 export class Phase2Loop {
   constructor(
     private readonly core: KerbsFlowCore,
@@ -77,8 +83,26 @@ export class Phase2Loop {
   ) {}
 
   async run(request: Phase2LoopRequest): Promise<Phase2LoopResult> {
-    this.assertRequest(request);
-    let command = this.core.startRun(request.runId, request.objective, `${request.runId}:start`);
+    this.assertRequest(request, this.planningMaster);
+    this.core.startRun(request.runId, request.objective, `${request.runId}:start`);
+    return this.driveStarted(request);
+  }
+
+  async driveStarted(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
+    const planningMaster = controls.planningMaster ?? this.planningMaster;
+    this.assertRequest(request, planningMaster);
+    const started = this.store.getRun(request.runId);
+    if (started === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} was not accepted before Phase2Loop.driveStarted`);
+    if (started.state !== "INTAKE" || this.store.getWorktree(request.runId) !== undefined || started.currentTaskId !== null || started.activeAttemptId !== null) {
+      throw new KerbsFlowError("PHASE2_START_BOUNDARY_INVALID", "already-started Phase2 drive requires a fresh INTAKE run with no worktree, task, or attempt");
+    }
+    let command: Pick<CommandResult, "to" | "stateVersion"> = { to: started.state, stateVersion: started.stateVersion };
+    const checkpoint = async (): Promise<void> => {
+      const observed = await controls.checkpoint?.();
+      const current = observed ?? this.store.getRun(request.runId)?.stateVersion;
+      if (current !== undefined) command = { ...command, stateVersion: current };
+    };
+    await checkpoint();
     let intake: RepositoryIntake;
     try {
       intake = this.git.intake(request.repositoryPath, request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid });
@@ -91,12 +115,16 @@ export class Phase2Loop {
         : this.core.failIntake(request.runId, command.stateVersion, `${request.runId}:intake-failed`, error.code, error.message);
       return { verdict: gateable ? "HUMAN_GATE" : "FAILED", intakeIssue: { code: error.code, summary: error.message }, stateVersion: command.stateVersion };
     }
+    await checkpoint();
     new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
     command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
+    await checkpoint();
     const worktree = this.git.create(intake, request.runId);
     this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
-    const planned = await this.acceptInitialPlan(request, command.stateVersion);
+    await checkpoint();
+    const planned = await this.acceptInitialPlan(request, command.stateVersion, planningMaster, controls.checkpoint);
     command = planned.command;
+    await checkpoint();
     let decision = planned.decision;
     let currentRoutingDecision = planned.routingDecision;
     this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
@@ -105,6 +133,7 @@ export class Phase2Loop {
     let nextEscalationReason: string | undefined;
 
     while (true) {
+      await checkpoint();
       this.assertRoutingForPlanningDecision(decision, currentRoutingDecision);
       attempts += 1;
       command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
@@ -121,6 +150,7 @@ export class Phase2Loop {
       }
       command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
       command = await this.core.completeAttempt(request.runId, command.stateVersion, `${request.runId}:complete:${attempts}`);
+      await checkpoint();
       const afterExecution = this.store.readModel(request.runId);
       if (afterExecution === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared`);
       if (afterExecution.run.state === "HUMAN_GATE") return { verdict: "HUMAN_GATE", intake, worktree, attempts, stateVersion: afterExecution.run.stateVersion };
@@ -131,13 +161,17 @@ export class Phase2Loop {
       const executorResult = parseExecutorResult(JSON.parse(afterExecution.activeAttempt.outcomeJson));
       let focused: FocusedVerificationResult;
       try {
+        await checkpoint();
         focused = await this.verifier.verify(intake, worktree, decision, executorResult, request.focusedCheck);
       } catch (error) {
         if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
+        await checkpoint();
         command = this.core.gateVerificationSandboxUnavailable(request.runId, command.stateVersion, `${request.runId}:focused-sandbox-gate:${attempts}`);
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, attempts, stateVersion: command.stateVersion };
       }
+      await checkpoint();
       command = this.core.recordFocusedValidation(request.runId, command.stateVersion, `${request.runId}:focused:${attempts}`, focused.bundle);
+      await checkpoint();
       if (focused.bundle.outcome !== "passed") {
         const policy = this.recordFailure(request, decision, executorResult, focused, "focused_verification");
         command = this.core.review(request.runId, command.stateVersion, `${request.runId}:focused-policy:${attempts}`, this.reviewForPolicy(request, policy));
@@ -151,7 +185,7 @@ export class Phase2Loop {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after focused verification`;
         }
-        const reworked = await this.acceptRework(request, command.stateVersion, decision, reworkFailure, `${request.runId}:continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, reworkFailure, `${request.runId}:continue:${attempts}`, currentRoutingDecision, nextSelectionReason, planningMaster, controls.checkpoint);
         command = reworked.command;
         decision = reworked.decision;
         currentRoutingDecision = reworked.routingDecision;
@@ -175,13 +209,17 @@ export class Phase2Loop {
       }
       let phase: Awaited<ReturnType<FocusedVerifier["verifyPhase"]>>;
       try {
+        await checkpoint();
         phase = await this.verifier.verifyPhase(intake, worktree, decision, executorResult, request.phaseCheck);
       } catch (error) {
         if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
+        await checkpoint();
         command = this.core.gateVerificationSandboxUnavailable(request.runId, command.stateVersion, `${request.runId}:phase-sandbox-gate:${attempts}`);
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, verification: focused, attempts, stateVersion: command.stateVersion };
       }
+      await checkpoint();
       this.store.recordAuthoritativePhaseValidation(phase.authoritative);
+      await checkpoint();
       if (phase.verification.bundle.outcome !== "passed") {
         const policy = this.recordFailure(request, decision, executorResult, phase.verification, "phase_verification");
         command = this.core.applyPhaseFailurePolicy(request.runId, command.stateVersion, `${request.runId}:phase-policy:${attempts}`, policy.fingerprint);
@@ -195,7 +233,7 @@ export class Phase2Loop {
           nextEscalationReason = undefined;
           nextSelectionReason = `failure policy selected ${policy.resultingAction} after phase verification`;
         }
-        const reworked = await this.acceptRework(request, command.stateVersion, decision, reworkFailure, `${request.runId}:phase-continue:${attempts}`, currentRoutingDecision, nextSelectionReason);
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, reworkFailure, `${request.runId}:phase-continue:${attempts}`, currentRoutingDecision, nextSelectionReason, planningMaster, controls.checkpoint);
         command = reworked.command;
         decision = reworked.decision;
         currentRoutingDecision = reworked.routingDecision;
@@ -208,6 +246,7 @@ export class Phase2Loop {
       if (semanticRequired && this.semanticReviewer !== undefined && request.semanticReview !== undefined) {
         semanticReviewId = asReviewId(this.ids.next("review"));
         try {
+          await checkpoint();
           await this.semanticReviewer.review({
             reviewAttemptId: semanticReviewId,
             runId: request.runId,
@@ -226,14 +265,15 @@ export class Phase2Loop {
         } catch {
           semanticReviewId = undefined;
         }
+        await checkpoint();
       }
       command = this.core.completeTrustedPhaseValidation(request.runId, command.stateVersion, `${request.runId}:phase-close:${attempts}`, { validationId: phase.authoritative.bundle.validationId, ...(semanticReviewId === undefined ? {} : { semanticReviewId }) });
       return { verdict: command.to === "NEXT_PHASE" ? "PASS" : command.to === "REWORK" ? "REWORK" : command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: phase.verification, attempts, stateVersion: command.stateVersion };
     }
   }
 
-  private assertRequest(request: Phase2LoopRequest): void {
-    if (this.planningMaster !== undefined) {
+  private assertRequest(request: Phase2LoopRequest, planningMaster: PlanningMaster | undefined): void {
+    if (planningMaster !== undefined) {
       if (request.planningDecision !== undefined || request.routingDecision !== undefined) {
         throw new KerbsFlowError("PLANNING_AUTHORITY_CONFLICT", "Planning Master runs receive their decision and routing authority only from PlanningMasterResult");
       }
@@ -350,8 +390,14 @@ export class Phase2Loop {
     return Object.freeze({ ...base, resultingAction });
   }
 
-  private async acceptInitialPlan(request: Phase2LoopRequest, stateVersion: number): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
-    if (this.planningMaster === undefined) {
+  private async acceptInitialPlan(
+    request: Phase2LoopRequest,
+    initialStateVersion: number,
+    planningMaster: PlanningMaster | undefined,
+    controlCheckpoint?: Phase2DriveControls["checkpoint"],
+  ): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
+    let stateVersion = initialStateVersion;
+    if (planningMaster === undefined) {
       if (request.planningDecision === undefined) throw new KerbsFlowError("PLANNING_DECISION_REQUIRED", "legacy Phase2Loop requests require a precomputed planning decision");
       const decision = parsePlanningDecision(request.planningDecision);
       this.assertPlanningIdentity(decision, request);
@@ -363,8 +409,10 @@ export class Phase2Loop {
     }
     let lastError: unknown;
     for (let attempt = 0; attempt < 2; attempt += 1) {
+      const observed = await controlCheckpoint?.();
+      if (observed !== undefined) stateVersion = observed;
       const steer = this.observeSteer(request.runId);
-      const result = parsePlanningMasterResult(await this.planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer }));
+      const result = parsePlanningMasterResult(await planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer }));
       const decision = result.decision;
       this.assertPlanningIdentity(decision, request);
       this.assertRoutingForPlanningDecision(decision, result.routingDecision);
@@ -388,8 +436,10 @@ export class Phase2Loop {
     idempotencyKey: string,
     currentRoutingDecision: TrustedRoutingDecision | undefined,
     selectionReason: string,
+    planningMaster: PlanningMaster | undefined,
+    controlCheckpoint?: Phase2DriveControls["checkpoint"],
   ): Promise<{ command: ReturnType<KerbsFlowCore["reworkToReady"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
-    if (this.planningMaster === undefined) {
+    if (planningMaster === undefined) {
       let decision = parsePlanningDecision(baseDecision);
       this.assertPlanningIdentity(decision, request);
       if (failure.resultingAction === "escalate") {
@@ -414,9 +464,11 @@ export class Phase2Loop {
     }
     let lastError: unknown;
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      const observed = await controlCheckpoint?.();
+      if (observed !== undefined) stateVersion = observed;
       const steer = this.observeSteer(request.runId);
       const prior = this.store.getTask(request.taskId)?.decision ?? baseDecision;
-      const result = parsePlanningMasterResult(await this.planningMaster.planRework({ runId: request.runId, taskId: request.taskId, priorDecision: prior, failure, steer }));
+      const result = parsePlanningMasterResult(await planningMaster.planRework({ runId: request.runId, taskId: request.taskId, priorDecision: prior, failure, steer }));
       const corrected = result.decision;
       this.assertPlanningIdentity(corrected, request);
       let routingDecision = result.routingDecision;

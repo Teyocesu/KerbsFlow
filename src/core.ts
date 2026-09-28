@@ -48,7 +48,9 @@ import { KerbsFlowError, NotFoundError } from "./errors.js";
 import {
   CommandMutation,
   ReadModel,
+  RunLaunchBinding,
   SqlTransaction,
+  StoredRun,
   StateStore,
   StoredAttempt,
   StoredGate,
@@ -147,6 +149,22 @@ export class KerbsFlowCore {
       throw new KerbsFlowError("INTERNAL_COMMAND_ERROR", "start command did not parse as start");
     }
     return this.store.createRun(command);
+  }
+
+  startRunWithLaunchBinding(runId: RunId, objective: string, idempotencyKey: string, binding: RunLaunchBinding, commandId?: CommandId): CommandResult {
+    const command = parseCommand({
+      schemaVersion: CONTRACT_VERSIONS.command,
+      commandId: commandId ?? this.nextCommandId(),
+      idempotencyKey,
+      runId,
+      expectedStateVersion: 0,
+      kind: "start",
+      objective,
+    });
+    if (command.kind !== "start") {
+      throw new KerbsFlowError("INTERNAL_COMMAND_ERROR", "coordinated start command did not parse as start");
+    }
+    return this.store.createRunWithLaunchBinding(command, binding);
   }
 
   completeIntake(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
@@ -443,6 +461,10 @@ export class KerbsFlowCore {
       const current = this.attemptInTransaction(tx, attempt.attemptId);
       if (current.lifecycle !== "RUNNING" && current.lifecycle !== "PREPARED") {
         throw new KerbsFlowError("ATTEMPT_NOT_ACTIVE", `attempt ${current.attemptId} is ${current.lifecycle}`);
+      }
+      const cancellation = tx.get("SELECT status FROM cancellation_intents WHERE attempt_id = ?", current.attemptId) as Record<string, unknown> | undefined;
+      if (cancellation !== undefined) {
+        throw new KerbsFlowError("ATTEMPT_CANCELLATION_PENDING", `attempt ${current.attemptId} has durable cancellation intent; normal result ingestion is blocked`);
       }
       const artifact = this.artifacts.put(runId, "executor-result", JSON.stringify(rawJson), attempt.attemptId);
       const persistedResult = parsed === undefined ? undefined : { ...parsed, artifacts: [...parsed.artifacts, artifact.artifactId] };
@@ -1003,16 +1025,30 @@ export class KerbsFlowCore {
   }
 
   pause(runId: RunId, expectedStateVersion: number, idempotencyKey: string, commandId?: CommandId): CommandResult {
+    return this.pauseAfterQuiescence(runId, expectedStateVersion, expectedStateVersion, idempotencyKey, commandId, false);
+  }
+
+  pauseAfterQuiescence(
+    runId: RunId,
+    requestStateVersion: number,
+    observedStateVersion: number,
+    idempotencyKey: string,
+    commandId?: CommandId,
+    requireQuiescent = true,
+  ): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
       commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
-      expectedStateVersion,
+      expectedStateVersion: requestStateVersion,
       kind: "pause",
     });
-    return this.store.executeCommand(command, ({ tx, run }) => {
+    return this.store.executeCommandAtObservedVersion(command, observedStateVersion, ({ tx, run }) => {
       const uncertain = run.activeAttemptId !== null && this.activeAttemptInTransaction(tx, run.activeAttemptId);
+      if (requireQuiescent && uncertain) {
+        throw new KerbsFlowError("PAUSE_REQUIRES_QUIESCENT_RUN", "coordinated pause cannot commit while an executor attempt is active or ambiguous");
+      }
       const chosen = choosePauseContract(run.state, uncertain);
       const pauseContract = {
         schemaVersion: CONTRACT_VERSIONS.pause,
@@ -1076,13 +1112,14 @@ export class KerbsFlowCore {
     const current = this.store.getRun(runId);
     if (current?.stateVersion === expectedStateVersion && current.activeAttemptId !== null) {
       const activeAttempt = this.store.getAttempt(current.activeAttemptId);
-      if (activeAttempt?.adapterDescriptorJson !== null && activeAttempt?.adapterDescriptorJson !== undefined) {
+      const nonterminal = activeAttempt !== undefined && (activeAttempt.lifecycle === "PREPARED" || activeAttempt.lifecycle === "RUNNING" || activeAttempt.lifecycle === "UNKNOWN");
+      if (nonterminal && activeAttempt.adapterDescriptorJson !== null) {
         const descriptor = parseAdapterDescriptor(JSON.parse(activeAttempt.adapterDescriptorJson));
         if (descriptor.adapter !== "fake") {
           throw new KerbsFlowError("REAL_CANCEL_REQUIRES_DURABLE_INTENT", "real adapter cancellation must use requestRealCancellation before any external signal");
         }
       }
-      const handle = this.liveHandles.get(current.activeAttemptId);
+      const handle = nonterminal ? this.liveHandles.get(current.activeAttemptId) : undefined;
       if (handle !== undefined) {
         this.adapter.cancel(handle, reason);
       }
@@ -1124,33 +1161,101 @@ export class KerbsFlowCore {
     });
   }
 
-  requestRealCancellation(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reason: string): CommandResult {
+  cancelAfterQuiescence(
+    runId: RunId,
+    requestStateVersion: number,
+    observedStateVersion: number,
+    idempotencyKey: string,
+    reason: string,
+    commandId?: CommandId,
+  ): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
-      commandId: this.nextCommandId(),
+      commandId: commandId ?? this.nextCommandId(),
+      idempotencyKey,
+      runId,
+      expectedStateVersion: requestStateVersion,
+      kind: "cancel",
+      reason,
+    });
+    return this.store.executeCommandAtObservedVersion(command, observedStateVersion, ({ tx, run, now }) => {
+      if (run.activeAttemptId !== null) {
+        const attempt = this.attemptInTransaction(tx, run.activeAttemptId);
+        if (attempt.lifecycle === "PREPARED" || attempt.lifecycle === "RUNNING" || attempt.lifecycle === "UNKNOWN") {
+          throw new KerbsFlowError("CANCEL_REQUIRES_QUIESCENT_RUN", "coordinated cancellation cannot finalize while an executor attempt is active or ambiguous");
+        }
+      }
+      return this.cancelQuiescentMutation(tx, run, now, reason);
+    });
+  }
+
+  private cancelQuiescentMutation(tx: SqlTransaction, run: StoredRun, now: string, reason: string): CommandMutation {
+    if (run.state === "IDLE" || run.state === "FAILED" || run.state === "CANCELLED" || run.state === "DONE") {
+      throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `cannot cancel from ${run.state}`);
+    }
+    if (run.currentGateId !== null) {
+      const gate = this.gateInTransaction(tx, run.currentGateId);
+      if (gate.gate.status === "open") {
+        const rejected: HumanGate = {
+          ...gate.gate,
+          status: "rejected",
+          resolution: { optionId: "cancel", actor: "human", resolvedAt: now, note: reason },
+        };
+        tx.run("UPDATE human_gates SET status = ?, gate_json = ?, resolved_at = ? WHERE gate_id = ?", rejected.status, JSON.stringify(rejected), now, gate.gateId);
+      }
+    }
+    return {
+      transition: {
+        to: "CANCELLED",
+        actor: "human",
+        reasonCode: "cancel_requested",
+        taskId: run.currentTaskId,
+        attemptId: run.activeAttemptId,
+        gateId: run.currentGateId,
+        payload: { reason },
+      },
+      runPatch: { pauseContract: null, currentGateId: null, recoveryRequired: false, recoveryReason: null },
+      details: { reason },
+    } satisfies CommandMutation;
+  }
+
+  requestRealCancellation(
+    runId: RunId,
+    expectedStateVersion: number,
+    idempotencyKey: string,
+    reason: string,
+    commandId?: CommandId,
+    observedStateVersion = expectedStateVersion,
+  ): CommandResult {
+    const command = parseCommand({
+      schemaVersion: CONTRACT_VERSIONS.command,
+      commandId: commandId ?? this.nextCommandId(),
       idempotencyKey,
       runId,
       expectedStateVersion,
       kind: "cancel",
       reason,
     });
-    return this.store.executeCommand(command, ({ tx, run, now }) => {
-      if (run.state !== "EXECUTE" && run.state !== "RECOVERY" && run.state !== "PAUSED") {
-        throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `real attempt cancellation is not allowed from ${run.state}`);
+    return this.store.executeCommandAtObservedVersion(command, observedStateVersion, ({ tx, run, now }) => {
+      if (run.state === "IDLE" || run.state === "FAILED" || run.state === "CANCELLED" || run.state === "DONE") {
+        throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `cannot cancel from ${run.state}`);
       }
       if (run.activeAttemptId === null) {
         throw new KerbsFlowError("ATTEMPT_REQUIRED", "real cancellation requires an active attempt");
       }
       const attempt = this.attemptInTransaction(tx, run.activeAttemptId);
-      if (isTerminalAttempt(attempt.lifecycle)) {
-        throw new KerbsFlowError("ATTEMPT_NOT_ACTIVE", `attempt ${attempt.attemptId} is already ${attempt.lifecycle}`);
-      }
       const existing = tx.get("SELECT reason FROM cancellation_intents WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
       if (existing !== undefined) {
         if (existing.reason !== reason) {
           throw new KerbsFlowError("CANCELLATION_INTENT_CONFLICT", "active attempt already has a different durable cancellation intent");
         }
         return { details: { attemptId: attempt.attemptId, cancellationIntent: "already_persisted" } } satisfies CommandMutation;
+      }
+      if (isTerminalAttempt(attempt.lifecycle)) {
+        throw new KerbsFlowError("ATTEMPT_NOT_ACTIVE", `attempt ${attempt.attemptId} is already ${attempt.lifecycle}`);
+      }
+      if (run.state !== "EXECUTE" && run.state !== "RECOVERY" && run.state !== "PAUSED") {
+        throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `real attempt cancellation is not allowed from ${run.state}`);
       }
       tx.run(
         "INSERT INTO cancellation_intents (attempt_id, run_id, reason, status, request_command_id, requested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",

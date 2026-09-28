@@ -411,6 +411,20 @@ export const MIGRATIONS: readonly Migration[] = [
       CREATE UNIQUE INDEX steer_one_pending_per_run_idx ON steer_instructions(run_id) WHERE consumed_at IS NULL;
     `,
   },
+  {
+    version: 11,
+    name: "phase6c-run-launch-bindings",
+    sql: `
+      CREATE TABLE run_launch_bindings (
+        run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+        task_id TEXT NOT NULL UNIQUE,
+        repository_path TEXT NOT NULL,
+        launch_profile_id TEXT NOT NULL,
+        launch_profile_hash TEXT NOT NULL CHECK (length(launch_profile_hash) = 64),
+        created_at TEXT NOT NULL
+      ) STRICT;
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -535,6 +549,18 @@ export interface StoredRun {
   recoveryReason: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface RunLaunchBinding {
+  runId: RunId;
+  taskId: TaskId;
+  canonicalRepositoryPath: string;
+  launchProfileId: string;
+  launchProfileHash: string;
+}
+
+export interface StoredRunLaunchBinding extends RunLaunchBinding {
+  createdAt: string;
 }
 
 export interface StoredTask {
@@ -777,6 +803,19 @@ export class StateStore {
   getRun(runId: RunId): StoredRun | undefined {
     this.assertOpen();
     return this.readRun(this.db.prepare("SELECT * FROM runs WHERE run_id = ?").get(runId) as Row | undefined);
+  }
+
+  getRunLaunchBinding(runId: RunId): StoredRunLaunchBinding | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM run_launch_bindings WHERE run_id = ?").get(runId) as Row | undefined;
+    return row === undefined ? undefined : parseRunLaunchBindingRow(row);
+  }
+
+  listUnfinishedRuns(): StoredRun[] {
+    this.assertOpen();
+    return (this.db.prepare("SELECT * FROM runs WHERE state NOT IN ('IDLE', 'FAILED', 'CANCELLED', 'DONE') ORDER BY created_at, run_id").all() as Row[])
+      .map((row) => this.readRun(row))
+      .filter((run): run is StoredRun => run !== undefined);
   }
 
   getCommandIdempotencyKey(commandId: CommandId): string | undefined {
@@ -1357,6 +1396,18 @@ export class StateStore {
   }
 
   createRun(command: Command & { kind: "start" }): CommandResult {
+    return this.createRunTransaction(command);
+  }
+
+  createRunWithLaunchBinding(command: Command & { kind: "start" }, value: RunLaunchBinding): CommandResult {
+    const binding = parseRunLaunchBinding(value);
+    if (binding.runId !== command.runId) {
+      throw new KerbsFlowError("LAUNCH_BINDING_SCOPE_MISMATCH", "launch binding runId does not match the accepted Start");
+    }
+    return this.createRunTransaction(command, binding);
+  }
+
+  private createRunTransaction(command: Command & { kind: "start" }, binding?: RunLaunchBinding): CommandResult {
     this.assertOpen();
     const validated = parseCommand(command);
     if (validated.kind !== "start") {
@@ -1382,6 +1433,17 @@ export class StateStore {
         now,
         now,
       );
+      if (binding !== undefined) {
+        tx.run(
+          "INSERT INTO run_launch_bindings (run_id, task_id, repository_path, launch_profile_id, launch_profile_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+          binding.runId,
+          binding.taskId,
+          binding.canonicalRepositoryPath,
+          binding.launchProfileId,
+          binding.launchProfileHash,
+          now,
+        );
+      }
       const transitionId = asTransitionId(this.ids.next("transition"));
       const result: CommandResult = {
         schemaVersion: CONTRACT_VERSIONS.commandResult,
@@ -1421,9 +1483,24 @@ export class StateStore {
     });
   }
 
+  replayCommand(command: Command): CommandResult | undefined {
+    this.assertOpen();
+    const validated = parseCommand(command);
+    const duplicate = this.withTransaction((tx) => this.readCommand(tx, validated.idempotencyKey));
+    return duplicate === undefined ? undefined : this.replayOrReject(duplicate, semanticCommandHash(validated));
+  }
+
   executeCommand(command: Command, mutation: (context: CommandMutationContext) => CommandMutation): CommandResult {
+    return this.executeCommandAtObservedVersion(command, command.expectedStateVersion, mutation);
+  }
+
+  executeCommandAtObservedVersion(command: Command, observedStateVersion: number, mutation: (context: CommandMutationContext) => CommandMutation): CommandResult {
     this.assertOpen();
     command = parseCommand(command);
+    if (!Number.isSafeInteger(observedStateVersion) || observedStateVersion < command.expectedStateVersion
+      || (observedStateVersion !== command.expectedStateVersion && command.kind !== "pause" && command.kind !== "cancel")) {
+      throw new KerbsFlowError("INVALID_DEFERRED_COMMAND", "only a claimed Pause or Cancel may commit at a later observed state version");
+    }
     const now = this.clock.now();
     const hash = semanticCommandHash(command);
     return this.withTransaction((tx) => {
@@ -1435,8 +1512,8 @@ export class StateStore {
       if (run === undefined) {
         throw new NotFoundError("run", command.runId);
       }
-      if (run.stateVersion !== command.expectedStateVersion) {
-        throw new StateVersionConflictError(command.runId, command.expectedStateVersion, run.stateVersion);
+      if (run.stateVersion !== observedStateVersion) {
+        throw new StateVersionConflictError(command.runId, observedStateVersion, run.stateVersion);
       }
       const mutationResult = mutation({ tx, run, now, nextId: (prefix) => this.ids.next(prefix) });
       const transition = mutationResult.transition;
@@ -1973,6 +2050,44 @@ function updateRun(tx: SqlTransaction, run: StoredRun, patch: RunPatch | undefin
     run.stateVersion,
   );
   return next;
+}
+
+function parseRunLaunchBinding(value: unknown): RunLaunchBinding {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new KerbsFlowError("RUN_LAUNCH_BINDING_INVALID", "launch binding must be an object");
+  }
+  const object = value as Record<string, unknown>;
+  for (const key of Object.keys(object)) {
+    if (!["runId", "taskId", "canonicalRepositoryPath", "launchProfileId", "launchProfileHash"].includes(key)) {
+      throw new KerbsFlowError("RUN_LAUNCH_BINDING_INVALID", `launch binding has unsupported field ${key}`);
+    }
+  }
+  const runId = asRunId(stringValue(object.runId, "launchBinding.runId"));
+  const taskId = asTaskId(stringValue(object.taskId, "launchBinding.taskId"));
+  const canonicalRepositoryPath = stringValue(object.canonicalRepositoryPath, "launchBinding.canonicalRepositoryPath");
+  const launchProfileId = stringValue(object.launchProfileId, "launchBinding.launchProfileId");
+  const launchProfileHash = stringValue(object.launchProfileHash, "launchBinding.launchProfileHash");
+  if (!isAbsolute(canonicalRepositoryPath) || canonicalRepositoryPath.includes("\0")) {
+    throw new KerbsFlowError("RUN_LAUNCH_BINDING_INVALID", "launch binding repository path must be absolute and NUL-free");
+  }
+  if (launchProfileId.length === 0 || launchProfileId.length > 256 || launchProfileId !== launchProfileId.trim()) {
+    throw new KerbsFlowError("RUN_LAUNCH_BINDING_INVALID", "launch profile ID must be a trimmed string of at most 256 characters");
+  }
+  if (!/^[a-f0-9]{64}$/.test(launchProfileHash)) {
+    throw new KerbsFlowError("RUN_LAUNCH_BINDING_INVALID", "launch profile hash must be a lowercase SHA-256 digest");
+  }
+  return { runId, taskId, canonicalRepositoryPath, launchProfileId, launchProfileHash };
+}
+
+function parseRunLaunchBindingRow(row: Row): StoredRunLaunchBinding {
+  const binding = parseRunLaunchBinding({
+    runId: row.run_id,
+    taskId: row.task_id,
+    canonicalRepositoryPath: row.repository_path,
+    launchProfileId: row.launch_profile_id,
+    launchProfileHash: row.launch_profile_hash,
+  });
+  return { ...binding, createdAt: stringValue(row.created_at, "run_launch_bindings.created_at") };
 }
 
 function parseRunRow(row: Row): StoredRun {
