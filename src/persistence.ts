@@ -425,6 +425,29 @@ export const MIGRATIONS: readonly Migration[] = [
       ) STRICT;
     `,
   },
+  {
+    version: 12,
+    name: "phase6c-coordinated-cancel-identity",
+    sql: `
+      ALTER TABLE cancellation_intents ADD COLUMN request_idempotency_key TEXT NOT NULL DEFAULT 'legacy_unbound';
+      ALTER TABLE cancellation_intents ADD COLUMN request_expected_state_version INTEGER NOT NULL DEFAULT -1;
+      UPDATE cancellation_intents
+      SET request_idempotency_key = (
+        SELECT idempotency_key FROM commands WHERE commands.command_id = cancellation_intents.request_command_id
+      )
+      WHERE EXISTS (
+        SELECT 1 FROM commands WHERE commands.command_id = cancellation_intents.request_command_id
+      );
+      UPDATE cancellation_intents
+      SET request_expected_state_version = (
+        SELECT CAST(json_extract(request_json, '$.expectedStateVersion') AS INTEGER)
+        FROM commands WHERE commands.command_id = cancellation_intents.request_command_id
+      )
+      WHERE EXISTS (
+        SELECT 1 FROM commands WHERE commands.command_id = cancellation_intents.request_command_id
+      );
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -517,6 +540,8 @@ export interface StoredCancellationIntent {
   reason: string;
   status: "REQUESTED" | "SIGNAL_PENDING" | "SIGNALLED" | "CANCELLED" | "UNCERTAIN";
   requestCommandId: string;
+  requestIdempotencyKey: string;
+  requestExpectedStateVersion: number;
   adapterOutcomeJson: string | null;
   reconciliationJson: string | null;
   requestedAt: string;
@@ -2332,6 +2357,8 @@ function parseCancellationIntentRow(row: Row): StoredCancellationIntent {
     reason: stringValue(row.reason, "cancellation_intents.reason"),
     status,
     requestCommandId: stringValue(row.request_command_id, "cancellation_intents.request_command_id"),
+    requestIdempotencyKey: stringValue(row.request_idempotency_key, "cancellation_intents.request_idempotency_key"),
+    requestExpectedStateVersion: numberValue(row.request_expected_state_version, "cancellation_intents.request_expected_state_version"),
     adapterOutcomeJson: nullableString(row.adapter_outcome_json, "cancellation_intents.adapter_outcome_json"),
     reconciliationJson: nullableString(row.reconciliation_json, "cancellation_intents.reconciliation_json"),
     requestedAt: stringValue(row.requested_at, "cancellation_intents.requested_at"),

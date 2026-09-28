@@ -13,6 +13,7 @@ import {
   HumanGate,
   JsonValue,
   ReviewDecision,
+  ReconcileOutcome,
   ReviewId,
   RunId,
   RunState,
@@ -47,6 +48,7 @@ import type { ArtifactStore } from "./artifacts.js";
 import { KerbsFlowError, NotFoundError } from "./errors.js";
 import {
   CommandMutation,
+  CommandMutationContext,
   ReadModel,
   RunLaunchBinding,
   SqlTransaction,
@@ -1226,6 +1228,7 @@ export class KerbsFlowCore {
     reason: string,
     commandId?: CommandId,
     observedStateVersion = expectedStateVersion,
+    requestIdentity?: Pick<Extract<Command, { kind: "cancel" }>, "commandId" | "idempotencyKey" | "expectedStateVersion">,
   ): CommandResult {
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
@@ -1236,6 +1239,21 @@ export class KerbsFlowCore {
       kind: "cancel",
       reason,
     });
+    const externalCommand = requestIdentity === undefined
+      ? command
+      : parseCommand({
+          schemaVersion: CONTRACT_VERSIONS.command,
+          commandId: requestIdentity.commandId,
+          idempotencyKey: requestIdentity.idempotencyKey,
+          runId,
+          expectedStateVersion: requestIdentity.expectedStateVersion,
+          kind: "cancel",
+          reason,
+        });
+    if (externalCommand.kind !== "cancel") throw new KerbsFlowError("INTERNAL_COMMAND_ERROR", "cancellation request identity did not parse as Cancel");
+    if (externalCommand.expectedStateVersion !== expectedStateVersion) {
+      throw new KerbsFlowError("CANCELLATION_COMMAND_CONFLICT", "durable cancellation intent must retain the command's original expected state version");
+    }
     return this.store.executeCommandAtObservedVersion(command, observedStateVersion, ({ tx, run, now }) => {
       if (run.state === "IDLE" || run.state === "FAILED" || run.state === "CANCELLED" || run.state === "DONE") {
         throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `cannot cancel from ${run.state}`);
@@ -1244,10 +1262,12 @@ export class KerbsFlowCore {
         throw new KerbsFlowError("ATTEMPT_REQUIRED", "real cancellation requires an active attempt");
       }
       const attempt = this.attemptInTransaction(tx, run.activeAttemptId);
-      const existing = tx.get("SELECT reason FROM cancellation_intents WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
+      const existing = tx.get("SELECT reason, request_command_id, request_idempotency_key, request_expected_state_version FROM cancellation_intents WHERE attempt_id = ?", attempt.attemptId) as Record<string, unknown> | undefined;
       if (existing !== undefined) {
-        if (existing.reason !== reason) {
-          throw new KerbsFlowError("CANCELLATION_INTENT_CONFLICT", "active attempt already has a different durable cancellation intent");
+        if (existing.reason !== reason || existing.request_command_id !== externalCommand.commandId
+          || existing.request_idempotency_key !== externalCommand.idempotencyKey
+          || existing.request_expected_state_version !== externalCommand.expectedStateVersion) {
+          throw new KerbsFlowError("CANCELLATION_COMMAND_CONFLICT", "active attempt already has a different durable external Cancel identity, precondition, or reason");
         }
         return { details: { attemptId: attempt.attemptId, cancellationIntent: "already_persisted" } } satisfies CommandMutation;
       }
@@ -1258,12 +1278,14 @@ export class KerbsFlowCore {
         throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `real attempt cancellation is not allowed from ${run.state}`);
       }
       tx.run(
-        "INSERT INTO cancellation_intents (attempt_id, run_id, reason, status, request_command_id, requested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO cancellation_intents (attempt_id, run_id, reason, status, request_command_id, request_idempotency_key, request_expected_state_version, requested_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         attempt.attemptId,
         runId,
         reason,
         "REQUESTED",
-        command.commandId,
+        externalCommand.commandId,
+        externalCommand.idempotencyKey,
+        externalCommand.expectedStateVersion,
         now,
         now,
       );
@@ -1325,6 +1347,24 @@ export class KerbsFlowCore {
   }
 
   async reconcileRealCancellation(runId: RunId, expectedStateVersion: number, idempotencyKey: string): Promise<CommandResult> {
+    return this.reconcileCancellation(runId, expectedStateVersion, (reconciliation, attemptId) => this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "recovery", {
+      attemptId,
+      phase: "cancel_reconcile",
+      reconciliation: parseJsonValue(reconciliation, "cancellationReconciliation"),
+    }));
+  }
+
+  finalizeCoordinatedCancellation(commandValue: unknown, observedStateVersion: number): Promise<CommandResult> {
+    const command = parseCommand(commandValue);
+    if (command.kind !== "cancel") throw new KerbsFlowError("INTERNAL_COMMAND_ERROR", "coordinated cancellation finalization requires a Cancel command");
+    return this.reconcileCancellation(command.runId, observedStateVersion, () => command);
+  }
+
+  private async reconcileCancellation(
+    runId: RunId,
+    observedStateVersion: number,
+    commandFor: (reconciliation: ReconcileOutcome, attemptId: ReturnType<typeof asAttemptId>) => Command,
+  ): Promise<CommandResult> {
     const model = this.requiredModel(runId);
     const attempt = this.requiredAttempt(model.run.activeAttemptId);
     const intent = this.store.getCancellationIntent(attempt.attemptId);
@@ -1333,12 +1373,13 @@ export class KerbsFlowCore {
     }
     const reconciliation = await this.adapter.reconcile({ runId, taskId: attempt.taskId, attemptId: attempt.attemptId });
     const certainCancellation = reconciliation.outcome === "terminal" && reconciliation.result?.outcome === "cancelled";
-    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "recovery", {
-      attemptId: attempt.attemptId,
-      phase: "cancel_reconcile",
-      reconciliation: parseJsonValue(reconciliation, "cancellationReconciliation"),
-    });
-    return this.store.executeCommand(command, ({ tx, run, now }) => {
+    const command = commandFor(reconciliation, attempt.attemptId);
+    if (command.runId !== runId) throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "cancellation finalization command does not match its run");
+    if (command.kind === "cancel" && (command.reason !== intent.reason || command.commandId !== intent.requestCommandId
+      || command.idempotencyKey !== intent.requestIdempotencyKey || command.expectedStateVersion !== intent.requestExpectedStateVersion)) {
+      throw new KerbsFlowError("CANCELLATION_COMMAND_CONFLICT", "external Cancel identity, precondition, or reason does not match its durable cancellation intent");
+    }
+    const mutation = ({ tx, run, now }: CommandMutationContext): CommandMutation => {
       if (run.activeAttemptId !== attempt.attemptId) {
         throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "cancellation reconciliation no longer matches the active attempt");
       }
@@ -1377,7 +1418,10 @@ export class KerbsFlowCore {
         },
         details: { attemptId: attempt.attemptId, certainCancellation },
       } satisfies CommandMutation;
-    });
+    };
+    return command.kind === "cancel"
+      ? this.store.executeCommandAtObservedVersion(command, observedStateVersion, mutation)
+      : this.store.executeCommand(command, mutation);
   }
 
   recover(runId: RunId, expectedStateVersion: number, idempotencyKey: string, value: unknown): CommandResult {

@@ -75,6 +75,50 @@ test("forward migration creates and verifies an owner-only bounded backup", { sk
   }
 });
 
+test("forward migration retains the external identity and precondition of an unfinished cancellation intent", () => {
+  const db = new DatabaseSync(":memory:");
+  const clock = new FixedClock("2026-09-22T12:34:56.789Z");
+  const runId = asRunId("run_legacy_cancel_intent");
+  const taskId = asTaskId("task_legacy_cancel_intent");
+  const attemptId = asAttemptId("attempt_legacy_cancel_intent");
+  const commandId = asCommandId("command_legacy_cancel_intent");
+  const idempotencyKey = "cancel:legacy:exact-request";
+  const expectedStateVersion = 4;
+  try {
+    applyMigrations(db, MIGRATIONS.slice(0, 11), clock);
+    db.prepare("INSERT INTO runs (run_id, objective, state, state_version, current_task_id, active_attempt_id, created_at, updated_at) VALUES (?, ?, 'EXECUTE', ?, ?, ?, ?, ?)")
+      .run(runId, "legacy cancellation fixture", expectedStateVersion, taskId, attemptId, clock.now(), clock.now());
+    db.prepare("INSERT INTO tasks (task_id, run_id, status, decision_json, created_at, updated_at) VALUES (?, ?, 'active', '{}', ?, ?)")
+      .run(taskId, runId, clock.now(), clock.now());
+    db.prepare("INSERT INTO attempts (attempt_id, run_id, task_id, lifecycle, created_at, updated_at) VALUES (?, ?, ?, 'RUNNING', ?, ?)")
+      .run(attemptId, runId, taskId, clock.now(), clock.now());
+    const request = {
+      schemaVersion: CONTRACT_VERSIONS.command,
+      commandId,
+      idempotencyKey,
+      runId,
+      expectedStateVersion,
+      kind: "cancel",
+      reason: "preserve pending request identity",
+    };
+    db.prepare("INSERT INTO commands (idempotency_key, command_id, run_id, request_hash, request_json, result_json, transition_id, state_version_before, state_version_after, created_at) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)")
+      .run(idempotencyKey, commandId, runId, requestHash(request), JSON.stringify(request), "{}", expectedStateVersion, expectedStateVersion, clock.now());
+    db.prepare("INSERT INTO cancellation_intents (attempt_id, run_id, reason, status, request_command_id, requested_at, updated_at) VALUES (?, ?, ?, 'REQUESTED', ?, ?, ?)")
+      .run(attemptId, runId, request.reason, commandId, clock.now(), clock.now());
+
+    applyMigrations(db, MIGRATIONS, clock);
+    const intent = db.prepare("SELECT request_command_id, request_idempotency_key, request_expected_state_version FROM cancellation_intents")
+      .get() as { request_command_id: string; request_idempotency_key: string; request_expected_state_version: number };
+    assert.deepEqual({ ...intent }, {
+      request_command_id: commandId,
+      request_idempotency_key: idempotencyKey,
+      request_expected_state_version: expectedStateVersion,
+    });
+  } finally {
+    db.close();
+  }
+});
+
 test("backup collision fails closed before retrying a failed migration", () => {
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-backup-failure-"));
   const dbPath = join(root, "state.sqlite");

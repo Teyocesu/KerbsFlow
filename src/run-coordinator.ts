@@ -7,6 +7,7 @@ import {
   type CommandResult,
   type RunId,
   type TaskId,
+  asCommandId,
   asTaskId,
   isTerminalState,
   parseAdapterDescriptor,
@@ -69,7 +70,7 @@ interface PauseClaim {
 
 interface CancelClaim {
   request: CoordinatorCancelRequest;
-  operation: Promise<CommandResult>;
+  operation?: Promise<CommandResult>;
 }
 
 interface RunReservation {
@@ -109,9 +110,10 @@ export class RunCoordinator {
   ) {
     this.profile = canonicalTrustedLaunchProfile(launchProfile);
     const unfinished = this.store.listUnfinishedRuns();
-    if (unfinished.length > 0) {
-      this.reservation = newReservation(unfinished[0]!.runId, true);
+    if (unfinished.length > 1) {
+      throw new KerbsFlowError("MULTIPLE_UNFINISHED_RUNS", "startup found multiple unfinished runs; one RunCoordinator cannot truthfully own more than one drive");
     }
+    if (unfinished.length === 1) this.reservation = newReservation(unfinished[0]!.runId, true);
   }
 
   get activeRunId(): RunId | undefined {
@@ -135,6 +137,9 @@ export class RunCoordinator {
     if (this.reservation !== undefined) {
       if (this.reservation.runId !== request.runId) {
         throw new KerbsFlowError("ACTIVE_RUN_CONFLICT", `run ${this.reservation.runId} owns the coordinator slot`);
+      }
+      if (this.reservation.startupBlocked) {
+        throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "startup found an unfinished run without an owned Phase2 drive; Start cannot claim continuation");
       }
       const taskId = this.reservation.taskId ?? this.ids.next("task");
       const binding = this.reservation.launchBinding ?? this.binding(request.runId, asTaskId(taskId));
@@ -283,36 +288,51 @@ export class RunCoordinator {
     });
     if (command.kind !== "cancel") throw new KerbsFlowError("INTERNAL_COMMAND_ERROR", "cancel request did not parse as cancel");
     const replay = this.store.replayCommand(command);
-    if (replay?.to === "CANCELLED") return Promise.resolve(replay);
-    const persistedRun = replay === undefined ? undefined : this.store.getRun(request.runId);
-    if (persistedRun !== undefined && isTerminalState(persistedRun.state)) {
-      if (persistedRun.state === "CANCELLED") {
-        return Promise.resolve({ ...replay!, replayed: true, to: persistedRun.state, stateVersion: persistedRun.stateVersion });
-      }
-      throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `run ${request.runId} is already terminal at ${persistedRun.state}`);
+    if (replay !== undefined) {
+      if (replay.to === "CANCELLED" || replay.to === "RECOVERY") return Promise.resolve(replay);
+      throw new KerbsFlowError("CANCEL_COMMAND_INCOMPLETE", "the external Cancel identity already has a nonterminal result; refusing to replace or reinterpret its durable command result");
     }
 
     const reservation = this.requireReservation(request.runId);
     const existing = reservation.cancelClaim;
     if (existing !== undefined) {
-      if (sameCancelRequest(existing.request, request)) return existing.operation;
+      if (sameCancelRequest(existing.request, request)) return existing.operation!;
       throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another Cancel already owns this run's control boundary");
     }
-    if (replay === undefined) this.assertRequestVersion(request.runId, request.expectedStateVersion);
+    const current = this.store.getRun(request.runId);
+    if (current === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} does not exist`);
+    const activeIntent = current.activeAttemptId === null ? undefined : this.store.getCancellationIntent(current.activeAttemptId);
+    if (activeIntent === undefined) {
+      this.assertRequestVersion(request.runId, request.expectedStateVersion);
+    } else if (activeIntent.requestCommandId !== request.commandId || activeIntent.requestIdempotencyKey !== request.idempotencyKey
+      || activeIntent.requestExpectedStateVersion !== request.expectedStateVersion || activeIntent.reason !== request.reason) {
+      throw new KerbsFlowError("CANCELLATION_COMMAND_CONFLICT", "the active attempt already belongs to a different external Cancel identity, precondition, or reason");
+    }
     if (reservation.pauseClaim !== undefined) {
       reservation.pauseClaim.resume.resolve("cancel");
       reservation.pauseClaim.quiescent.resolve();
     }
     reservation.cancelRequested = true;
-    const operation = this.finishCancel(reservation, request, replay !== undefined).then((result) => {
+    const claim: CancelClaim = { request };
+    claim.operation = this.finishCancel(reservation, request).then((result) => {
       const current = this.store.getRun(reservation.runId);
       if (reservation.driveSettled && current !== undefined && isTerminalState(current.state) && this.reservation === reservation) {
         this.reservation = undefined;
       }
       return result;
+    }).finally(() => {
+      if (reservation.cancelClaim === claim) delete reservation.cancelClaim;
+      const current = this.store.getRun(reservation.runId);
+      const attemptId = current?.activeAttemptId;
+      const intent = attemptId === null || attemptId === undefined ? undefined : this.store.getCancellationIntent(attemptId);
+      if (intent === undefined) {
+        reservation.cancelRequested = false;
+      } else if (intent.status === "REQUESTED") {
+        reservation.signalledAttempts.delete(intent.attemptId);
+      }
     });
-    reservation.cancelClaim = { request, operation };
-    return operation;
+    reservation.cancelClaim = claim;
+    return claim.operation;
   }
 
   private async finishPause(reservation: RunReservation, claim: PauseClaim): Promise<CommandResult> {
@@ -339,13 +359,11 @@ export class RunCoordinator {
     return result;
   }
 
-  private async finishCancel(reservation: RunReservation, request: CoordinatorCancelRequest, replayedRequest: boolean): Promise<CommandResult> {
+  private async finishCancel(reservation: RunReservation, request: CoordinatorCancelRequest): Promise<CommandResult> {
     const initial = this.store.getRun(request.runId);
     if (initial === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} does not exist`);
     if (isTerminalState(initial.state)) {
-      const stored = replayedRequest ? this.store.replayCommand(parseCancelCommand(request)) : undefined;
-      if (stored === undefined) throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `run ${request.runId} is already terminal at ${initial.state}`);
-      return { ...stored, replayed: true, to: initial.state, stateVersion: initial.stateVersion };
+      throw new KerbsFlowError("CANCEL_NOT_ALLOWED", `run ${request.runId} is already terminal at ${initial.state}`);
     }
 
     const attempt = initial.activeAttemptId === null ? undefined : this.store.getAttempt(initial.activeAttemptId);
@@ -356,47 +374,52 @@ export class RunCoordinator {
     const realAttempt = nonterminalAttempt && descriptor?.adapter !== "fake";
 
     if (realAttempt && attempt !== undefined) {
-      let requestResult: CommandResult | undefined;
-      try {
-        if (!replayedRequest || this.store.getCancellationIntent(attempt.attemptId) === undefined) {
-          requestResult = this.core.requestRealCancellation(
+      let intent = this.store.getCancellationIntent(attempt.attemptId);
+      if (intent === undefined) {
+        try {
+          this.core.requestRealCancellation(
             request.runId,
             request.expectedStateVersion,
-            request.idempotencyKey,
+            internalCancellationKey(request.idempotencyKey, "request"),
             request.reason,
-            request.commandId,
+            asCommandId(this.ids.next("command")),
             initial.stateVersion,
+            { commandId: request.commandId, idempotencyKey: request.idempotencyKey, expectedStateVersion: request.expectedStateVersion },
           );
+        } catch (error) {
+          if (!(error instanceof KerbsFlowError) || error.code !== "ATTEMPT_NOT_ACTIVE") throw error;
+          const latest = this.store.getAttempt(attempt.attemptId);
+          if (latest === undefined || latest.lifecycle === "PREPARED" || latest.lifecycle === "RUNNING" || latest.lifecycle === "UNKNOWN") throw error;
+          await this.waitForCancelBoundary(reservation);
+          const current = this.store.getRun(request.runId);
+          if (current === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared during Cancel`);
+          return this.core.cancelAfterQuiescence(request.runId, request.expectedStateVersion, current.stateVersion, request.idempotencyKey, request.reason, request.commandId);
         }
-      } catch (error) {
-        if (!(error instanceof KerbsFlowError) || error.code !== "ATTEMPT_NOT_ACTIVE") throw error;
-        const latest = this.store.getAttempt(attempt.attemptId);
-        if (latest === undefined || latest.lifecycle === "PREPARED" || latest.lifecycle === "RUNNING" || latest.lifecycle === "UNKNOWN") throw error;
-        await this.waitForCancelBoundary(reservation);
-        const current = this.store.getRun(request.runId);
-        if (current === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared during Cancel`);
-        return this.core.cancelAfterQuiescence(request.runId, request.expectedStateVersion, current.stateVersion, request.idempotencyKey, request.reason, request.commandId);
+        intent = this.store.getCancellationIntent(attempt.attemptId);
       }
-
-      const intent = this.store.getCancellationIntent(attempt.attemptId);
       if (intent === undefined) {
         throw new KerbsFlowError("CANCELLATION_INTENT_REQUIRED", "real nonterminal attempt lacks durable cancellation intent");
       }
-      if (requestResult?.to === "CANCELLED") {
-        await this.waitForCancelBoundary(reservation);
-        return requestResult;
+      if (intent.requestCommandId !== request.commandId || intent.requestIdempotencyKey !== request.idempotencyKey
+        || intent.requestExpectedStateVersion !== request.expectedStateVersion || intent.reason !== request.reason) {
+        throw new KerbsFlowError("CANCELLATION_COMMAND_CONFLICT", "the active attempt already belongs to a different external Cancel identity, precondition, or reason");
       }
-      if (!reservation.startupBlocked && !replayedRequest && descriptor !== undefined && intent.status === "REQUESTED"
+      if (!reservation.startupBlocked && descriptor !== undefined && intent.status === "REQUESTED"
         && !reservation.signalledAttempts.has(attempt.attemptId)) {
         reservation.signalledAttempts.add(attempt.attemptId);
         const current = this.store.getRun(request.runId);
         if (current === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared before cancellation signal`);
-        this.core.signalRealCancellation(request.runId, current.stateVersion, internalCancellationKey(request.idempotencyKey, "signal"));
+        try {
+          this.core.signalRealCancellation(request.runId, current.stateVersion, internalCancellationKey(request.idempotencyKey, "signal"));
+        } catch (error) {
+          const afterSignal = this.store.getCancellationIntent(attempt.attemptId);
+          if (afterSignal === undefined || afterSignal.status === "REQUESTED") throw error;
+        }
       }
       await this.waitForCancelBoundary(reservation, this.profile.executionTimeoutMs);
       const current = this.store.getRun(request.runId);
       if (current === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared before cancellation reconciliation`);
-      return this.core.reconcileRealCancellation(request.runId, current.stateVersion, internalCancellationKey(request.idempotencyKey, "reconcile"));
+      return this.core.finalizeCoordinatedCancellation(parseCancelCommand(request), current.stateVersion);
     }
 
     await this.waitForCancelBoundary(reservation);
@@ -554,7 +577,7 @@ function sameCancelRequest(left: CoordinatorCancelRequest, right: CoordinatorCan
   return sameControlRequest(left, right) && left.reason === right.reason;
 }
 
-function internalCancellationKey(idempotencyKey: string, phase: "signal" | "reconcile"): string {
+function internalCancellationKey(idempotencyKey: string, phase: "request" | "signal" | "reconcile"): string {
   const digest = createHash("sha256").update(idempotencyKey, "utf8").digest("hex");
   return `run-coordinator:${digest}:${phase}`;
 }
