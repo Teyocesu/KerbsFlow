@@ -1,0 +1,319 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
+import { request as httpRequest, type IncomingMessage } from "node:http";
+
+import { asGateId, asInstructionId, asRunId, asTaskId, type RunId } from "../src/contracts.js";
+import { createPhase2PlanningDecision } from "../src/planning.js";
+import { createPhase6CStack, waitFor } from "./phase6c-harness.js";
+
+interface HttpResponse {
+  status: number;
+  body: string;
+}
+
+interface Snapshot {
+  run: { runId: string; state: string; stateVersion: number; pauseContract: { resumeTarget: string } | null };
+  activeAttempt: { attemptId: string; lifecycle: string } | null;
+  currentGate: { gateId: string; status: string; options: Array<{ id: string; target: string }> } | null;
+  pendingSteer: Record<string, unknown> | null;
+}
+
+test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop and durable state", async (suite) => {
+  await suite.test("Start ownership, Steer secrecy/consumption, quiescent Pause and persisted Resume target", async () => {
+    const stack = createPhase6CStack({ holdFirstInitialPlan: true, phaseCheck: true });
+    const runId = asRunId("run_phase6c_pause_steer");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      const started = await post(stack.api, token, "/v1/runs", envelope("command_6c_start", "idem_6c_start", 0, {
+        runId,
+        objective: "create the synthetic result",
+      }));
+      assert.equal(started.status, 200);
+      assert.equal(json(started).to, "INTAKE");
+      assert.equal(stack.coordinator.activeRunId, runId, "the real coordinator must own the accepted HTTP Start");
+      const binding = stack.store.getRunLaunchBinding(runId);
+      assert.ok(binding, "Start must persist the trusted host-side launch binding");
+      assert.equal(binding.canonicalRepositoryPath, realpathSync(stack.repository.root));
+      assert.equal(binding.launchProfileId, "phase6c-synthetic-profile");
+      assert.equal(stack.store.getRun("run_phase6c_competing" as typeof runId), undefined);
+
+      const firstPlan = await stack.firstInitialPlanStarted.promise;
+      assert.equal(stack.store.getRun(runId)?.state, "PLAN");
+      const competing = await post(stack.api, token, "/v1/runs", envelope("command_6c_competing", "idem_6c_competing", 0, {
+        runId: "run_phase6c_competing",
+        objective: "must not acquire the active slot",
+      }));
+      assert.equal(competing.status, 409);
+      assert.equal(errorCode(competing), "ACTIVE_RUN_CONFLICT");
+      assert.equal(stack.store.getRun("run_phase6c_competing" as typeof runId), undefined);
+
+      const beforeSteer = await snapshot(stack.api, token, runId);
+      const steerText = "QA cedar instruction: keep this synthetic change narrow";
+      const steered = await post(stack.api, token, `/v1/runs/${runId}/steer`, envelope("command_6c_steer", "idem_6c_steer", beforeSteer.run.stateVersion, { text: steerText }));
+      assert.equal(steered.status, 200);
+      const pending = await snapshot(stack.api, token, runId);
+      assert.deepEqual(Object.keys(pending.pendingSteer ?? {}).sort(), ["createdAt", "instructionId", "pending"]);
+      assert.equal(JSON.stringify(pending).includes(steerText), false, "raw Steer text must stay out of the snapshot projection");
+      assert.equal(firstPlan.steer.text, null, "the first in-flight plan must have observed no Steer");
+
+      stack.releaseFirstInitialPlan.resolve();
+      const retriedPlan = await waitFor(() => stack.planningInputs.initial.length >= 2 ? stack.planningInputs.initial[1] : undefined, "stale Planning Master retry");
+      assert.equal(retriedPlan.steer.text, steerText, "the retried planning boundary must receive the queued Steer");
+      const activeHandle = await stack.adapter.started.promise;
+      const active = await snapshot(stack.api, token, runId);
+      assert.equal(active.run.state, "EXECUTE");
+      assert.equal(active.activeAttempt?.attemptId, activeHandle.attemptId);
+      assert.equal(stack.adapter.requests.length, 1);
+
+      let pauseFinished = false;
+      const pauseResponsePromise = post(stack.api, token, `/v1/runs/${runId}/pause`, envelope("command_6c_pause", "idem_6c_pause", active.run.stateVersion, {}))
+        .then((response) => { pauseFinished = true; return response; });
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(pauseFinished, false, "Pause must remain pending while the owned executor is active");
+      assert.equal(stack.store.getRun(runId)?.state, "EXECUTE", "the run cannot claim PAUSED before executor quiescence");
+      assert.equal(stack.store.getAttempt(activeHandle.attemptId)?.lifecycle, "RUNNING");
+
+      stack.adapter.finish(activeHandle, "succeeded");
+      const pausedResponse = await pauseResponsePromise;
+      assert.equal(pausedResponse.status, 200);
+      assert.equal(json(pausedResponse).to, "PAUSED");
+      const paused = await snapshot(stack.api, token, runId);
+      assert.equal(paused.run.state, "PAUSED");
+      assert.equal(paused.run.pauseContract?.resumeTarget, "VERIFY_FOCUSED");
+      assert.equal(stack.store.getRun(runId)?.pauseContract?.resumeTarget, "VERIFY_FOCUSED");
+
+      const stale = await post(stack.api, token, `/v1/runs/${runId}/steer`, envelope("command_6c_stale", "idem_6c_stale", active.run.stateVersion, { text: "stale mutation" }));
+      assert.equal(stale.status, 409);
+      assert.equal(stack.store.getRun(runId)?.state, "PAUSED", "a stale API mutation cannot create a false transition");
+      const repaired = await snapshot(stack.api, token, runId);
+      assert.equal(repaired.run.state, "PAUSED");
+      assert.equal(repaired.run.stateVersion, paused.run.stateVersion, "the authoritative snapshot supplies the current version");
+
+      const resumed = await post(stack.api, token, `/v1/runs/${runId}/resume`, envelope("command_6c_resume", "idem_6c_resume", paused.run.stateVersion, {}));
+      assert.equal(resumed.status, 200);
+      assert.equal(json(resumed).to, "VERIFY_FOCUSED");
+      await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "same Phase2 drive to complete focused and phase verification");
+      assert.equal(stack.adapter.requests.length, 1, "resume must continue the existing drive without replaying execution");
+      assert.equal((await snapshot(stack.api, token, runId)).pendingSteer, null);
+      const instructionId = String(pending.pendingSteer?.instructionId);
+      const instruction = stack.store.getSteerInstruction(asInstructionId(instructionId));
+      assert.ok(instruction?.consumedAt, "the accepted plan must consume the Steer exactly once");
+      assert.equal(stack.store.getSteerInstruction(asInstructionId(instructionId))?.instructionId, instructionId);
+      const eventStream = await readSse(stack.api, token, runId, stack.store.listTransitions(runId).length);
+      assert.equal(eventStream.includes(steerText), false, "raw Steer text must not appear in the production SSE projection");
+      assert.equal((await get(stack.api, token, "/app.js")).status, 200, "LocalApiServer must serve the production UI asset");
+
+      const terminal = await post(stack.api, token, `/v1/runs/${runId}/cancel`, envelope("command_6c_cleanup", "idem_6c_cleanup", (await snapshot(stack.api, token, runId)).run.stateVersion, { reason: "finish synthetic integration fixture" }));
+      assert.equal(terminal.status, 200);
+      assert.equal(json(terminal).to, "CANCELLED");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("persisted human gate rejects stale/unoffered choices and accepts a scoped option", async () => {
+    const stack = createPhase6CStack();
+    const runId = asRunId("run_phase6c_gate");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      const started = await post(stack.api, token, "/v1/runs", envelope("command_gate_start", "idem_gate_start", 0, { runId, objective: "reach a synthetic human gate" }));
+      assert.equal(started.status, 200);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "blocked");
+      await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "integrated HUMAN_GATE");
+      const gateSnapshot = await snapshot(stack.api, token, runId);
+      const gate = gateSnapshot.currentGate;
+      assert.ok(gate);
+      const transitionsBefore = stack.store.listTransitions(runId).length;
+
+      const invalidOption = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_gate_invalid", "idem_gate_invalid", gateSnapshot.run.stateVersion, { optionId: "not-offered", note: "" }));
+      assert.equal(invalidOption.status, 409);
+      assert.equal(errorCode(invalidOption), "GATE_OPTION_INVALID");
+      assert.equal(stack.store.listTransitions(runId).length, transitionsBefore);
+
+      const staleOption = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_gate_stale", "idem_gate_stale", gateSnapshot.run.stateVersion - 1, { optionId: "cancel", note: "stale" }));
+      assert.equal(staleOption.status, 409);
+      assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
+      assert.equal((await snapshot(stack.api, token, runId)).currentGate?.gateId, gate.gateId, "snapshot repair retains the authoritative open gate");
+
+      assert.ok(gate.options.some((option) => option.id === "cancel" && option.target === "CANCELLED"));
+      const resolved = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_gate_resolve", "idem_gate_resolve", gateSnapshot.run.stateVersion, { optionId: "cancel", note: "QA chose the explicit cancel option" }));
+      assert.equal(resolved.status, 200);
+      assert.equal(json(resolved).to, "CANCELLED");
+      const repaired = await snapshot(stack.api, token, runId);
+      assert.equal(repaired.run.state, "CANCELLED");
+      assert.equal(repaired.currentGate, null);
+      const stored = stack.store.getGate(asGateId(gate.gateId));
+      assert.equal(stored?.status, "rejected");
+      assert.equal(stored?.gate.resolution?.note, "QA chose the explicit cancel option");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("active Cancel signals once and reaches CANCELLED only with terminal proof", async () => {
+    const stack = createPhase6CStack();
+    const runId = asRunId("run_phase6c_cancel");
+    const commandId = "command_external_cancel_6c";
+    const idempotencyKey = "external-cancel-6c";
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_cancel_start", "idem_cancel_start", 0, { runId, objective: "hold synthetic work for active cancellation" }))).status, 200);
+      const handle = await stack.adapter.started.promise;
+      const active = await snapshot(stack.api, token, runId);
+      assert.equal(active.run.state, "EXECUTE");
+      const cancelled = await post(stack.api, token, `/v1/runs/${runId}/cancel`, envelope(commandId, idempotencyKey, active.run.stateVersion, { reason: "physical control QA cancellation" }));
+      assert.equal(cancelled.status, 200);
+      const response = json(cancelled);
+      assert.equal(response.to, "CANCELLED");
+      assert.equal(response.commandId, commandId, "HTTP must return the external command identity");
+      assert.equal(response.idempotencyKey, idempotencyKey);
+      assert.equal(stack.adapter.cancelCalls, 1, "the coordinator may signal the active adapter at most once");
+      assert.equal((await snapshot(stack.api, token, runId)).run.state, "CANCELLED");
+      const intent = stack.store.getCancellationIntent(handle.attemptId);
+      assert.equal(intent?.status, "CANCELLED");
+      assert.equal(stack.store.getAttempt(handle.attemptId)?.lifecycle, "CANCELLED");
+      assert.equal((await stack.adapter.reconcile({ runId, taskId: handle.taskId, attemptId: handle.attemptId })).outcome, "terminal");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("headless Phase2 remains usable without starting LocalApiServer", async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId("run_phase6c_headless");
+    try {
+      const taskId = stack.store.getRunLaunchBinding(runId)?.taskId;
+      assert.equal(taskId, undefined, "headless Phase2 is not prebound by a UI/server Start");
+      const plannedTaskId = asTaskId("task_phase6c_headless");
+      const decision = createPhase2PlanningDecision({
+        decisionId: "decision_phase6c_headless",
+        runId,
+        taskId: plannedTaskId,
+        objective: "complete a headless synthetic Phase2 run",
+        acceptance: ["the synthetic result passes the independent check"],
+        positiveScope: ["result.txt"],
+        negativeScope: ["docs", "test"],
+        model: "synthetic-model",
+        canonicalContext: "headless phase6c control integration",
+      });
+      const headless = stack.phase2.run({
+        runId,
+        taskId: plannedTaskId,
+        objective: decision.action.summary,
+        repositoryPath: stack.repository.root,
+        expectedBaseOid: stack.repository.head,
+        planningDecision: decision,
+        focusedCheck: { name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
+        phaseCheck: { level: "phase", commandId: "phase6c-headless-check", name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
+        executionTimeoutMs: 5_000,
+      });
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "succeeded");
+      const result = await headless;
+      assert.equal(result.verdict, "PASS");
+      assert.equal(stack.adapter.requests.length, 1);
+      assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
+    } finally {
+      await stack.close();
+    }
+  });
+});
+
+function envelope(commandId: string, idempotencyKey: string, expectedStateVersion: number, payload: Record<string, unknown>) {
+  return { schemaVersion: "kerbsflow.local-command/v1", commandId, idempotencyKey, expectedStateVersion, payload };
+}
+
+function json(response: HttpResponse): Record<string, unknown> {
+  return JSON.parse(response.body) as Record<string, unknown>;
+}
+
+function errorCode(response: HttpResponse): unknown {
+  const error = json(response).error;
+  return typeof error === "object" && error !== null && !Array.isArray(error)
+    ? (error as Record<string, unknown>).code
+    : undefined;
+}
+
+async function bootstrapToken(api: ReturnType<typeof createPhase6CStack>["api"]): Promise<string> {
+  const response = await get(api, undefined, "/");
+  assert.equal(response.status, 200);
+  const token = /<meta name="kerbsflow-token" content="([A-Za-z0-9_-]+)">/u.exec(response.body)?.[1];
+  assert.ok(token, "bootstrap document must provide its per-launch token");
+  return token;
+}
+
+async function snapshot(api: ReturnType<typeof createPhase6CStack>["api"], token: string, runId: RunId): Promise<Snapshot> {
+  const response = await get(api, token, `/v1/runs/${runId}/snapshot`);
+  assert.equal(response.status, 200);
+  return JSON.parse(response.body) as Snapshot;
+}
+
+function post(api: ReturnType<typeof createPhase6CStack>["api"], token: string, path: string, body: unknown): Promise<HttpResponse> {
+  return request(api, token, path, "POST", body);
+}
+
+function get(api: ReturnType<typeof createPhase6CStack>["api"], token: string | undefined, path: string): Promise<HttpResponse> {
+  return request(api, token, path, "GET");
+}
+
+function request(api: ReturnType<typeof createPhase6CStack>["api"], token: string | undefined, path: string, method: "GET" | "POST", body?: unknown): Promise<HttpResponse> {
+  const headers: Record<string, string> = { host: `127.0.0.1:${api.port()}` };
+  if (path !== "/") {
+    assert.ok(token);
+    headers["X-KerbsFlow-Token"] = token;
+  }
+  if (method === "POST") {
+    headers.origin = `http://127.0.0.1:${api.port()}`;
+    headers["content-type"] = "application/json";
+  }
+  const payload = body === undefined ? undefined : JSON.stringify(body);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({ hostname: "127.0.0.1", port: api.port(), path, method, headers, setHost: false, agent: false }, (response) => {
+      response.setEncoding("utf8");
+      let content = "";
+      response.on("data", (chunk: string) => { content += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, body: content }));
+    });
+    req.on("error", reject);
+    req.end(payload);
+  });
+}
+
+function readSse(api: ReturnType<typeof createPhase6CStack>["api"], token: string, runId: RunId, expectedEvents: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest({
+      hostname: "127.0.0.1",
+      port: api.port(),
+      path: `/v1/runs/${runId}/events`,
+      method: "GET",
+      headers: { host: `127.0.0.1:${api.port()}`, "X-KerbsFlow-Token": token, "Last-Event-ID": "0" },
+      setHost: false,
+      agent: false,
+    }, (response: IncomingMessage) => {
+      let content = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk: string) => {
+        content += chunk;
+        const eventCount = content.split("\n\n").filter((frame) => frame.includes("event: state")).length;
+        if (eventCount >= expectedEvents) {
+          response.destroy();
+          resolve(content);
+        }
+      });
+      response.on("error", () => { /* the request is intentionally closed after the persisted cursor is read */ });
+      setTimeout(() => {
+        response.destroy();
+        reject(new Error("timed out reading persisted SSE state events"));
+      }, 2_000).unref();
+    });
+    req.on("error", (error) => {
+      if (!/socket hang up/u.test(error.message)) reject(error);
+    });
+    req.end();
+  });
+}

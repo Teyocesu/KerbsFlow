@@ -537,10 +537,11 @@ function updateMutationControls(session) {
   const state = session.currentState;
   const terminal = state === "IDLE" || state === "FAILED" || state === "CANCELLED" || state === "DONE";
   const busy = session.mutationInFlight === true;
+  const steerBytes = updateSteerByteCount();
   elements.pauseControl.disabled = busy || terminal || state === "PAUSED";
   elements.resumeControl.disabled = busy || state !== "PAUSED";
   elements.steerText.disabled = busy || terminal;
-  elements.steerSubmit.disabled = busy || terminal || elements.steerText.value.length === 0 || updateSteerByteCount() > 4096;
+  elements.steerSubmit.disabled = busy || terminal || elements.steerText.value.length === 0 || steerBytes > 4096;
   elements.cancelReason.disabled = busy || terminal;
   elements.cancelSubmit.disabled = busy || terminal || elements.cancelReason.value.trim() === "";
   const gateOpen = session.currentGateStatus === "open";
