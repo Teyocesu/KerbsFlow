@@ -1,4 +1,7 @@
 # KerbsFlow handoff
 
-- Phase 6C.3 implementation, focused integration, and physical macOS control QA are complete on `phase6/thin-local-ui`; independent review is pending and Phase 6C remains open.
-- Next action: independent review of Phase 6C.3. Do not start Phase 6D.
+- Phase 6A complete.
+- Phase 6B CLOSED / PASS.
+- Phase 6C CLOSED / PASS at e0f2c111ad02a280f5e3e20700923dc9550855da.
+- Phase 6D has not started.
+- Next action: Phase 6D — UX hardening.
