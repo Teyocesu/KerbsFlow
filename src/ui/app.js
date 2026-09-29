@@ -50,6 +50,8 @@ const elements = {
 
 let currentSession;
 let startInFlight = false;
+let pageSessionInvalid = false;
+const invalidSessionMessage = "The local session is invalid. Reload this page to start a new session.";
 
 class MutationIdentityError extends Error {
   constructor() {
@@ -59,7 +61,7 @@ class MutationIdentityError extends Error {
 }
 
 function isCurrent(session) {
-  return currentSession === session && !session.controller.signal.aborted;
+  return !pageSessionInvalid && currentSession === session && !session.controller.signal.aborted;
 }
 
 function valueText(value) {
@@ -74,19 +76,35 @@ function setText(element, value) {
 }
 
 function setConnection(message, state) {
+  if (pageSessionInvalid) {
+    message = "Session invalid";
+    state = "error";
+  }
   setText(elements.connection, message);
   elements.connection.dataset.state = state;
 }
 
 function setPageStatus(message, state) {
+  if (pageSessionInvalid) {
+    message = invalidSessionMessage;
+    state = "error";
+  }
   setText(elements.pageStatus, message);
   elements.pageStatus.dataset.state = state;
   elements.pageStatus.hidden = false;
 }
 
 function clearPageStatus() {
+  if (pageSessionInvalid) {
+    setPageStatus(invalidSessionMessage, "error");
+    return;
+  }
   if (currentSession?.notice !== undefined) {
     setPageStatus(currentSession.notice.message, currentSession.notice.state);
+    return;
+  }
+  if (currentSession?.reconnecting === true) {
+    setPageStatus("The event connection was lost. Reconnecting; the displayed snapshot may be stale.", "warning");
     return;
   }
   if (elements.pageStatus.hidden) return;
@@ -96,6 +114,7 @@ function clearPageStatus() {
 }
 
 function setSessionNotice(session, message, state = "error") {
+  if (pageSessionInvalid) return;
   session.notice = { message, state };
   if (isCurrent(session)) setPageStatus(message, state);
 }
@@ -103,6 +122,24 @@ function setSessionNotice(session, message, state = "error") {
 function clearSessionNotice(session) {
   delete session.notice;
   if (isCurrent(session)) clearPageStatus();
+}
+
+function invalidatePageSession() {
+  if (pageSessionInvalid) return;
+  pageSessionInvalid = true;
+  currentSession?.controller.abort();
+  currentSession?.snapshotController?.abort();
+  for (const controller of currentSession?.artifactControllers ?? []) controller.abort();
+  if (currentSession?.refreshTimer !== undefined) window.clearTimeout(currentSession.refreshTimer);
+  for (const control of [
+    elements.newRun, elements.switchRun,
+    ...elements.startForm.querySelectorAll("input, textarea, button"),
+    ...elements.form.querySelectorAll("input, button"),
+    ...elements.emptyForm.querySelectorAll("input, button"),
+  ]) control.disabled = true;
+  if (currentSession !== undefined) updateMutationControls(currentSession);
+  setConnection("Session invalid", "error");
+  setPageStatus(invalidSessionMessage, "error");
 }
 
 function randomHex() {
@@ -115,6 +152,7 @@ function randomHex() {
 }
 
 async function postMutation(path, runId, expectedStateVersion, payload) {
+  if (pageSessionInvalid) throw new Error("local session invalid");
   let identity;
   try {
     identity = {
@@ -364,7 +402,7 @@ function renderHumanGate(snapshot, session) {
       choose.dataset.mutation = "gate";
       choose.setAttribute("aria-label", "Choose gate option " + valueText(option.label));
       choose.textContent = "Choose this option";
-      choose.disabled = session.mutationInFlight === true;
+      choose.disabled = pageSessionInvalid || session.mutationInFlight === true;
       choose.addEventListener("click", () => {
         void resolveGate(session, valueText(item.gateId), option.id, note.value);
       });
@@ -535,7 +573,7 @@ function updateSteerByteCount() {
 }
 
 function updateMutationControls(session) {
-  const invalid = session.sessionInvalid === true;
+  const invalid = pageSessionInvalid;
   const state = session.currentState;
   const terminal = invalid || state === "IDLE" || state === "FAILED" || state === "CANCELLED" || state === "DONE";
   const busy = invalid || session.mutationInFlight === true;
@@ -599,10 +637,7 @@ function renderSnapshot(snapshot, session) {
 
 function showApiFailure(status, session, keepConnection) {
   if (status === 401) {
-    session.sessionInvalid = true;
-    setConnection("Session invalid", "error");
-    setPageStatus("The local session is invalid. Reload this page to start a new session.", "error");
-    if (session.hasSnapshot) updateMutationControls(session);
+    invalidatePageSession();
     return;
   }
   if (status === 404) {
@@ -611,19 +646,21 @@ function showApiFailure(status, session, keepConnection) {
     setPageStatus("Run not found. Check the run ID and load it again.", "error");
     return;
   }
+  if (session.reconnecting === true) {
+    clearPageStatus();
+    return;
+  }
   if (!keepConnection) setConnection("Not connected", "error");
   setPageStatus("The local API returned an error (HTTP " + status + ").", "error");
 }
 
 async function refreshAfterMutationFailure(session, response) {
-  const failure = await safeMutationError(response);
-  if (!isCurrent(session)) return;
   if (response.status === 401) {
-    session.sessionInvalid = true;
-    setConnection("Session invalid", "error");
-    setSessionNotice(session, failure.message);
+    invalidatePageSession();
     return;
   }
+  const failure = await safeMutationError(response);
+  if (!isCurrent(session)) return;
   setSessionNotice(session, failure.message);
   if (response.status === 404 || response.status === 409 || response.status >= 500) {
     const refreshed = await refreshSnapshot(session);
@@ -651,10 +688,6 @@ function commandPath(session, command) {
 
 async function submitRunMutation(session, command, payload, kind, gateId) {
   if (!isCurrent(session) || session.mutationInFlight) return;
-  if (session.sessionInvalid === true) {
-    setSessionNotice(session, "The local session is invalid. Reload this page before sending commands.");
-    return;
-  }
   if (!Number.isSafeInteger(session.stateVersion)) {
     setSessionNotice(session, "A current snapshot is required before sending a command.");
     return;
@@ -760,7 +793,7 @@ async function resolveGate(session, gateId, optionId, note) {
 
 async function startRun(event) {
   event.preventDefault();
-  if (startInFlight) return;
+  if (pageSessionInvalid || startInFlight) return;
   const objective = elements.startObjective.value;
   if (objective.trim() === "") {
     elements.startObjective.focus();
@@ -800,6 +833,10 @@ async function startRun(event) {
     }
 
     if (!sent.response.ok) {
+      if (sent.response.status === 401) {
+        invalidatePageSession();
+        return;
+      }
       const failure = await safeMutationError(sent.response);
       if (sent.response.status === 409 && [
         "RUN_CONTINUATION_UNAVAILABLE",
@@ -844,7 +881,7 @@ async function startRun(event) {
     }
   } finally {
     startInFlight = false;
-    elements.startButton.disabled = false;
+    elements.startButton.disabled = pageSessionInvalid;
   }
 }
 
@@ -858,6 +895,10 @@ async function fetchSnapshot(session) {
       headers: { "X-KerbsFlow-Token": apiToken },
       signal: controller.signal,
     });
+    if (response.status === 401) {
+      invalidatePageSession();
+      return false;
+    }
     if (!isCurrent(session)) return false;
     if (!response.ok) {
       showApiFailure(response.status, session, session.hasSnapshot);
@@ -880,7 +921,8 @@ async function fetchSnapshot(session) {
   } catch {
     if (isCurrent(session) && !controller.signal.aborted) {
       if (!session.hasSnapshot) setConnection("Not connected", "error");
-      setPageStatus("The local API is unavailable or returned an invalid snapshot.", "error");
+      if (session.reconnecting === true) clearPageStatus();
+      else setPageStatus("The local API is unavailable or returned an invalid snapshot.", "error");
     }
     return false;
   } finally {
@@ -983,7 +1025,7 @@ function eventPath(session) {
 async function runEventStream(session) {
   let failedConnections = 0;
   let repairRefreshRequired = false;
-  while (isCurrent(session) && !session.sessionInvalid && !session.runUnavailable) {
+  while (isCurrent(session) && !session.runUnavailable) {
     const attempt = new AbortController();
     const abortAttempt = () => attempt.abort();
     session.controller.signal.addEventListener("abort", abortAttempt, { once: true });
@@ -997,8 +1039,12 @@ async function runEventStream(session) {
         },
         signal: attempt.signal,
       });
+      if (response.status === 401) {
+        invalidatePageSession();
+        return;
+      }
       if (!isCurrent(session)) return;
-      if (response.status === 401 || response.status === 404) {
+      if (response.status === 404) {
         showApiFailure(response.status, session, false);
         return;
       }
@@ -1009,24 +1055,26 @@ async function runEventStream(session) {
 
       if (repairRefreshRequired) {
         const refreshed = await refreshSnapshot(session);
-        if (!isCurrent(session) || session.sessionInvalid || session.runUnavailable) return;
+        if (!isCurrent(session) || session.runUnavailable) return;
         if (!refreshed) throw new Error("snapshot refresh failed");
         repairRefreshRequired = false;
       }
       connectedAt = Date.now();
+      session.reconnecting = false;
       setConnection("Connected", "connected");
       clearPageStatus();
       await consumeEvents(response, session);
       if (!isCurrent(session)) return;
       throw new Error("event stream ended");
     } catch {
-      if (!isCurrent(session) || session.sessionInvalid || session.runUnavailable) return;
+      if (!isCurrent(session) || session.runUnavailable) return;
       repairRefreshRequired = true;
+      session.reconnecting = true;
       if (connectedAt !== undefined && Date.now() - connectedAt >= 30_000) failedConnections = 0;
       setConnection("Reconnecting", "reconnecting");
-      setPageStatus("The event connection was lost. Reconnecting and refreshing the snapshot.", "error");
+      clearPageStatus();
       await refreshSnapshot(session);
-      if (!isCurrent(session) || session.sessionInvalid || session.runUnavailable) return;
+      if (!isCurrent(session) || session.runUnavailable) return;
       const delay = Math.min(500 * (2 ** failedConnections), 5000);
       failedConnections += 1;
       await waitForReconnect(session, delay);
@@ -1078,6 +1126,7 @@ function resetDashboard() {
 }
 
 async function loadRun(runId, notice) {
+  if (pageSessionInvalid) return currentSession;
   stopSession();
   resetDashboard();
   elements.runInput.value = runId;
@@ -1104,7 +1153,7 @@ async function loadRun(runId, notice) {
   setPageStatus("Loading the authoritative run snapshot.", "");
 
   const loaded = await refreshSnapshot(session);
-  if (!isCurrent(session) || !loaded || session.sessionInvalid || session.runUnavailable) return session;
+  if (!isCurrent(session) || !loaded || session.runUnavailable) return session;
   setConnection("Connecting event stream", "loading");
   void runEventStream(session);
   return session;
@@ -1141,6 +1190,7 @@ function closeRunSelector() {
 }
 
 elements.switchRun.addEventListener("click", () => {
+  if (pageSessionInvalid) return;
   if (!elements.form.hidden) {
     closeRunSelector();
     return;
@@ -1151,6 +1201,7 @@ elements.switchRun.addEventListener("click", () => {
   elements.runInput.select();
 });
 elements.newRun.addEventListener("click", () => {
+  if (pageSessionInvalid) return;
   elements.startRunInput.value = "";
   void loadRun("").then(() => elements.startObjective.focus());
 });
@@ -1219,12 +1270,7 @@ elements.cancelForm.addEventListener("submit", (event) => {
 });
 
 if (apiToken === "") {
-  setConnection("Session invalid", "error");
-  setPageStatus("The local session token is unavailable. Reload this page.", "error");
-  elements.startRunInput.disabled = true;
-  elements.startObjective.disabled = true;
-  elements.startButton.disabled = true;
-  elements.emptyRunInput.disabled = true;
+  invalidatePageSession();
 } else {
   setConnection("Not connected", "idle");
   clearPageStatus();
