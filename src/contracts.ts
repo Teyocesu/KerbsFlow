@@ -252,6 +252,7 @@ export interface CancelCommand extends CommandBase {
 }
 
 export const STEER_TEXT_MAX_UTF8_BYTES = 4096;
+export const CANCEL_REASON_MAX_UTF8_BYTES = 1024;
 
 export interface SteerCommand extends CommandBase {
   kind: "steer";
@@ -752,7 +753,7 @@ export function parseCommand(value: unknown, path = "command"): Command {
       return { ...base, kind };
     case "cancel":
       assertKeys(object, ["schemaVersion", "commandId", "idempotencyKey", "runId", "expectedStateVersion", "kind", "reason"], path);
-      return { ...base, kind, reason: boundedString(object.reason, `${path}.reason`, 1000) };
+      return { ...base, kind, reason: parseCancelReason(object.reason, `${path}.reason`) };
     case "steer":
       assertKeys(object, ["schemaVersion", "commandId", "idempotencyKey", "runId", "expectedStateVersion", "kind", "text"], path);
       return { ...base, kind, text: parseSteerText(object.text, `${path}.text`) };
@@ -1476,6 +1477,17 @@ export function parseSteerText(value: unknown, path = "text"): string {
   const byteLength = Buffer.byteLength(value, "utf8");
   if (byteLength > STEER_TEXT_MAX_UTF8_BYTES) {
     throw new ContractValidationError(path, `must be at most ${STEER_TEXT_MAX_UTF8_BYTES} UTF-8 bytes`);
+  }
+  return value;
+}
+
+export function parseCancelReason(value: unknown, path = "reason"): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ContractValidationError(path, "must be a non-empty string");
+  }
+  const byteLength = Buffer.byteLength(value, "utf8");
+  if (byteLength > CANCEL_REASON_MAX_UTF8_BYTES) {
+    throw new ContractValidationError(path, `must be at most ${CANCEL_REASON_MAX_UTF8_BYTES} UTF-8 bytes`);
   }
   return value;
 }

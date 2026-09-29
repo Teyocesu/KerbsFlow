@@ -27,7 +27,7 @@ import { FakeAdapter } from "../src/fake.js";
 import { LocalApiServer, type ArtifactReader } from "../src/local-api.js";
 import { KerbsFlowError } from "../src/errors.js";
 import { StateStore } from "../src/persistence.js";
-import type { CoordinatorCancelRequest, CoordinatorControlRequest, CoordinatorStartRequest, RunCoordinator } from "../src/run-coordinator.js";
+import type { CoordinatorCancelRequest, CoordinatorControlRequest, CoordinatorGateResolutionRequest, CoordinatorStartRequest, RunCoordinator } from "../src/run-coordinator.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 
 interface ApiFixture {
@@ -58,8 +58,8 @@ interface RequestOptions {
   chunked?: boolean;
 }
 
-type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "steer" | "resolveGateScoped">;
-type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel">;
+type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "steer" | "configuration">;
+type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate">;
 
 interface RunningApi {
   fixture: ApiFixture;
@@ -171,7 +171,7 @@ function localApiCore(fixture: ApiFixture, overrides: Partial<LocalApiCore> = {}
   return {
     readModel: (runId) => (overrides.readModel ?? fixture.core.readModel.bind(fixture.core))(runId),
     steer: (...args) => (overrides.steer ?? fixture.core.steer.bind(fixture.core))(...args),
-    resolveGateScoped: (...args) => (overrides.resolveGateScoped ?? fixture.core.resolveGateScoped.bind(fixture.core))(...args),
+    configuration: fixture.core.configuration,
   };
 }
 
@@ -200,6 +200,15 @@ function localApiCoordinator(fixture: ApiFixture, overrides: Partial<LocalApiCoo
       value.expectedStateVersion,
       value.idempotencyKey,
       value.reason,
+      value.commandId,
+    ))))(request),
+    resolveGate: (request) => (overrides.resolveGate ?? ((value: CoordinatorGateResolutionRequest) => Promise.resolve(fixture.core.resolveGateScoped(
+      value.runId,
+      value.expectedStateVersion,
+      value.idempotencyKey,
+      value.gateId,
+      value.optionId,
+      value.note,
       value.commandId,
     ))))(request),
   };
@@ -338,9 +347,19 @@ function startRun(fixture: ApiFixture, runId: RunId): void {
   fixture.core.startRun(runId, "synthetic local API objective", `start:${runId}`);
 }
 
-async function createArtifact(fixture: ApiFixture, runId: RunId, suffix: string): Promise<ArtifactId> {
+async function createArtifact(fixture: ApiFixture, runId: RunId, suffix: string, canonicalRepositoryPath?: string): Promise<ArtifactId> {
   const decision = planFor(runId, suffix);
-  startRun(fixture, runId);
+  if (canonicalRepositoryPath === undefined) {
+    startRun(fixture, runId);
+  } else {
+    fixture.core.startRunWithLaunchBinding(runId, "synthetic local API objective", `start:${runId}`, {
+      runId,
+      taskId: decision.taskId,
+      canonicalRepositoryPath,
+      launchProfileId: "synthetic-profile",
+      launchProfileHash: "8".repeat(64),
+    });
+  }
   fixture.core.completeIntake(runId, 1, `${suffix}:intake`);
   fixture.core.plan(runId, 2, `${suffix}:plan`, decision);
   const prepared = fixture.core.prepareExecution(runId, 3, `${suffix}:prepare`);
@@ -960,7 +979,38 @@ test("bounded persistence reads validate IDs, limits, cursors, and chronological
 test("snapshot returns a bounded persisted projection and omits artifact paths", async () => {
   await withApi(async ({ fixture, api, token }) => {
     const runId = asRunId("run_local_api_snapshot");
-    const artifactId = await createArtifact(fixture, runId, "api_snapshot");
+    const canonicalRepositoryPath = "/Users/synthetic/private-repository/kerbsflow";
+    const artifactId = await createArtifact(fixture, runId, "api_snapshot", canonicalRepositoryPath);
+    fixture.store.recordCanonicalSnapshot({
+      runId,
+      repositoryPath: canonicalRepositoryPath,
+      baseOid: "synthetic-base",
+      hashes: { "docs/SPEC-v0.1.0.md": "synthetic-canonical-hash-secret" },
+    });
+    fixture.store.recordFailureOccurrence({
+      runId,
+      taskId: asTaskId("task_api_snapshot"),
+      attemptId: null,
+      fingerprint: "snapshot-retry",
+      failureClass: "implementation_failure",
+      reasonCode: "retry_after_check_failure",
+      normalizedJson: "{\"diagnostic\":\"raw normalized diagnostics sentinel\"}",
+      routeJson: "{\"route\":\"raw route json sentinel\"}",
+      resultingAction: "retry_same_route",
+      escalationReason: null,
+    });
+    fixture.store.recordFailureOccurrence({
+      runId,
+      taskId: asTaskId("task_api_snapshot"),
+      attemptId: null,
+      fingerprint: "snapshot-rework",
+      failureClass: "implementation_failure",
+      reasonCode: "rework_after_check_failure",
+      normalizedJson: "{\"diagnostic\":\"raw normalized diagnostics sentinel\"}",
+      routeJson: "{\"route\":\"raw route json sentinel\"}",
+      resultingAction: "rework",
+      escalationReason: "/Users/synthetic/private-escalation-reason",
+    });
     let version = fixture.core.readModel(runId)!.run.stateVersion;
     for (let index = 0; index < 26; index += 1) {
       version = fixture.core.pause(runId, version, `snapshot:pause:${index}`).stateVersion;
@@ -971,17 +1021,42 @@ test("snapshot returns a bounded persisted projection and omits artifact paths",
     assert.equal(response.headers["content-type"], "application/json; charset=utf-8");
     assert.equal(response.headers["cache-control"], "no-store");
     const snapshot = JSON.parse(response.body) as Record<string, unknown> & {
-      run: { runId: string; stateVersion: number };
+      run: { runId: string; stateVersion: number; state: string; phase: string; phaseSource: string; recoveryRequired: boolean };
       currentTask: { action: { positiveScope: string[] }; route: { adapter: string; model: string } };
       activeAttempt: { adapter: string; model: string };
+      project: { status: string; name: string | null };
+      supervision: {
+        canonical: { status: string; capturedAt: string | null; specCaptured: boolean };
+        scopeCheck: { name: string; status: string; evidenceClass: string | null };
+        invariants: { source: string; effectiveMaxImplementationAttempts: number; interpretation: string };
+        retryEscalation: {
+          taskStatus: string;
+          policyDecisionCounts: { retry_same_route: number; rework: number; escalate: number };
+          latestDecision: { reasonCode: string; action: string; escalationReason: string | null } | null;
+        };
+      };
       pendingSteer: null;
       recentTransitions: Array<{ sequence: number }>;
       artifacts: Array<Record<string, unknown>>;
       transitionCursor: number;
     };
-    assert.deepEqual(Object.keys(snapshot).sort(), ["activeAttempt", "artifacts", "currentGate", "currentTask", "latestReview", "latestValidation", "pendingSteer", "recentTransitions", "run", "schemaVersion", "transitionCursor"].sort());
+    assert.deepEqual(Object.keys(snapshot).sort(), ["activeAttempt", "artifacts", "currentGate", "currentTask", "latestReview", "latestValidation", "pendingSteer", "project", "recentTransitions", "run", "schemaVersion", "supervision", "transitionCursor"].sort());
     assert.equal(snapshot.schemaVersion, "kerbsflow.local-snapshot/v1");
     assert.equal(snapshot.run.runId, runId);
+    assert.equal(snapshot.run.phase, "verification");
+    assert.equal(snapshot.run.phaseSource, "run_state");
+    assert.equal(snapshot.project.status, "available");
+    assert.equal(snapshot.project.name, "kerbsflow");
+    assert.equal(snapshot.supervision.canonical.status, "captured");
+    assert.equal(snapshot.supervision.canonical.specCaptured, true);
+    assert.equal(snapshot.supervision.scopeCheck.status, "not_checked");
+    assert.equal(snapshot.supervision.invariants.source, "effective_core_configuration");
+    assert.equal(snapshot.supervision.invariants.effectiveMaxImplementationAttempts, fixture.core.configuration.effectiveMaxImplementationAttempts);
+    assert.equal(snapshot.supervision.invariants.interpretation, "enforced policy; not a run-wide validation pass");
+    assert.deepEqual(snapshot.supervision.retryEscalation.policyDecisionCounts, { retry_same_route: 1, rework: 1, escalate: 0 });
+    assert.equal(snapshot.supervision.retryEscalation.taskStatus, "available");
+    assert.equal(snapshot.supervision.retryEscalation.latestDecision?.action, "rework");
+    assert.equal(snapshot.supervision.retryEscalation.latestDecision?.escalationReason, "[path redacted]");
     assert.equal(snapshot.pendingSteer, null);
     assert.equal(snapshot.run.stateVersion, fixture.core.readModel(runId)?.run.stateVersion);
     assert.equal(snapshot.currentTask.route.adapter, "[redacted]");
@@ -998,7 +1073,7 @@ test("snapshot returns a bounded persisted projection and omits artifact paths",
     assert.equal(snapshot.artifacts.length, 1);
     assert.equal(snapshot.artifacts[0]?.artifactId, artifactId);
     assert.deepEqual(Object.keys(snapshot.artifacts[0] ?? {}).sort(), ["artifactId", "attemptId", "contentHash", "createdAt", "kind", "redactionState", "retentionCategory", "runId", "sizeBytes"].sort());
-    assert.doesNotMatch(response.body, /relativePath|databasePath|worktreePath|providerIdentityJson|payloadJson|ghp_syntheticCredential123456|\/Users\/synthetic\/worktree/u);
+    assert.doesNotMatch(response.body, /relativePath|databasePath|worktreePath|providerIdentityJson|payloadJson|ghp_syntheticCredential123456|\/Users\/synthetic\/(?:worktree|private-repository|private-escalation-reason)|synthetic-canonical-hash-secret|raw normalized diagnostics sentinel|raw route json sentinel/u);
     assert.equal((await sendRequest(api, "/v1/runs/run_local_api_missing/snapshot", { origin: `http://127.0.0.1:${api.port()}`, token })).status, 404);
   }, {
     core: (fixture) => ({

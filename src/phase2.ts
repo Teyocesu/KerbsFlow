@@ -1,7 +1,9 @@
 import {
   CONTRACT_VERSIONS,
   type ExecutorResult,
+  type AttemptId,
   type FailureClassification,
+  type GateId,
   type CommandResult,
   type PlanningDecision,
   type ReviewDecision,
@@ -56,7 +58,7 @@ export interface Phase2LoopRequest {
 }
 
 export interface Phase2LoopResult {
-  verdict: "PASS" | "REWORK" | "HUMAN_GATE" | "RECOVERY" | "FAILED";
+  verdict: "PASS" | "REWORK" | "HUMAN_GATE" | "RECOVERY" | "FAILED" | "CANCELLED";
   intake?: RepositoryIntake;
   worktree?: WorktreeRecord;
   executorResult?: ExecutorResult;
@@ -68,6 +70,7 @@ export interface Phase2LoopResult {
 
 export interface Phase2DriveControls {
   checkpoint?: () => Promise<number | void>;
+  waitForGateResolution?: (boundary: { gateId: GateId; taskId: TaskId; attemptId: AttemptId }) => Promise<number>;
   planningMaster?: PlanningMaster;
 }
 
@@ -153,7 +156,77 @@ export class Phase2Loop {
       await checkpoint();
       const afterExecution = this.store.readModel(request.runId);
       if (afterExecution === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared`);
-      if (afterExecution.run.state === "HUMAN_GATE") return { verdict: "HUMAN_GATE", intake, worktree, attempts, stateVersion: afterExecution.run.stateVersion };
+      if (afterExecution.run.state === "HUMAN_GATE") {
+        const gate = afterExecution.currentGate;
+        const blockedAttempt = afterExecution.activeAttempt;
+        const blockedResult = blockedAttempt?.outcomeJson === null || blockedAttempt?.outcomeJson === undefined
+          ? undefined
+          : parseExecutorResult(JSON.parse(blockedAttempt.outcomeJson));
+        const heldExecutorGate = controls.waitForGateResolution !== undefined
+          && gate?.status === "open" && gate.gate.status === "open"
+          && gate.taskId === request.taskId && gate.attemptId !== null
+          && blockedAttempt?.lifecycle === "BLOCKED" && blockedAttempt.attemptId === gate.attemptId
+          && blockedResult?.runId === request.runId && blockedResult.taskId === request.taskId
+          && blockedResult.attemptId === gate.attemptId && blockedResult.outcome === "blocked"
+          && blockedResult.failureClass !== null
+          && blockedResult.humanGate?.gateId === gate.gateId
+          && blockedResult.humanGate.taskId === gate.taskId
+          && blockedResult.humanGate.attemptId === gate.attemptId;
+        if (!heldExecutorGate || gate === undefined || blockedAttempt === undefined || blockedResult === undefined) {
+          return { verdict: "HUMAN_GATE", intake, worktree, attempts, stateVersion: afterExecution.run.stateVersion };
+        }
+
+        const resolvedStateVersion = await controls.waitForGateResolution!({ gateId: gate.gateId, taskId: request.taskId, attemptId: blockedAttempt.attemptId });
+        await checkpoint();
+        const resolvedModel = this.store.readModel(request.runId);
+        if (resolvedModel === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared after human-gate resolution`);
+        if (resolvedModel.run.stateVersion < resolvedStateVersion) {
+          throw new KerbsFlowError("PHASE2_GATE_RESOLUTION_VERSION_INVALID", "the persisted run version moved behind its held-gate checkpoint");
+        }
+        if (resolvedModel.run.state === "REWORK") {
+          const resolvedGate = this.store.getGate(gate.gateId);
+          if (resolvedModel.run.currentTaskId !== request.taskId
+            || resolvedModel.run.activeAttemptId !== blockedAttempt.attemptId
+            || resolvedModel.activeAttempt?.attemptId !== blockedAttempt.attemptId
+            || resolvedModel.activeAttempt.outcomeJson !== blockedAttempt.outcomeJson
+            || resolvedGate?.status !== "resolved"
+            || resolvedGate.gate.resolution?.optionId === undefined
+            || !gate.gate.options.some((option) => option.id === resolvedGate.gate.resolution!.optionId && option.target === "REWORK")) {
+            throw new KerbsFlowError("PHASE2_GATE_REWORK_BOUNDARY_INVALID", "the persisted REWORK transition no longer matches the held executor result and gate option");
+          }
+          const failure: ReworkFailureContext = {
+            failureClass: blockedResult.failureClass!,
+            reasonCode: gate.gate.reasonCode,
+            summary: gate.gate.summary,
+            resultingAction: "rework",
+          };
+          nextEscalationReason = undefined;
+          nextSelectionReason = "human gate resolution selected bounded rework";
+          const reworked = await this.acceptRework(
+            request,
+            resolvedModel.run.stateVersion,
+            decision,
+            failure,
+            `${request.runId}:human-gate-rework:${attempts}`,
+            currentRoutingDecision,
+            nextSelectionReason,
+            planningMaster,
+            controls.checkpoint,
+          );
+          command = reworked.command;
+          decision = reworked.decision;
+          currentRoutingDecision = reworked.routingDecision;
+          this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
+          continue;
+        }
+        if (resolvedModel.run.state === "FAILED") {
+          return { verdict: "FAILED", intake, worktree, attempts, stateVersion: resolvedModel.run.stateVersion };
+        }
+        if (resolvedModel.run.state === "CANCELLED") {
+          return { verdict: "CANCELLED", intake, worktree, attempts, stateVersion: resolvedModel.run.stateVersion };
+        }
+        throw new KerbsFlowError("PHASE2_GATE_RESOLUTION_UNSUPPORTED", `held executor gate resolved to unsupported state ${resolvedModel.run.state}`);
+      }
       if (afterExecution.run.state === "RECOVERY") return { verdict: "RECOVERY", intake, worktree, attempts, stateVersion: afterExecution.run.stateVersion };
       if (afterExecution.run.state !== "VERIFY_FOCUSED" || afterExecution.activeAttempt?.outcomeJson === null || afterExecution.activeAttempt === undefined) {
         throw new KerbsFlowError("PHASE2_BOUNDARY_INVALID", `executor completed at unexpected state ${afterExecution.run.state}`);

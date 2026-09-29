@@ -49,13 +49,14 @@ test("LocalApiServer serves fixed dashboard assets with the bootstrap and securi
     core: {
       readModel: () => undefined,
       steer: () => { throw new Error("unexpected UI asset test Steer call"); },
-      resolveGateScoped: () => { throw new Error("unexpected UI asset test gate call"); },
+      configuration: fixture.core.configuration,
     },
     coordinator: {
       start: () => { throw new Error("unexpected UI asset test Start call"); },
       pause: async () => { throw new Error("unexpected UI asset test Pause call"); },
       resume: async () => { throw new Error("unexpected UI asset test Resume call"); },
       cancel: async () => { throw new Error("unexpected UI asset test Cancel call"); },
+      resolveGate: async () => { throw new Error("unexpected UI asset test gate call"); },
     },
     store: fixture.store,
     artifacts: {
@@ -171,8 +172,11 @@ test("dashboard keeps stale-session, repair-ordering, and notice-survival guards
 
 function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw new Error("unexpected request"); }) {
   class Element {
-    constructor(readonly id = "") {}
-    textContent = "";
+    constructor(readonly id = "", readonly tagName = "element") {}
+    private ownText = "";
+    children: Element[] = [];
+    get textContent() { return this.ownText + this.children.map((child) => child.textContent).join(""); }
+    set textContent(value: string) { this.ownText = value; this.children = []; }
     dataset: Record<string, string> = {};
     hidden = false;
     disabled = false;
@@ -182,6 +186,7 @@ function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw
     addEventListener(name: string, listener: (event: { preventDefault(): void }) => void) {
       this.listeners.set(name, listener);
     }
+    append(...children: Element[]) { this.children.push(...children); }
     querySelectorAll() {
       const formControls: Record<string, string[]> = {
         "start-form": ["start-run-id", "start-objective", "start-run"],
@@ -190,13 +195,14 @@ function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw
       };
       return (formControls[this.id] ?? []).map((id) => document.getElementById(id));
     }
-    replaceChildren() {}
+    replaceChildren(...children: Element[]) { this.ownText = ""; this.children = [...children]; }
     setAttribute() {}
     removeAttribute() {}
     focus() {}
   }
   class MetaElement extends Element { content = "test-token"; }
   const nodes = new Map<string, Element>();
+  const createdTags: string[] = [];
   const document = {
     querySelector: () => new MetaElement(),
     querySelectorAll: () => [],
@@ -204,14 +210,51 @@ function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw
       if (!nodes.has(id)) nodes.set(id, new Element(id));
       return nodes.get(id);
     },
+    createElement(tagName: string) { createdTags.push(tagName); return new Element("", tagName); },
+    createTextNode(value: string) { const node = new Element("", "#text"); node.textContent = value; return node; },
   };
   const context = createContext({
     document, HTMLMetaElement: MetaElement, fetch, AbortController, TextEncoder, TextDecoder,
     window: { setTimeout: (callback: () => void) => setTimeout(callback, 0), clearTimeout },
   });
   runInContext(readFileSync(new URL("../../src/ui/app.js", import.meta.url), "utf8"), context);
-  return { context, node: (id: string) => document.getElementById(id)! };
+  return { context, node: (id: string) => document.getElementById(id)!, createdTags };
 }
+
+test("dashboard renders added supervision facts as inert text in the existing Overview regions", () => {
+  const { context, node, createdTags } = dashboardContext();
+  const acceptance = "Keep this literal <img src=x onerror=alert(1)>";
+  const snapshot = {
+    run: {
+      runId: "run_render", state: "RECOVERY", phase: "recovery", phaseSource: "run_state", stateVersion: 4,
+      recoveryRequired: true, recoveryReason: "synthetic reconciliation required",
+      pauseContract: { originState: "EXECUTE", durableBoundary: "uncertain_activity", resumeTarget: "RECOVERY" },
+    },
+    project: { status: "available", name: "kerbsflow" },
+    currentTask: { action: { kind: "implementation", summary: "Render safely", acceptance: [acceptance], validationLevel: "focused", positiveScope: [], negativeScope: [] }, route: {} },
+    activeAttempt: null,
+    supervision: {
+      canonical: { status: "captured", capturedAt: "2026-09-25T12:00:00.000Z", specCaptured: true },
+      scopeCheck: { name: "Git base and scope", status: "not_checked", evidenceClass: null },
+      invariants: { enforcedPolicy: { legalTransitions: true, singleActiveExecutor: true, independentEvidence: true, secretsAbsentFromPersistence: true, highImpactHumanGates: true, automaticReleaseActions: true, ambiguousReplay: true, executorCannotVerify: true, maxImplementationAttempts: 3 }, effectiveMaxImplementationAttempts: 3, interpretation: "enforced policy; not a run-wide validation pass", observedChecks: {} },
+      retryEscalation: { taskStatus: "available", policyDecisionCounts: { retry_same_route: 1, rework: 0, escalate: 0 }, recordedAttempts: 1, latestDecision: null },
+    },
+    currentGate: null, pendingSteer: null, latestValidation: null, latestReview: null,
+    recentTransitions: [], artifacts: [], transitionCursor: 0,
+  };
+  runInContext(`renderSnapshot(snapshotForRender, sessionForRender)`, Object.assign(context, {
+    snapshotForRender: snapshot,
+    sessionForRender: { runId: "run_render", currentState: "RECOVERY", stateVersion: 4, currentGateId: undefined, currentGateStatus: undefined, snapshot, hasSnapshot: true, mutationInFlight: false, controller: new AbortController(), artifactControllers: new Set() },
+  }));
+  assert.match(node("current-work-content").textContent, /Required validationFocused/u);
+  assert.ok(node("current-work-content").textContent.includes(acceptance));
+  assert.match(node("execution-context").textContent, /Captured; current files not checked/u);
+  assert.match(node("execution-context").textContent, /Pause originEXECUTE/u);
+  assert.match(node("execution-context").textContent, /Recovery requiredYes/u);
+  assert.match(node("execution-context").textContent, /Recovery reasonsynthetic reconciliation required/u);
+  assert.match(node("execution-context").textContent, /persisted run state/u);
+  assert.equal(createdTags.includes("img"), false, "untrusted acceptance remains text, not a created element");
+});
 
 test("runtime 401 locks the page through New run and blocks later Start and load requests", async () => {
   let requests = 0;

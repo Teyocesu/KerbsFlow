@@ -292,6 +292,9 @@ function renderCurrentWork(snapshot) {
   elements.currentWork.replaceChildren();
   const metadata = document.createElement("dl");
   metadata.className = "task-metadata";
+  addDetail(metadata, "Action", action.kind === undefined ? undefined : displayLabel(action.kind));
+  addDetail(metadata, "Required validation", action.validationLevel === undefined ? undefined : displayLabel(action.validationLevel));
+  addDetail(metadata, "Acceptance", asArray(action.acceptance).join(" · "));
   addDetail(metadata, "Adapter", attempt.adapter ?? route.adapter);
   addDetail(metadata, "Model", attempt.model ?? route.model);
   addDetail(metadata, "Attempt", attempt.attemptId, true);
@@ -522,6 +525,54 @@ function sortedTransitions(snapshot) {
 
 function renderExecutionContext(snapshot) {
   elements.context.replaceChildren();
+  const run = asObject(snapshot.run);
+  const project = asObject(snapshot.project);
+  const supervision = asObject(snapshot.supervision);
+  const canonical = asObject(supervision.canonical);
+  const invariants = asObject(supervision.invariants);
+  const enforcedPolicy = asObject(invariants.enforcedPolicy);
+  const scope = asObject(supervision.scopeCheck);
+  const observedChecks = asObject(invariants.observedChecks);
+  const retryEscalation = asObject(supervision.retryEscalation);
+  const counts = asObject(retryEscalation.policyDecisionCounts);
+  const pauseContract = asObject(run.pauseContract);
+  addDetail(elements.context, "Project", project.status === "available" ? project.name : "Unavailable");
+  addDetail(elements.context, "Lifecycle phase", valueText(run.phase) + " (persisted run state)");
+  addDetail(elements.context, "Canonical snapshot", canonical.status === "captured" ? "Captured; current files not checked" : "Not captured");
+  addDetail(elements.context, "Canonical capture time", canonical.capturedAt);
+  addDetail(elements.context, "SPEC captured", canonical.specCaptured === true ? "Yes" : "No");
+  addDetail(elements.context, "Git base and scope", displayLabel(scope.status) + (scope.evidenceClass ? " (" + displayLabel(scope.evidenceClass) + ")" : ""));
+  addDetail(elements.context, "Observed checks", [observedChecks.originalCheckout, observedChecks.focusedCheckEvidenceIntegrity]
+    .map((checkValue) => {
+      const check = asObject(checkValue);
+      return valueText(check.name) + ": " + displayLabel(check.status) + (check.evidenceClass ? " (" + displayLabel(check.evidenceClass) + ")" : "");
+    }).join(" · "));
+  addDetail(elements.context, "Enforced policy", "Legal transitions " + valueText(enforcedPolicy.legalTransitions)
+    + " · Single active executor " + valueText(enforcedPolicy.singleActiveExecutor)
+    + " · Independent evidence " + valueText(enforcedPolicy.independentEvidence)
+    + " · Secrets absent from persistence " + valueText(enforcedPolicy.secretsAbsentFromPersistence)
+    + " · High impact human gates " + valueText(enforcedPolicy.highImpactHumanGates)
+    + " · Automatic release actions " + valueText(enforcedPolicy.automaticReleaseActions)
+    + " · Ambiguous replay " + valueText(enforcedPolicy.ambiguousReplay)
+    + " · Executor cannot verify " + valueText(enforcedPolicy.executorCannotVerify)
+    + " · Max implementation attempts " + valueText(enforcedPolicy.maxImplementationAttempts));
+  addDetail(elements.context, "Effective attempt limit", invariants.effectiveMaxImplementationAttempts);
+  addDetail(elements.context, "Policy interpretation", invariants.interpretation);
+  addDetail(elements.context, "Failure policy decisions", (retryEscalation.taskStatus === "available" ? "Current task · " : "No current task · ")
+    + "Retry same route " + valueText(counts.retry_same_route)
+    + " · Rework " + valueText(counts.rework) + " · Escalate " + valueText(counts.escalate));
+  addDetail(elements.context, "Recorded attempts", retryEscalation.taskStatus === "available" ? retryEscalation.recordedAttempts : "Unavailable");
+  const latestDecision = retryEscalation.latestDecision;
+  if (latestDecision !== null && latestDecision !== undefined) {
+    const decision = asObject(latestDecision);
+    addDetail(elements.context, "Latest policy decision", displayLabel(decision.action) + " · " + valueText(decision.reasonCode)
+      + (decision.escalationReason ? " · " + valueText(decision.escalationReason) : ""));
+  }
+  if (pauseContract.originState !== undefined) addDetail(elements.context, "Pause origin", pauseContract.originState);
+  if (pauseContract.durableBoundary !== undefined) addDetail(elements.context, "Pause durable boundary", pauseContract.durableBoundary);
+  if (pauseContract.resumeTarget !== undefined) addDetail(elements.context, "Resume target", pauseContract.resumeTarget);
+  addDetail(elements.context, "Recovery required", run.recoveryRequired === true ? "Yes" : "No");
+  if (run.recoveryReason !== null && run.recoveryReason !== undefined) addDetail(elements.context, "Recovery reason", run.recoveryReason);
   const latest = sortedTransitions(snapshot).at(-1);
   if (latest === undefined) {
     addDetail(elements.context, "Latest transition", "No transitions recorded");
@@ -578,12 +629,13 @@ function updateMutationControls(session) {
   const terminal = invalid || state === "IDLE" || state === "FAILED" || state === "CANCELLED" || state === "DONE";
   const busy = invalid || session.mutationInFlight === true;
   const steerBytes = updateSteerByteCount();
+  const cancelBytes = new TextEncoder().encode(elements.cancelReason.value).length;
   elements.pauseControl.disabled = busy || terminal || state === "PAUSED";
   elements.resumeControl.disabled = busy || state !== "PAUSED";
   elements.steerText.disabled = busy || terminal;
   elements.steerSubmit.disabled = busy || terminal || elements.steerText.value.length === 0 || steerBytes > 4096;
   elements.cancelReason.disabled = busy || terminal;
-  elements.cancelSubmit.disabled = busy || terminal || elements.cancelReason.value.trim() === "";
+  elements.cancelSubmit.disabled = busy || terminal || elements.cancelReason.value.trim() === "" || cancelBytes > 1024;
   const gateOpen = session.currentGateStatus === "open";
   for (const note of elements.humanGate.querySelectorAll(".gate-resolution-note")) note.disabled = busy || !gateOpen;
   for (const button of elements.humanGate.querySelectorAll('[data-mutation="gate"]')) {
@@ -1264,6 +1316,11 @@ elements.cancelForm.addEventListener("submit", (event) => {
   if (reason === "") {
     elements.cancelReason.focus();
     setSessionNotice(session, "Enter a brief reason before cancelling the run.");
+    return;
+  }
+  if (new TextEncoder().encode(reason).length > 1024) {
+    setSessionNotice(session, "Cancellation reason must be at most 1024 UTF-8 bytes.");
+    elements.cancelReason.focus();
     return;
   }
   void submitRunMutation(session, "cancel", { reason }, "cancel");

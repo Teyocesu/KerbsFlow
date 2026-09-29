@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 
-import { asGateId, asInstructionId, asRunId, asTaskId, type RunId } from "../src/contracts.js";
+import { asCommandId, asGateId, asInstructionId, asRunId, asTaskId, type RunId } from "../src/contracts.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { createPhase6CStack, waitFor } from "./phase6c-harness.js";
 
@@ -154,6 +154,204 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
     }
   });
 
+  await suite.test("terminal gate resolution settles its drive, coalesces duplicates, and old replay preserves the next Start slot", async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const firstRun = asRunId("run_phase6c_gate_terminal");
+    const nextRun = asRunId("run_phase6c_gate_next_start");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_terminal_start", "idem_terminal_start", 0, { runId: firstRun, objective: "settle one gate-owned drive" }))).status, 200);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "blocked");
+      await waitFor(() => stack.store.getRun(firstRun)?.state === "HUMAN_GATE" ? true : undefined, "held executor gate");
+      const before = await snapshot(stack.api, token, firstRun);
+      const gate = before.currentGate;
+      assert.ok(gate);
+      const terminalCommand = envelope("command_terminal_gate", "idem_terminal_gate", before.run.stateVersion, { optionId: "cancel", note: "terminal duplicate race" });
+      const path = `/v1/runs/${firstRun}/gates/${gate.gateId}/resolve`;
+      const transitionsBefore = stack.store.listTransitions(firstRun).length;
+      const duplicates = await Promise.all([
+        post(stack.api, token, path, terminalCommand),
+        post(stack.api, token, path, terminalCommand),
+      ]);
+      assert.deepEqual(duplicates.map((response) => response.status), [200, 200]);
+      assert.ok(duplicates.every((response) => json(response).to === "CANCELLED"));
+      assert.equal(stack.store.listTransitions(firstRun).length, transitionsBefore + 1, "the gate decision must commit once");
+      assert.equal((await snapshot(stack.api, token, firstRun)).run.state, "CANCELLED");
+      await waitFor(() => stack.coordinator.activeRunId === undefined ? true : undefined, "terminal drive reservation release");
+      assert.equal(stack.store.listUnfinishedRuns().length, 0, "terminal resolution must settle before the next Start can own the slot");
+
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_next_start", "idem_next_start", 0, { runId: nextRun, objective: "own the next drive" }))).status, 200);
+      await waitFor(() => stack.adapter.requests.length === 2 ? stack.adapter.requests[1] : undefined, "executor for the next Start");
+      const nextVersion = stack.store.getRun(nextRun)?.stateVersion;
+      const replay = await post(stack.api, token, path, terminalCommand);
+      assert.equal(replay.status, 200);
+      assert.equal(json(replay).replayed, true);
+      assert.equal(stack.coordinator.activeRunId, nextRun, "replay of the old terminal gate cannot release the new reservation");
+      assert.equal(stack.store.getRun(nextRun)?.stateVersion, nextVersion, "old replay cannot wake or mutate the next drive");
+
+      stack.adapter.finishNext("succeeded");
+      await waitFor(() => stack.store.getRun(nextRun)?.state === "NEXT_PHASE" ? true : undefined, "the next Start's one owned drive");
+      assert.equal(stack.planningInputs.initial.length, 2);
+      assert.equal(stack.adapter.requests.length, 2, "old gate replay must not install or duplicate a drive");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("executor-blocked REWORK resumes the same drive after Pause during execution", async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId("run_phase6c_gate_rework");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_rework_start", "idem_rework_start", 0, { runId, objective: "continue the blocked implementation" }))).status, 200);
+      const firstHandle = await stack.adapter.started.promise;
+      const executing = await snapshot(stack.api, token, runId);
+      const pausePromise = post(stack.api, token, `/v1/runs/${runId}/pause`, envelope("command_rework_pause", "idem_rework_pause", executing.run.stateVersion, {}));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assert.equal(stack.store.getRun(runId)?.state, "EXECUTE", "Pause remains pending until the running executor returns");
+
+      stack.adapter.finish(firstHandle, "blocked");
+      const paused = await pausePromise;
+      assert.equal(paused.status, 200);
+      assert.equal(json(paused).to, "PAUSED");
+      const pausedSnapshot = await snapshot(stack.api, token, runId);
+      assert.equal(pausedSnapshot.run.pauseContract?.resumeTarget, "HUMAN_GATE");
+      const resumed = await post(stack.api, token, `/v1/runs/${runId}/resume`, envelope("command_rework_resume", "idem_rework_resume", pausedSnapshot.run.stateVersion, {}));
+      assert.equal(resumed.status, 200);
+      assert.equal(json(resumed).to, "HUMAN_GATE");
+      const gateSnapshot = await snapshot(stack.api, token, runId);
+      const gate = gateSnapshot.currentGate;
+      assert.ok(gate);
+      const gatePath = `/v1/runs/${runId}/gates/${gate.gateId}/resolve`;
+      const reworkCommand = envelope("command_rework_gate", "idem_rework_gate", gateSnapshot.run.stateVersion, { optionId: "rework", note: "continue the persisted blocked result" });
+      const worktreeBefore = stack.store.getWorktree(runId);
+      const accepted = await post(stack.api, token, gatePath, reworkCommand);
+      assert.equal(accepted.status, 200);
+      assert.equal(json(accepted).to, "REWORK");
+      const replay = await post(stack.api, token, gatePath, reworkCommand);
+      assert.equal(replay.status, 200);
+      assert.equal(json(replay).replayed, true);
+      const secondRequest = await waitFor(() => stack.adapter.requests.length === 2 ? stack.adapter.requests[1] : undefined, "second implementation attempt after gate rework");
+      assert.equal(stack.planningInputs.initial.length, 1, "REWORK must not rerun intake or initial planning");
+      assert.equal(stack.planningInputs.rework.length, 1);
+      assert.equal(stack.planningInputs.rework[0]?.failure.resultingAction, "rework");
+      assert.equal(stack.planningInputs.rework[0]?.failure.failureClass, "security_or_privilege_gate");
+      assert.equal(stack.planningInputs.rework[0]?.failure.reasonCode, "security_or_privilege_gate");
+      assert.equal(secondRequest.taskId, firstHandle.taskId);
+      assert.notEqual(secondRequest.attemptId, firstHandle.attemptId);
+      assert.equal(stack.store.getWorktree(runId)?.worktreePath, worktreeBefore?.worktreePath, "the installed drive reuses its owned worktree");
+      assert.equal(stack.adapter.requests.length, 2, "replayed REWORK must not create another attempt");
+
+      stack.adapter.finishNext("succeeded");
+      await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "focused and phase verification after REWORK");
+      const transitions = stack.store.listTransitions(runId);
+      assert.equal(transitions.filter((transition) => transition.reasonCode === "intake_validated").length, 1);
+      assert.ok(transitions.some((transition) => transition.to === "VERIFY_FOCUSED"));
+      assert.ok(transitions.some((transition) => transition.to === "VERIFY_PHASE"));
+      assert.equal(stack.adapter.requests.length, 2, "the old blocked result is not replayed through execution or verification");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("unsupported gate targets and exhausted REWORK budget fail before mutation", async () => {
+    const stack = createPhase6CStack({ maxImplementationAttempts: 1, extraGateTarget: "PLAN" });
+    const runId = asRunId("run_phase6c_gate_fail_closed");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_fail_closed_start", "idem_fail_closed_start", 0, { runId, objective: "reject unproven gate continuations" }))).status, 200);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "blocked");
+      await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "blocked attempt at an open gate");
+      const gateSnapshot = await snapshot(stack.api, token, runId);
+      const gate = gateSnapshot.currentGate;
+      assert.ok(gate);
+      const transitionsBefore = stack.store.listTransitions(runId);
+      const attemptCount = stack.store.countTaskAttempts(runId, handle.taskId);
+      assert.equal(attemptCount, 1);
+      assert.equal(stack.core.configuration.effectiveMaxImplementationAttempts, 1);
+
+      const unsupported = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_fail_closed_plan", "idem_fail_closed_plan", gateSnapshot.run.stateVersion, { optionId: "unsupported", note: "must remain open" }));
+      assert.equal(unsupported.status, 409);
+      assert.equal(errorCode(unsupported), "GATE_CONTINUATION_UNAVAILABLE");
+      assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
+      assert.equal(stack.store.getGate(asGateId(gate.gateId))?.status, "open");
+      assert.deepEqual(stack.store.listTransitions(runId), transitionsBefore);
+
+      const exhausted = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_fail_closed_rework", "idem_fail_closed_rework", gateSnapshot.run.stateVersion, { optionId: "rework", note: "budget is exhausted" }));
+      assert.equal(exhausted.status, 409);
+      assert.equal(errorCode(exhausted), "GATE_CONTINUATION_UNAVAILABLE");
+      assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
+      assert.equal(stack.store.getGate(asGateId(gate.gateId))?.status, "open");
+      assert.deepEqual(stack.store.listTransitions(runId), transitionsBefore);
+      assert.equal(stack.planningInputs.rework.length, 0);
+      assert.equal(stack.adapter.requests.length, 1);
+
+      const closed = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_fail_closed_cleanup", "idem_fail_closed_cleanup", gateSnapshot.run.stateVersion, { optionId: "cancel", note: "close test run" }));
+      assert.equal(closed.status, 200);
+      assert.equal(json(closed).to, "CANCELLED");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("Pause and Cancel wake a held gate loop without allowing gate-resolution races", async () => {
+    const stack = createPhase6CStack();
+    const runId = asRunId("run_phase6c_gate_controls");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_gate_controls_start", "idem_gate_controls_start", 0, { runId, objective: "hold a blocked gate through Pause and Cancel" }))).status, 200);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "blocked");
+      await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "held executor gate");
+      const gateSnapshot = await snapshot(stack.api, token, runId);
+      const gate = gateSnapshot.currentGate;
+      assert.ok(gate);
+
+      const pause = await post(stack.api, token, `/v1/runs/${runId}/pause`, envelope("command_gate_controls_pause", "idem_gate_controls_pause", gateSnapshot.run.stateVersion, {}));
+      assert.equal(pause.status, 200);
+      assert.equal(json(pause).to, "PAUSED");
+      const paused = await snapshot(stack.api, token, runId);
+      assert.equal(paused.run.pauseContract?.resumeTarget, "HUMAN_GATE");
+      const gateWhilePaused = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope("command_gate_controls_paused_resolve", "idem_gate_controls_paused_resolve", paused.run.stateVersion, { optionId: "cancel", note: "cannot resolve while paused" }));
+      assert.equal(gateWhilePaused.status, 409);
+      assert.equal(stack.store.getGate(asGateId(gate.gateId))?.status, "open");
+
+      const resume = await post(stack.api, token, `/v1/runs/${runId}/resume`, envelope("command_gate_controls_resume", "idem_gate_controls_resume", paused.run.stateVersion, {}));
+      assert.equal(resume.status, 200);
+      assert.equal(json(resume).to, "HUMAN_GATE");
+      const resumed = await snapshot(stack.api, token, runId);
+      const cancelPromise = stack.coordinator.cancel({
+        runId,
+        commandId: asCommandId("command_gate_controls_cancel"),
+        idempotencyKey: "idem_gate_controls_cancel",
+        expectedStateVersion: resumed.run.stateVersion,
+        reason: "Cancel at the held executor gate",
+      });
+      assert.throws(() => stack.coordinator.resolveGate({
+        runId,
+        commandId: asCommandId("command_gate_controls_racing_gate"),
+        idempotencyKey: "idem_gate_controls_racing_gate",
+        expectedStateVersion: resumed.run.stateVersion,
+        gateId: asGateId(gate.gateId),
+        optionId: "rework",
+        note: "must not race a claimed Cancel",
+      }), /control boundary/u);
+      const cancelled = await cancelPromise;
+      assert.equal(cancelled.to, "CANCELLED");
+      assert.equal(stack.store.getRun(runId)?.state, "CANCELLED");
+      assert.equal(stack.adapter.requests.length, 1);
+      assert.equal(stack.coordinator.activeRunId, undefined);
+    } finally {
+      await stack.close();
+    }
+  });
+
   await suite.test("active Cancel signals once and reaches CANCELLED only with terminal proof", async () => {
     const stack = createPhase6CStack();
     const runId = asRunId("run_phase6c_cancel");
@@ -166,7 +364,21 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const handle = await stack.adapter.started.promise;
       const active = await snapshot(stack.api, token, runId);
       assert.equal(active.run.state, "EXECUTE");
-      const cancelled = await post(stack.api, token, `/v1/runs/${runId}/cancel`, envelope(commandId, idempotencyKey, active.run.stateVersion, { reason: "physical control QA cancellation" }));
+      const beforeOverflow = stack.store.getRun(runId);
+      assert.ok(beforeOverflow);
+      const transitionsBeforeOverflow = stack.store.listTransitions(runId);
+      const tooLong = await post(stack.api, token, `/v1/runs/${runId}/cancel`, envelope(commandId, idempotencyKey, active.run.stateVersion, { reason: "€".repeat(1000) }));
+      assert.equal(tooLong.status, 400);
+      assert.equal(stack.store.getRun(runId)?.state, beforeOverflow.state);
+      assert.equal(stack.store.getRun(runId)?.stateVersion, beforeOverflow.stateVersion);
+      assert.deepEqual(stack.store.listTransitions(runId), transitionsBeforeOverflow);
+      assert.equal(stack.store.getCommandIdempotencyKey(asCommandId(commandId)), undefined);
+      assert.equal(stack.store.getCancellationIntent(handle.attemptId), undefined);
+      assert.equal(stack.adapter.cancelCalls, 0);
+
+      const validReason = `${"€".repeat(341)}a`;
+      assert.equal(Buffer.byteLength(validReason, "utf8"), 1024);
+      const cancelled = await post(stack.api, token, `/v1/runs/${runId}/cancel`, envelope(commandId, idempotencyKey, active.run.stateVersion, { reason: validReason }));
       assert.equal(cancelled.status, 200);
       const response = json(cancelled);
       assert.equal(response.to, "CANCELLED");
@@ -176,6 +388,7 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.equal((await snapshot(stack.api, token, runId)).run.state, "CANCELLED");
       const intent = stack.store.getCancellationIntent(handle.attemptId);
       assert.equal(intent?.status, "CANCELLED");
+      assert.equal(intent?.reason, validReason);
       assert.equal(stack.store.getAttempt(handle.attemptId)?.lifecycle, "CANCELLED");
       assert.equal((await stack.adapter.reconcile({ runId, taskId: handle.taskId, attemptId: handle.attemptId })).outcome, "terminal");
     } finally {

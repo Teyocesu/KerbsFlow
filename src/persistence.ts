@@ -484,6 +484,11 @@ export interface StoredFailureOccurrence {
   createdAt: string;
 }
 
+export interface StoredFailurePolicySummary {
+  resultingActionCounts: { retry_same_route: number; rework: number; escalate: number };
+  latestDecision?: { reasonCode: string; action: string; escalationReason: string | null };
+}
+
 export interface StoredCanonicalSnapshot {
   runId: RunId;
   repositoryPath: string;
@@ -1252,6 +1257,36 @@ export class StateStore {
     this.assertOpen();
     const row = this.db.prepare("SELECT COUNT(*) AS count FROM attempts WHERE run_id = ? AND task_id = ?").get(runId, taskId) as Row | undefined;
     return numberValue(row?.count ?? 0, "attempts.count");
+  }
+
+  summarizeFailurePolicy(runId: RunId, taskId: TaskId): StoredFailurePolicySummary {
+    this.assertOpen();
+    const row = this.db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE WHEN resulting_action = 'retry_same_route' THEN 1 ELSE 0 END), 0) AS retry_same_route_count,
+        COALESCE(SUM(CASE WHEN resulting_action = 'rework' THEN 1 ELSE 0 END), 0) AS rework_count,
+        COALESCE(SUM(CASE WHEN resulting_action = 'escalate' THEN 1 ELSE 0 END), 0) AS escalate_count,
+        (SELECT reason_code FROM failure_occurrences WHERE run_id = ? AND task_id = ? ORDER BY sequence DESC LIMIT 1) AS latest_reason_code,
+        (SELECT resulting_action FROM failure_occurrences WHERE run_id = ? AND task_id = ? ORDER BY sequence DESC LIMIT 1) AS latest_action,
+        (SELECT escalation_reason FROM failure_occurrences WHERE run_id = ? AND task_id = ? ORDER BY sequence DESC LIMIT 1) AS latest_escalation_reason
+      FROM failure_occurrences
+      WHERE run_id = ? AND task_id = ?
+    `).get(runId, taskId, runId, taskId, runId, taskId, runId, taskId) as Row | undefined;
+    if (row === undefined) throw new KerbsFlowError("FAILURE_POLICY_SUMMARY_UNAVAILABLE", "failure policy aggregate query returned no row");
+    const reasonCode = nullableString(row.latest_reason_code, "failure_occurrences.latest_reason_code");
+    const action = nullableString(row.latest_action, "failure_occurrences.latest_action");
+    const escalationReason = nullableString(row.latest_escalation_reason, "failure_occurrences.latest_escalation_reason");
+    if ((reasonCode === null) !== (action === null)) {
+      throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "latest failure policy summary fields do not agree");
+    }
+    return {
+      resultingActionCounts: {
+        retry_same_route: numberValue(row.retry_same_route_count, "failure_occurrences.retry_same_route_count"),
+        rework: numberValue(row.rework_count, "failure_occurrences.rework_count"),
+        escalate: numberValue(row.escalate_count, "failure_occurrences.escalate_count"),
+      },
+      ...(reasonCode === null || action === null ? {} : { latestDecision: { reasonCode, action, escalationReason } }),
+    };
   }
 
   listTaskAttempts(runId: RunId, taskId: TaskId): StoredAttempt[] {

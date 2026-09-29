@@ -1,5 +1,6 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { basename } from "node:path";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 
@@ -9,10 +10,12 @@ import {
   asGateId,
   asRunId,
   ContractValidationError,
+  parseCancelReason,
   type ArtifactId,
   type CommandId,
   type CommandResult,
   type RunId,
+  type RunState,
 } from "./contracts.js";
 import type { KerbsFlowCore } from "./core.js";
 import { IdempotencyConflictError, KerbsFlowError, NotFoundError, StateVersionConflictError } from "./errors.js";
@@ -30,8 +33,8 @@ export interface LocalApiServerOptions {
 }
 
 export interface LocalApiServerDependencies {
-  core: Pick<KerbsFlowCore, "readModel" | "steer" | "resolveGateScoped">;
-  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel">;
+  core: Pick<KerbsFlowCore, "readModel" | "steer" | "configuration">;
+  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate">;
   store: StateStore;
   artifacts: ArtifactReader;
 }
@@ -292,7 +295,7 @@ export class LocalApiServer {
         } else {
           const result = await this.dependencies.coordinator.cancel({
             ...control,
-            reason: requiredMutationString(envelope.payload.reason, 1_000),
+            reason: parseCancelReason(envelope.payload.reason, "cancel.reason"),
           });
           this.sendCancelResult(response, result);
         }
@@ -307,15 +310,15 @@ export class LocalApiServer {
         const optionId = requiredMutationString(envelope.payload.optionId, 100);
         const note = optionalMutationText(envelope.payload.note, 4_096);
         if (this.dependencies.store.getGate(gateId) === undefined) throw new NotFoundError("gate", gateId);
-        const result = this.dependencies.core.resolveGateScoped(
+        const result = await this.dependencies.coordinator.resolveGate({
           runId,
-          envelope.expectedStateVersion,
-          envelope.idempotencyKey,
+          commandId: envelope.commandId,
+          idempotencyKey: envelope.idempotencyKey,
+          expectedStateVersion: envelope.expectedStateVersion,
           gateId,
           optionId,
-          note,
-          envelope.commandId,
-        );
+          ...(note === undefined ? {} : { note }),
+        });
         this.sendCommandResult(response, result);
         return;
       }
@@ -339,17 +342,21 @@ export class LocalApiServer {
       run: {
         runId: model.run.runId,
         state: model.run.state,
+        phase: lifecyclePhase(model.run.state),
+        phaseSource: "run_state",
         stateVersion: model.run.stateVersion,
         recoveryRequired: model.run.recoveryRequired,
         recoveryReason: model.run.recoveryReason === null ? null : safeSnapshotText(model.run.recoveryReason, 500),
         pauseContract: model.run.pauseContract,
       },
+      project: snapshotProject(this.dependencies.store.getRunLaunchBinding(runId)?.canonicalRepositoryPath),
       currentTask: snapshotTask(model.currentTask),
       activeAttempt: snapshotAttempt(model),
       currentGate: snapshotGate(model),
       pendingSteer: snapshotPendingSteer(this.dependencies.store.getPendingSteerInstruction(runId)),
       latestValidation: snapshotValidation(model),
       latestReview: snapshotReview(model),
+      supervision: snapshotSupervision(model, this.dependencies.store, this.dependencies.core.configuration),
       recentTransitions: transitions.map(snapshotTransition),
       artifacts: artifacts.map(snapshotArtifact),
       transitionCursor: transitions.at(-1)?.sequence ?? 0,
@@ -715,6 +722,95 @@ function snapshotTask(task: ReadModel["currentTask"]): unknown {
   };
 }
 
+function snapshotProject(canonicalRepositoryPath: string | undefined): { status: "available" | "unavailable"; name: string | null } {
+  if (canonicalRepositoryPath === undefined) return { status: "unavailable", name: null };
+  const name = basename(canonicalRepositoryPath);
+  return name === ""
+    ? { status: "unavailable", name: null }
+    : { status: "available", name: safeSnapshotText(name, 200) };
+}
+
+function lifecyclePhase(state: RunState): string {
+  switch (state) {
+    case "IDLE": return "idle";
+    case "INTAKE": return "intake";
+    case "PLAN":
+    case "READY": return "planning";
+    case "EXECUTE": return "execution";
+    case "VERIFY_FOCUSED":
+    case "VERIFY_PHASE":
+    case "FINAL_VERIFY": return "verification";
+    case "REVIEW": return "review";
+    case "REWORK": return "rework";
+    case "NEXT_PHASE": return "phase_boundary";
+    case "HUMAN_GATE":
+    case "HUMAN_RELEASE_GATE": return "human_decision";
+    case "PAUSED": return "paused";
+    case "RECOVERY": return "recovery";
+    case "FAILED":
+    case "CANCELLED":
+    case "DONE": return "terminal";
+  }
+}
+
+function snapshotSupervision(model: ReadModel, store: StateStore, configuration: KerbsFlowCore["configuration"]): unknown {
+  const task = model.currentTask;
+  const attempt = model.activeAttempt;
+  const validation = model.latestValidation;
+  const validationMatchesCurrent = task !== undefined && attempt !== undefined && validation !== undefined
+    && validation.taskId === task.taskId && validation.attemptId === attempt.attemptId;
+  const check = (name: string) => {
+    if (!validationMatchesCurrent) return { status: "not_checked", evidenceClass: null };
+    const evidence = validation.bundle.checks.find((candidate) => candidate.name === name);
+    if (evidence === undefined) return { status: "not_checked", evidenceClass: null };
+    return {
+      status: evidence.outcome === "passed" || evidence.outcome === "failed" ? evidence.outcome : "not_checked",
+      evidenceClass: evidence.evidenceClass,
+    };
+  };
+  const canonical = store.getCanonicalSnapshot(model.run.runId);
+  const policy = task === undefined ? undefined : store.summarizeFailurePolicy(model.run.runId, task.taskId);
+  const attempts = task === undefined ? 0 : store.countTaskAttempts(model.run.runId, task.taskId);
+  return {
+    canonical: {
+      status: canonical === undefined ? "not_captured" : "captured",
+      capturedAt: canonical?.capturedAt ?? null,
+      specCaptured: typeof canonical?.hashes["docs/SPEC-v0.1.0.md"] === "string",
+    },
+    scopeCheck: { name: "Git base and scope", ...check("Git base and scope") },
+    invariants: {
+      source: "effective_core_configuration",
+      enforcedPolicy: {
+        legalTransitions: configuration.hardInvariants.legalTransitions,
+        singleActiveExecutor: configuration.hardInvariants.singleActiveExecutor,
+        independentEvidence: configuration.hardInvariants.independentEvidence,
+        secretsAbsentFromPersistence: configuration.hardInvariants.secretsAbsentFromPersistence,
+        highImpactHumanGates: configuration.hardInvariants.highImpactHumanGates,
+        automaticReleaseActions: configuration.hardInvariants.automaticReleaseActions,
+        ambiguousReplay: configuration.hardInvariants.ambiguousReplay,
+        executorCannotVerify: configuration.hardInvariants.executorCannotVerify,
+        maxImplementationAttempts: configuration.hardInvariants.maxImplementationAttempts,
+      },
+      effectiveMaxImplementationAttempts: configuration.effectiveMaxImplementationAttempts,
+      interpretation: "enforced policy; not a run-wide validation pass",
+      observedChecks: {
+        originalCheckout: { name: "original checkout invariant", ...check("original checkout invariant") },
+        focusedCheckEvidenceIntegrity: { name: "focused-check evidence integrity", ...check("focused-check evidence integrity") },
+      },
+    },
+    retryEscalation: {
+      taskStatus: task === undefined ? "unavailable" : "available",
+      policyDecisionCounts: policy?.resultingActionCounts ?? { retry_same_route: 0, rework: 0, escalate: 0 },
+      recordedAttempts: attempts,
+      latestDecision: policy?.latestDecision === undefined ? null : {
+        reasonCode: safeSnapshotText(policy.latestDecision.reasonCode, 120),
+        action: safeSnapshotText(policy.latestDecision.action, 80),
+        escalationReason: policy.latestDecision.escalationReason === null ? null : safeSnapshotText(policy.latestDecision.escalationReason, 300),
+      },
+    },
+  };
+}
+
 function snapshotAttempt(model: ReadModel): unknown {
   const attempt = model.activeAttempt;
   if (attempt === undefined) return null;
@@ -887,6 +983,8 @@ function mapRequestError(error: unknown): LocalApiErrorShape {
       "GATE_OPTION_INVALID",
       "REAL_CANCEL_REQUIRES_DURABLE_INTENT",
       "CANCEL_NOT_ALLOWED",
+      "GATE_CONTINUATION_UNAVAILABLE",
+      "GATE_BOUNDARY_ALREADY_HELD",
     ].includes(error.code)) {
       return { status: 409, code: error.code, message: "command conflicts with the current state" };
     }

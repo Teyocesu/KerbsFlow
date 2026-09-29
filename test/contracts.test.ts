@@ -42,6 +42,21 @@ test("resume commands cannot carry a UI-selected target", () => {
   }), ContractValidationError);
 });
 
+test("Cancel command reasons are bounded by UTF-8 bytes", () => {
+  const base = {
+    schemaVersion: CONTRACT_VERSIONS.command,
+    commandId: "command_cancel_bytes",
+    idempotencyKey: "cancel-bytes",
+    runId: "run_cancel_bytes",
+    expectedStateVersion: 1,
+    kind: "cancel",
+  };
+  const maximum = `${"€".repeat(341)}a`;
+  assert.equal(Buffer.byteLength(maximum, "utf8"), 1024);
+  assert.equal(parseCommand({ ...base, reason: maximum }).kind, "cancel");
+  assert.throws(() => parseCommand({ ...base, reason: "€".repeat(1000) }), ContractValidationError);
+});
+
 test("human gates require two or more explicit options", () => {
   assert.throws(() => parseHumanGate({
     schemaVersion: CONTRACT_VERSIONS.humanGate,

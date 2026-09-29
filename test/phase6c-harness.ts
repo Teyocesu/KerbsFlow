@@ -22,6 +22,7 @@ import {
   type NormalizedEvent,
   type ReconcileOutcome,
   type RunId,
+  type RunState,
   type TaskId,
 } from "../src/contracts.js";
 import { KerbsFlowCore } from "../src/core.js";
@@ -67,6 +68,8 @@ export class SyntheticCodexAdapter implements ExecutorAdapter {
   cancelCalls = 0;
   private readonly waiters = new Map<string, Deferred<unknown>>();
   private readonly results = new Map<string, ExecutorResult>();
+
+  constructor(private readonly extraGateTarget?: RunState) {}
 
   probe(): AdapterDescriptor {
     return {
@@ -198,6 +201,7 @@ export class SyntheticCodexAdapter implements ExecutorAdapter {
         options: [
           { id: "rework", label: "Create bounded rework", consequence: "Return to the bounded rework path.", target: "REWORK" },
           { id: "cancel", label: "Cancel the run", consequence: "Stop this run and preserve its evidence.", target: "CANCELLED" },
+          ...(this.extraGateTarget === undefined ? [] : [{ id: "unsupported", label: "Unsupported path", consequence: "No continuation is registered for this target.", target: this.extraGateTarget }]),
         ],
         status: "open",
       } : null,
@@ -223,7 +227,7 @@ export async function waitFor<T>(read: () => T | undefined, description: string,
   assert.fail(`timed out waiting for ${description}`);
 }
 
-export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean } = {}): Phase6CStack {
+export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState } = {}): Phase6CStack {
   const repository = createGitRepository();
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-phase6c-controls-"));
   mkdirSync(join(root, "runtime"), { mode: 0o700 });
@@ -232,7 +236,7 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
   const ids = new SequenceIdSource("phase6c_controls");
   const store = StateStore.open(join(runtime, "state.sqlite"), { clock, ids });
   const artifacts = new FileArtifactStore(join(runtime, "artifacts"), ids);
-  const adapter = new SyntheticCodexAdapter();
+  const adapter = new SyntheticCodexAdapter(options.extraGateTarget);
   const core = new KerbsFlowCore(store, adapter, artifacts, {
     clock,
     ids,
@@ -240,7 +244,9 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
       hardInvariants: DEFAULT_HARD_INVARIANTS,
       projectPolicy: { ...DEFAULT_PROJECT_POLICY, allowedAdapters: ["codex"] },
       userPreferences: DEFAULT_USER_PREFERENCES,
-      runOverride: DEFAULT_RUN_OVERRIDE,
+      runOverride: options.maxImplementationAttempts === undefined
+        ? DEFAULT_RUN_OVERRIDE
+        : { ...DEFAULT_RUN_OVERRIDE, maxImplementationAttempts: options.maxImplementationAttempts },
     },
   });
   const planningInputs: Phase6CStack["planningInputs"] = { initial: [], rework: [] };
@@ -292,7 +298,7 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
   };
   const coordinator = new RunCoordinator(core, store, phase2, profile, ids);
   const api = new LocalApiServer({
-    core: { readModel: core.readModel.bind(core), steer: core.steer.bind(core), resolveGateScoped: core.resolveGateScoped.bind(core) },
+    core: { readModel: core.readModel.bind(core), steer: core.steer.bind(core), configuration: core.configuration },
     coordinator,
     store,
     artifacts,
