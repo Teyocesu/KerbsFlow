@@ -83,9 +83,9 @@
             </div>
             <form id="steer-form" class="control-form">
               <label for="steer-text">Steer for the next safe planning boundary</label>
-              <textarea id="steer-text" rows="2" maxlength="4096" required></textarea>
+              <textarea id="steer-text" rows="2" maxlength="4096" aria-describedby="steer-byte-count" required></textarea>
               <div class="control-form-footer">
-                <span id="steer-byte-count" class="field-hint" aria-live="polite">0 / 4096 bytes</span>
+                <span id="steer-byte-count" class="field-hint">0 / 4096 bytes</span>
                 <button id="steer-submit" type="submit" data-mutation disabled>Queue Steer</button>
               </div>
             </form>

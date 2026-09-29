@@ -89,6 +89,7 @@ function clearPageStatus() {
     setPageStatus(currentSession.notice.message, currentSession.notice.state);
     return;
   }
+  if (elements.pageStatus.hidden) return;
   elements.pageStatus.hidden = true;
   elements.pageStatus.dataset.state = "";
   setText(elements.pageStatus, "");
@@ -534,9 +535,10 @@ function updateSteerByteCount() {
 }
 
 function updateMutationControls(session) {
+  const invalid = session.sessionInvalid === true;
   const state = session.currentState;
-  const terminal = state === "IDLE" || state === "FAILED" || state === "CANCELLED" || state === "DONE";
-  const busy = session.mutationInFlight === true;
+  const terminal = invalid || state === "IDLE" || state === "FAILED" || state === "CANCELLED" || state === "DONE";
+  const busy = invalid || session.mutationInFlight === true;
   const steerBytes = updateSteerByteCount();
   elements.pauseControl.disabled = busy || terminal || state === "PAUSED";
   elements.resumeControl.disabled = busy || state !== "PAUSED";
@@ -600,6 +602,7 @@ function showApiFailure(status, session, keepConnection) {
     session.sessionInvalid = true;
     setConnection("Session invalid", "error");
     setPageStatus("The local session is invalid. Reload this page to start a new session.", "error");
+    if (session.hasSnapshot) updateMutationControls(session);
     return;
   }
   if (status === 404) {
@@ -648,6 +651,10 @@ function commandPath(session, command) {
 
 async function submitRunMutation(session, command, payload, kind, gateId) {
   if (!isCurrent(session) || session.mutationInFlight) return;
+  if (session.sessionInvalid === true) {
+    setSessionNotice(session, "The local session is invalid. Reload this page before sending commands.");
+    return;
+  }
   if (!Number.isSafeInteger(session.stateVersion)) {
     setSessionNotice(session, "A current snapshot is required before sending a command.");
     return;
@@ -975,6 +982,7 @@ function eventPath(session) {
 
 async function runEventStream(session) {
   let failedConnections = 0;
+  let repairRefreshRequired = false;
   while (isCurrent(session) && !session.sessionInvalid && !session.runUnavailable) {
     const attempt = new AbortController();
     const abortAttempt = () => attempt.abort();
@@ -999,10 +1007,11 @@ async function runEventStream(session) {
         throw new Error("event stream unavailable");
       }
 
-      if (failedConnections > 0) {
+      if (repairRefreshRequired) {
         const refreshed = await refreshSnapshot(session);
         if (!isCurrent(session) || session.sessionInvalid || session.runUnavailable) return;
         if (!refreshed) throw new Error("snapshot refresh failed");
+        repairRefreshRequired = false;
       }
       connectedAt = Date.now();
       setConnection("Connected", "connected");
@@ -1012,6 +1021,7 @@ async function runEventStream(session) {
       throw new Error("event stream ended");
     } catch {
       if (!isCurrent(session) || session.sessionInvalid || session.runUnavailable) return;
+      repairRefreshRequired = true;
       if (connectedAt !== undefined && Date.now() - connectedAt >= 30_000) failedConnections = 0;
       setConnection("Reconnecting", "reconnecting");
       setPageStatus("The event connection was lost. Reconnecting and refreshing the snapshot.", "error");
@@ -1090,12 +1100,12 @@ async function loadRun(runId, notice) {
   };
   currentSession = session;
   elements.runContent.setAttribute("aria-busy", "true");
-  setConnection("Connecting", "loading");
+  setConnection("Loading snapshot", "loading");
   setPageStatus("Loading the authoritative run snapshot.", "");
 
   const loaded = await refreshSnapshot(session);
   if (!isCurrent(session) || !loaded || session.sessionInvalid || session.runUnavailable) return session;
-  setConnection("Connecting", "loading");
+  setConnection("Connecting event stream", "loading");
   void runEventStream(session);
   return session;
 }
@@ -1185,6 +1195,7 @@ elements.steerForm.addEventListener("submit", (event) => {
   const bytes = updateSteerByteCount();
   if (bytes > 4096) {
     setSessionNotice(session, "Steer must be at most 4096 UTF-8 bytes.");
+    elements.steerText.focus();
     return;
   }
   void submitRunMutation(session, "steer", { text: elements.steerText.value }, "steer");
@@ -1210,6 +1221,10 @@ elements.cancelForm.addEventListener("submit", (event) => {
 if (apiToken === "") {
   setConnection("Session invalid", "error");
   setPageStatus("The local session token is unavailable. Reload this page.", "error");
+  elements.startRunInput.disabled = true;
+  elements.startObjective.disabled = true;
+  elements.startButton.disabled = true;
+  elements.emptyRunInput.disabled = true;
 } else {
   setConnection("Not connected", "idle");
   clearPageStatus();

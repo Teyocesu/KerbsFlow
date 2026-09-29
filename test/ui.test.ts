@@ -142,3 +142,28 @@ test("dashboard keeps untrusted text inert and does not persist browser state", 
   assert.match(html, /<link rel="stylesheet" href="\/styles\.css">/u);
   assert.doesNotMatch(html, /<script\b(?![^>]*\bsrc=)[^>]*>/iu);
 });
+
+test("dashboard keeps stale-session, repair-ordering, and notice-survival guards", () => {
+  const app = readFileSync(new URL("../../src/ui/app.js", import.meta.url), "utf8");
+  assert.match(
+    app,
+    /function clearPageStatus\(\) \{[\s\S]*?if \(currentSession\?\.notice !== undefined\) \{[\s\S]*?setPageStatus\(currentSession\.notice\.message, currentSession\.notice\.state\);/u,
+    "a stale/conflict notice must survive successful snapshot repair",
+  );
+  assert.match(app, /repairRefreshRequired = true;/u, "a failed event connection must require snapshot repair");
+  assert.match(
+    app,
+    /async function runEventStream\(session\) \{[\s\S]*?if \(repairRefreshRequired\) \{[\s\S]*?refreshSnapshot\(session\)[\s\S]*?\}[\s\S]*?setConnection\("Connected", "connected"\)/u,
+    "reconnect must repair the authoritative snapshot before reporting Connected",
+  );
+  assert.match(
+    app,
+    /async function fetchSnapshot\(session\) \{[\s\S]*?if \(!isCurrent\(session\)\) return false;/u,
+    "a late snapshot from a superseded session must not render",
+  );
+  assert.match(
+    app,
+    /while \(isCurrent\(session\)\) \{[\s\S]*?reader\.read\(\)/u,
+    "a superseded session must stop consuming events",
+  );
+});
