@@ -225,7 +225,7 @@ test("live executor REWORK is projected before Phase2 registers its held-gate ch
       driver.beforeHold.promise,
       driver.done.promise.then(() => { throw driver.error ?? new Error("driver exited before the gate projection"); }),
     ]);
-    assert.deepEqual(beforeHold, ["rework"], "persisted blocked proof plus the live owned drive keeps REWORK visible before heldGate registration");
+    assert.deepEqual([...beforeHold].sort(), ["cancel", "fail", "rework"], "the exact live executor gate keeps every policy-valid action visible before heldGate registration");
 
     const afterHold = await driver.afterHold.promise;
     assert.deepEqual([...afterHold].sort(), ["cancel", "fail", "rework"]);

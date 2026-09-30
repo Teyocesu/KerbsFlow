@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { asCommandId, asGateId, asInstructionId, asRunId, asTaskId, type RunId } from "../src/contracts.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
-import { createPhase6CStack, waitFor } from "./phase6c-harness.js";
+import { createPhase6CStack, deferred, waitFor, type Phase6CStack } from "./phase6c-harness.js";
 
 interface HttpResponse {
   status: number;
@@ -189,6 +189,194 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       } finally {
         await stack.close();
       }
+    }
+  });
+
+  await suite.test("pre-hold REWORK waits for the exact held boundary before continuing the same drive", async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId("run_phase6c_prehold_rework");
+    const hold = delayGateBoundaryRegistration(stack);
+    try {
+      const reached = await startBlockedPreHoldGate(stack, hold, runId);
+      const gate = reached.gateSnapshot.currentGate;
+      assert.ok(gate);
+      const options = gate.options;
+      const reworkOption = options.find((option) => option.target === "REWORK");
+      const failOption = options.find((option) => option.target === "FAILED");
+      assert.ok(reworkOption);
+
+      const beforeRun = stack.store.getRun(runId);
+      const beforeAttemptCount = stack.store.countTaskAttempts(runId, reached.handle.taskId);
+      const beforeTransitions = stack.store.listTransitions(runId).length;
+      const beforeWorktree = stack.store.getWorktree(runId);
+      assert.equal(beforeRun?.state, "HUMAN_GATE");
+      assert.equal(beforeAttemptCount, 1);
+      assert.ok(beforeWorktree);
+      assert.equal(stack.planningInputs.initial.length, 1);
+      assert.equal(stack.planningInputs.rework.length, 0);
+
+      const resolution = observeResponse(post(
+        stack.api,
+        reached.token,
+        `/v1/runs/${runId}/gates/${gate.gateId}/resolve`,
+        envelope("command_prehold_rework", "idem_prehold_rework", reached.gateSnapshot.run.stateVersion, { optionId: reworkOption.id }),
+      ));
+      await assertResponsePending(resolution, "pre-hold REWORK must wait for Phase2's held boundary");
+      assertPreHoldOptions(reached.gateSnapshot);
+      assert.ok(failOption);
+
+      const pendingSnapshot = await snapshot(stack.api, reached.token, runId);
+      assert.equal(pendingSnapshot.run.state, "HUMAN_GATE");
+      assert.equal(pendingSnapshot.run.stateVersion, reached.gateSnapshot.run.stateVersion);
+      assert.equal(pendingSnapshot.currentGate?.status, "open");
+      assert.equal(stack.store.getGate(asGateId(gate.gateId))?.status, "open");
+      assert.equal(stack.store.listTransitions(runId).length, beforeTransitions);
+      assert.equal(stack.store.countTaskAttempts(runId, reached.handle.taskId), beforeAttemptCount);
+      assert.equal(stack.adapter.requests.length, 1);
+      assert.equal(stack.planningInputs.rework.length, 0, "Planning Master cannot run before the held boundary");
+      assert.equal(stack.coordinator.activeRunId, runId);
+
+      const competingGateResolution = await post(
+        stack.api,
+        reached.token,
+        `/v1/runs/${runId}/gates/${gate.gateId}/resolve`,
+        envelope("command_prehold_competing_gate", "idem_prehold_competing_gate", reached.gateSnapshot.run.stateVersion, { optionId: failOption.id }),
+      );
+      assert.equal(competingGateResolution.status, 409);
+      assert.equal(errorCode(competingGateResolution), "CONTROL_COMMAND_IN_PROGRESS");
+      const competingPause = await post(stack.api, reached.token, `/v1/runs/${runId}/pause`, envelope("command_prehold_competing_pause", "idem_prehold_competing_pause", reached.gateSnapshot.run.stateVersion, {}));
+      assert.equal(competingPause.status, 409);
+      assert.equal(errorCode(competingPause), "CONTROL_COMMAND_IN_PROGRESS");
+      const competingCancel = await post(stack.api, reached.token, `/v1/runs/${runId}/cancel`, envelope("command_prehold_competing_cancel", "idem_prehold_competing_cancel", reached.gateSnapshot.run.stateVersion, { reason: "a claimed gate boundary cannot be cancelled" }));
+      assert.equal(competingCancel.status, 409);
+      assert.equal(errorCode(competingCancel), "CONTROL_COMMAND_IN_PROGRESS");
+
+      hold.release();
+      await within(resolution.completed, "pre-hold REWORK response after gate registration");
+      assert.equal(resolution.response?.status, 200);
+      assert.equal(json(resolution.response!).to, "REWORK");
+
+      const secondRequest = await waitFor(() => stack.adapter.requests[1], "one bounded rework attempt on the same drive");
+      assert.equal(stack.adapter.requests.length, 2);
+      assert.equal(secondRequest.taskId, reached.handle.taskId);
+      assert.notEqual(secondRequest.attemptId, reached.handle.attemptId);
+      assert.equal(secondRequest.workingDirectory, stack.adapter.requests[0]?.workingDirectory, "REWORK reuses the same owned worktree");
+      assert.equal(stack.store.getWorktree(runId)?.worktreePath, beforeWorktree.worktreePath, "REWORK does not recreate the worktree");
+      assert.equal(stack.store.getAttempt(reached.handle.attemptId)?.lifecycle, "BLOCKED", "the prior attempt is not replayed or rewritten");
+      assert.equal(stack.store.countTaskAttempts(runId, reached.handle.taskId), 2);
+      assert.equal(stack.planningInputs.initial.length, 1, "the same drive does not replay intake or initial planning");
+      assert.equal(stack.planningInputs.rework.length, 1);
+
+      stack.adapter.finishNext("succeeded");
+      await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "same drive completes after one bounded REWORK attempt");
+      assert.equal(stack.adapter.requests.length, 2, "the resolution creates exactly one next attempt");
+    } finally {
+      hold.release();
+      await stack.close();
+    }
+  });
+
+  await suite.test("pre-hold FAILED and CANCELLED wait for the exact held boundary and release the slot", async () => {
+    for (const target of ["FAILED", "CANCELLED"] as const) {
+      const stack = createPhase6CStack({ phaseCheck: true });
+      const runId = asRunId(`run_phase6c_prehold_${target.toLowerCase()}`);
+      const nextRunId = asRunId(`run_phase6c_prehold_next_${target.toLowerCase()}`);
+      const hold = delayGateBoundaryRegistration(stack);
+      try {
+        const reached = await startBlockedPreHoldGate(stack, hold, runId);
+        const gate = reached.gateSnapshot.currentGate;
+        assert.ok(gate);
+        assertPreHoldOptions(reached.gateSnapshot);
+        const option = gate.options.find((candidate) => candidate.target === target);
+        assert.ok(option);
+        const beforeTransitions = stack.store.listTransitions(runId).length;
+        const resolution = observeResponse(post(
+          stack.api,
+          reached.token,
+          `/v1/runs/${runId}/gates/${gate.gateId}/resolve`,
+          envelope(`command_prehold_${target.toLowerCase()}`, `idem_prehold_${target.toLowerCase()}`, reached.gateSnapshot.run.stateVersion, { optionId: option.id }),
+        ));
+        await assertResponsePending(resolution, `pre-hold ${target} must wait for Phase2's held boundary`);
+
+        const pendingSnapshot = await snapshot(stack.api, reached.token, runId);
+        assert.equal(pendingSnapshot.run.state, "HUMAN_GATE");
+        assert.equal(pendingSnapshot.run.stateVersion, reached.gateSnapshot.run.stateVersion);
+        assert.equal(pendingSnapshot.currentGate?.status, "open");
+        assert.equal(stack.store.getGate(asGateId(gate.gateId))?.status, "open");
+        assert.equal(stack.store.listTransitions(runId).length, beforeTransitions);
+        assert.equal(stack.store.countTaskAttempts(runId, reached.handle.taskId), 1);
+        assert.equal(stack.coordinator.activeRunId, runId, "the reservation stays held while the terminal request waits");
+
+        hold.release();
+        await within(resolution.completed, `pre-hold ${target} response after gate registration`);
+        assert.equal(resolution.response?.status, 200);
+        assert.equal(json(resolution.response!).to, target);
+        assert.equal(stack.store.getRun(runId)?.state, target);
+        assert.equal(stack.coordinator.activeRunId, undefined, "terminal gate resolution releases only after the drive settles");
+
+        const nextStart = await post(stack.api, reached.token, "/v1/runs", envelope(`command_prehold_next_${target.toLowerCase()}`, `idem_prehold_next_${target.toLowerCase()}`, 0, { runId: nextRunId, objective: "claim the released coordinator slot" }));
+        assert.equal(nextStart.status, 200);
+        assert.equal(json(nextStart).to, "INTAKE");
+        const nextRequest = await waitFor(() => stack.adapter.requests[1], `next Start drive after ${target}`);
+        assert.equal(nextRequest.runId, nextRunId);
+        stack.adapter.finishNext("succeeded");
+        await waitFor(() => stack.store.getRun(nextRunId)?.state === "NEXT_PHASE" ? true : undefined, `next Start completes after ${target}`);
+      } finally {
+        hold.release();
+        await stack.close();
+      }
+    }
+  });
+
+  await suite.test("pre-hold resolution rejects when the live drive settles before registering its exact gate", async () => {
+    const stack = createPhase6CStack();
+    const runId = asRunId("run_phase6c_prehold_settles");
+    const hold = delayGateBoundaryRegistration(stack, true);
+    try {
+      const reached = await startBlockedPreHoldGate(stack, hold, runId);
+      const gate = reached.gateSnapshot.currentGate;
+      assert.ok(gate);
+      const reworkOption = gate.options.find((option) => option.target === "REWORK");
+      const failOption = gate.options.find((option) => option.target === "FAILED");
+      assert.ok(reworkOption);
+      assert.ok(failOption);
+      assertPreHoldOptions(reached.gateSnapshot);
+      const beforeTransitions = stack.store.listTransitions(runId).length;
+
+      const resolution = observeResponse(post(
+        stack.api,
+        reached.token,
+        `/v1/runs/${runId}/gates/${gate.gateId}/resolve`,
+        envelope("command_prehold_settles_rework", "idem_prehold_settles_rework", reached.gateSnapshot.run.stateVersion, { optionId: reworkOption.id }),
+      ));
+      await assertResponsePending(resolution, "pre-hold resolution must be claimed before the drive is released to fail");
+      const competingResolution = await post(
+        stack.api,
+        reached.token,
+        `/v1/runs/${runId}/gates/${gate.gateId}/resolve`,
+        envelope("command_prehold_settles_competing", "idem_prehold_settles_competing", reached.gateSnapshot.run.stateVersion, { optionId: failOption.id }),
+      );
+      assert.equal(competingResolution.status, 409);
+      assert.equal(errorCode(competingResolution), "CONTROL_COMMAND_IN_PROGRESS");
+
+      hold.release();
+      await within(resolution.completed, "pre-hold resolution rejection after drive settlement");
+      assert.equal(resolution.response?.status, 409);
+      assert.equal(errorCode(resolution.response!), "GATE_CONTINUATION_UNAVAILABLE");
+      assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
+      assert.equal(stack.store.getRun(runId)?.stateVersion, reached.gateSnapshot.run.stateVersion);
+      assert.equal(stack.store.getGate(asGateId(gate.gateId))?.status, "open");
+      assert.equal(stack.store.listTransitions(runId).length, beforeTransitions);
+      assert.equal(stack.store.countTaskAttempts(runId, reached.handle.taskId), 1);
+      assert.equal(stack.planningInputs.rework.length, 0);
+      assert.equal(stack.adapter.requests.length, 1);
+      assert.equal(stack.coordinator.activeRunId, runId);
+
+      const afterFailure = await snapshot(stack.api, reached.token, runId);
+      assert.deepEqual(afterFailure.currentGate?.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"], "cleared claim restores only safe terminal actionability after drive settlement");
+    } finally {
+      hold.release();
+      await stack.close();
     }
   });
 
@@ -652,6 +840,84 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
     }
   });
 });
+
+interface DelayedGateRegistration {
+  reached: Promise<void>;
+  isWaiting(): boolean;
+  release(): void;
+}
+
+function delayGateBoundaryRegistration(stack: Phase6CStack, failBeforeRegistration = false): DelayedGateRegistration {
+  const reached = deferred<void>();
+  const release = deferred<void>();
+  let waiting = false;
+  const driveStarted = stack.phase2.driveStarted.bind(stack.phase2);
+  stack.phase2.driveStarted = (request, controls) => driveStarted(request, {
+    ...controls,
+    waitForGateResolution: async (boundary) => {
+      waiting = true;
+      reached.resolve();
+      await release.promise;
+      if (failBeforeRegistration) throw new Error("synthetic Phase2 drive failure before held-gate registration");
+      const registerHeldGate = controls?.waitForGateResolution;
+      if (registerHeldGate === undefined) throw new Error("RunCoordinator did not provide its held-gate registration");
+      return registerHeldGate(boundary);
+    },
+  });
+  return { reached: reached.promise, isWaiting: () => waiting, release: () => release.resolve() };
+}
+
+async function startBlockedPreHoldGate(stack: Phase6CStack, hold: DelayedGateRegistration, runId: RunId) {
+  await stack.api.start();
+  const token = await bootstrapToken(stack.api);
+  const started = await post(stack.api, token, "/v1/runs", envelope(`command_prehold_start_${runId}`, `idem_prehold_start_${runId}`, 0, {
+    runId,
+    objective: "exercise an executor gate before Phase2 registers its held boundary",
+  }));
+  assert.equal(started.status, 200);
+  const handle = await stack.adapter.started.promise;
+  stack.adapter.finish(handle, "blocked");
+  await waitFor(() => hold.isWaiting() ? true : undefined, "Phase2 reaches the delayed held-gate registration");
+  const gateSnapshot = await snapshot(stack.api, token, runId);
+  assert.equal(gateSnapshot.run.state, "HUMAN_GATE");
+  assert.equal(gateSnapshot.currentGate?.status, "open");
+  return { token, handle, gateSnapshot };
+}
+
+function assertPreHoldOptions(snapshot: Snapshot): void {
+  const gate = snapshot.currentGate;
+  assert.ok(gate);
+  assert.deepEqual(gate.options.map((option) => option.id).sort(), ["cancel", "fail", "rework"]);
+  assert.deepEqual(gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK"]);
+  assert.equal(gate.options.find((option) => option.target === "REWORK")?.id, "rework");
+  assert.equal(gate.options.find((option) => option.target === "FAILED")?.id, "fail");
+  assert.equal(gate.options.find((option) => option.target === "CANCELLED")?.id, "cancel");
+}
+
+function observeResponse(promise: Promise<HttpResponse>) {
+  let response: HttpResponse | undefined;
+  let error: unknown;
+  const completed = promise.then((value) => { response = value; }, (failure: unknown) => { error = failure; });
+  return { completed, get response() { return response; }, get error() { return error; } };
+}
+
+async function assertResponsePending(response: ReturnType<typeof observeResponse>, message: string): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(response.response, undefined, `${message}; got ${response.response?.status} ${response.response?.body}`);
+  assert.equal(response.error, undefined, message);
+}
+
+async function within<T>(promise: Promise<T>, description: string, timeoutMs = 5_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => { timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs); }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
 
 function envelope(commandId: string, idempotencyKey: string, expectedStateVersion: number, payload: Record<string, unknown>) {
   return { schemaVersion: "kerbsflow.local-command/v1", commandId, idempotencyKey, expectedStateVersion, payload };

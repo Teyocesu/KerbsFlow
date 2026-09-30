@@ -84,17 +84,30 @@ interface CancelClaim {
   operation?: Promise<CommandResult>;
 }
 
-interface GateResolutionClaim {
-  request: CoordinatorGateResolutionRequest;
-  operation?: Promise<CommandResult>;
-}
-
-interface HeldGateBoundary {
+interface GateBoundaryIdentity {
   gateId: GateId;
   taskId: TaskId;
   attemptId: AttemptId;
+}
+
+interface PendingGateBoundary {
+  expected: GateBoundaryIdentity;
+  registration: Deferred<{ held: HeldGateBoundary; exact: boolean }>;
+}
+
+interface GateResolutionClaim {
+  request: CoordinatorGateResolutionRequest;
+  pendingBoundary?: PendingGateBoundary;
+  operation?: Promise<CommandResult>;
+}
+
+interface HeldGateBoundary extends GateBoundaryIdentity {
   wake: Deferred<void>;
 }
+
+type GateOptionPreflight =
+  | { kind: "immediate"; held?: HeldGateBoundary }
+  | { kind: "await-held"; boundary: GateBoundaryIdentity };
 
 interface RunReservation {
   runId: RunId;
@@ -157,7 +170,7 @@ export class RunCoordinator {
     const actionable = new Set<string>();
     for (const option of storedGate.gate.options) {
       try {
-        this.preflightGateOption(reservation, run, storedGate, option, true);
+        this.preflightGateOption(reservation, run, storedGate, option);
         actionable.add(option.id);
       } catch (error) {
         if (error instanceof KerbsFlowError && (error.code === "GATE_CONTINUATION_UNAVAILABLE" || error.code === "CONTROL_COMMAND_IN_PROGRESS")) continue;
@@ -428,11 +441,16 @@ export class RunCoordinator {
     }
     const option = storedGate.gate.options.find((candidate) => candidate.id === request.optionId);
     if (option === undefined) throw new KerbsFlowError("GATE_OPTION_INVALID", "the selected option was not offered by the persisted gate");
-    const held = this.preflightGateOption(reservation, run, storedGate, option, false);
+    const preflight = this.preflightGateOption(reservation, run, storedGate, option);
 
     const claim: GateResolutionClaim = { request };
+    if (preflight.kind === "await-held") {
+      claim.pendingBoundary = { expected: preflight.boundary, registration: deferred() };
+    }
     reservation.gateResolutionClaim = claim;
-    claim.operation = this.finishGateResolution(reservation, request, option.target, held).finally(() => {
+    claim.operation = (preflight.kind === "immediate"
+      ? this.finishGateResolution(reservation, request, option.target, preflight.held)
+      : this.finishPreHoldGateResolution(reservation, claim, option.target)).finally(() => {
       if (reservation.gateResolutionClaim === claim) delete reservation.gateResolutionClaim;
     });
     return claim.operation;
@@ -443,45 +461,97 @@ export class RunCoordinator {
     run: NonNullable<ReturnType<StateStore["getRun"]>>,
     storedGate: StoredGate,
     option: StoredGate["gate"]["options"][number],
-    allowLiveUnheldReworkProjection: boolean,
-  ): HeldGateBoundary | undefined {
+    claimOwner?: GateResolutionClaim,
+  ): GateOptionPreflight {
     if (reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
-      || reservation.gateResolutionClaim !== undefined) {
+      || (reservation.gateResolutionClaim !== undefined && reservation.gateResolutionClaim !== claimOwner)) {
       throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "Pause, Cancel, or another gate resolution already owns this run's control boundary");
+    }
+    if (reservation.runId !== run.runId || run.state !== "HUMAN_GATE" || run.currentGateId !== storedGate.gateId
+      || storedGate.runId !== reservation.runId || storedGate.status !== "open" || storedGate.gate.status !== "open") {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the supplied gate is no longer the current open gate for this run");
     }
 
     const held = reservation.heldGate;
     const heldMatches = held !== undefined && held.gateId === storedGate.gateId
       && held.taskId === storedGate.taskId && held.attemptId === storedGate.attemptId;
+    if (held !== undefined && !heldMatches) {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the live drive is holding a different gate boundary");
+    }
+    const liveOwnedDrive = !reservation.startupBlocked && !reservation.driveSettled
+      && storedGate.taskId !== null && reservation.taskId === storedGate.taskId;
+    const blockedResult = this.executorBlockedGateResult(reservation.runId, run.currentTaskId, run.activeAttemptId, storedGate);
     if (option.target === "REWORK") {
-      const liveOwnedDrive = !reservation.startupBlocked && !reservation.driveSettled
-        && reservation.taskId === storedGate.taskId;
-      if (storedGate.taskId === null || storedGate.attemptId === null || !liveOwnedDrive
-        || (!heldMatches && !allowLiveUnheldReworkProjection)) {
+      if (storedGate.taskId === null || storedGate.attemptId === null || !liveOwnedDrive || blockedResult === undefined) {
         throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "REWORK is supported only for a live owned executor-blocked gate continuation");
       }
-      const blocked = this.executorBlockedGateResult(reservation.runId, run.currentTaskId, run.activeAttemptId, storedGate);
-      if (blocked === undefined || !blocked.humanGate?.options.some((candidate) => candidate.target === "REWORK")) {
+      if (!blockedResult.humanGate?.options.some((candidate) => candidate.target === "REWORK")) {
         throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the persisted executor result does not prove this gate's REWORK continuation");
       }
       if (this.store.countTaskAttempts(reservation.runId, storedGate.taskId) >= this.core.configuration.effectiveMaxImplementationAttempts) {
         throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the task has exhausted its effective implementation-attempt budget");
       }
-      return heldMatches ? held : undefined;
+      if (heldMatches) return { kind: "immediate", held };
+      return { kind: "await-held", boundary: { gateId: storedGate.gateId, taskId: storedGate.taskId, attemptId: storedGate.attemptId } };
     }
 
     if (option.target === "FAILED" || option.target === "CANCELLED") {
-      if (!reservation.startupBlocked && !reservation.driveSettled && !heldMatches) {
-        throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the live drive has not reached a held checkpoint for this gate");
-      }
       const activeAttempt = run.activeAttemptId === null ? undefined : this.store.getAttempt(run.activeAttemptId);
       if (activeAttempt !== undefined && (activeAttempt.lifecycle === "PREPARED" || activeAttempt.lifecycle === "RUNNING" || activeAttempt.lifecycle === "UNKNOWN")) {
         throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "terminal gate resolution is unsafe while an attempt is active or ambiguous");
       }
-      return heldMatches ? held : undefined;
+      if (heldMatches) return { kind: "immediate", held };
+      if (liveOwnedDrive) {
+        if (blockedResult === undefined || storedGate.taskId === null || storedGate.attemptId === null) {
+          throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "terminal choice is not tied to the live executor-blocked gate");
+        }
+        return { kind: "await-held", boundary: { gateId: storedGate.gateId, taskId: storedGate.taskId, attemptId: storedGate.attemptId } };
+      }
+      if (reservation.startupBlocked || reservation.driveSettled) return { kind: "immediate" };
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the live drive has not reached a held checkpoint for this gate");
     }
 
     throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "this gate option has no proven coordinator continuation");
+  }
+
+  private async finishPreHoldGateResolution(
+    reservation: RunReservation,
+    claim: GateResolutionClaim,
+    target: string,
+  ): Promise<CommandResult> {
+    const pending = claim.pendingBoundary;
+    if (pending === undefined) throw new KerbsFlowError("INTERNAL_GATE_BOUNDARY_ERROR", "pre-hold gate resolution has no expected boundary");
+    const registration = await Promise.race([
+      pending.registration.promise.then((value) => ({ kind: "registered" as const, value })),
+      reservation.settled.promise.then(() => ({ kind: "settled" as const })),
+    ]);
+    if (registration.kind !== "registered" || !registration.value.exact || this.reservation !== reservation
+      || reservation.startupBlocked || reservation.driveSettled) {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the owned Phase2 drive settled before it proved this gate's held boundary");
+    }
+
+    const request = claim.request;
+    const held = registration.value.held;
+    if (!sameGateBoundary(pending.expected, held) || reservation.heldGate !== held) {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "Phase2 registered a different held gate boundary");
+    }
+    const run = this.assertRequestVersion(request.runId, request.expectedStateVersion);
+    const storedGate = this.store.getGate(asGateId(request.gateId));
+    if (run.state !== "HUMAN_GATE" || run.currentGateId !== request.gateId
+      || storedGate === undefined || storedGate.runId !== request.runId || storedGate.gateId !== request.gateId
+      || storedGate.status !== "open" || storedGate.gate.status !== "open"
+      || storedGate.taskId !== held.taskId || storedGate.attemptId !== held.attemptId) {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the gate no longer matches the exact held Phase2 boundary");
+    }
+    const option = storedGate.gate.options.find((candidate) => candidate.id === request.optionId);
+    if (option === undefined || option.target !== target) {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the claimed option is no longer policy-valid for the held gate");
+    }
+    const confirmed = this.preflightGateOption(reservation, run, storedGate, option, claim);
+    if (confirmed.kind !== "immediate" || confirmed.held !== held) {
+      throw new KerbsFlowError("GATE_CONTINUATION_UNAVAILABLE", "the held gate actionability changed before resolution");
+    }
+    return this.finishGateResolution(reservation, request, target, held);
   }
 
   private async finishGateResolution(
@@ -526,6 +596,10 @@ export class RunCoordinator {
     }
     const held: HeldGateBoundary = { ...boundary, wake: deferred<void>() };
     reservation.heldGate = held;
+    const pendingBoundary = reservation.gateResolutionClaim?.pendingBoundary;
+    if (reservation.gateResolutionClaim?.request.runId === reservation.runId && pendingBoundary !== undefined) {
+      pendingBoundary.registration.resolve({ held, exact: sameGateBoundary(pendingBoundary.expected, held) });
+    }
     try {
       while (true) {
         const current = this.store.getRun(reservation.runId);
@@ -814,6 +888,10 @@ function sameCancelRequest(left: CoordinatorCancelRequest, right: CoordinatorCan
 
 function sameGateResolutionRequest(left: CoordinatorGateResolutionRequest, right: CoordinatorGateResolutionRequest): boolean {
   return sameControlRequest(left, right) && left.gateId === right.gateId && left.optionId === right.optionId && left.note === right.note;
+}
+
+function sameGateBoundary(left: GateBoundaryIdentity, right: GateBoundaryIdentity): boolean {
+  return left.gateId === right.gateId && left.taskId === right.taskId && left.attemptId === right.attemptId;
 }
 
 function internalCancellationKey(idempotencyKey: string, phase: "request" | "signal" | "reconcile"): string {
