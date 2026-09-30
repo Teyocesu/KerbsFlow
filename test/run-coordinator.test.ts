@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  CONTRACT_VERSIONS,
   DEFAULT_HARD_INVARIANTS,
   DEFAULT_PROJECT_POLICY,
   DEFAULT_RUN_OVERRIDE,
@@ -152,6 +153,61 @@ test("startup refuses to report an unfinished historical Start as a live drive",
     const competing = startRequest("run_coord_startup_competing");
     assert.throws(() => coordinator.start(competing), (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT");
     assert.equal(fixture.store.getRun(competing.runId), undefined);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("rejected direct terminal recovery keeps the startup coordinator reservation", async () => {
+  const fixture = makeCoordinatorFixture();
+  const runId = asRunId("run_coord_recovery_slot");
+  try {
+    let command = fixture.core.startRun(runId, "preserve the recovery reservation", "coord:recovery-slot:start", asCommandId("command_coord_recovery_slot_start"));
+    command = fixture.core.completeIntake(runId, command.stateVersion, "coord:recovery-slot:intake");
+    const taskId = asTaskId("task_coord_recovery_slot");
+    const planned = createPhase2PlanningDecision({
+      decisionId: `decision_${runId}`,
+      runId,
+      taskId,
+      objective: "preserve the recovery reservation",
+      acceptance: ["ambiguous recovery cannot free the control-plane slot"],
+      positiveScope: ["src"],
+      negativeScope: ["external execution"],
+      model: "fixture-model",
+      canonicalContext: "direct terminal recovery reservation test",
+    });
+    const decision = { ...planned, route: { adapter: "fake" as const, model: "fake" }, requiredCapabilities: ["simulated_execution"], policyVersion: "phase1-test-policy" };
+    command = fixture.core.plan(runId, command.stateVersion, "coord:recovery-slot:plan", decision);
+    command = fixture.core.prepareExecution(runId, command.stateVersion, "coord:recovery-slot:prepare");
+    await fixture.core.beginFakeAttempt(runId, command.stateVersion, "coord:recovery-slot:begin");
+
+    fixture.store.close();
+    fixture.reopen();
+    const recovery = fixture.core.readModel(runId);
+    assert.equal(recovery?.run.state, "RECOVERY");
+    assert.equal(recovery?.activeAttempt?.lifecycle, "RUNNING");
+    assert.ok(recovery);
+
+    const coordinator = fixture.coordinator(new SettledDriver());
+    assert.equal(coordinator.activeRunId, runId);
+    assert.throws(
+      () => fixture.core.recover(runId, recovery.run.stateVersion, "coord:recovery-slot:reject", {
+        schemaVersion: CONTRACT_VERSIONS.recoveryDecision,
+        runId,
+        target: "FAILED",
+        summary: "ambiguous attempts cannot be abandoned",
+        evidenceRefs: [],
+      }),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "RECOVERY_EVIDENCE_INSUFFICIENT",
+    );
+
+    assert.equal(coordinator.activeRunId, runId, "rejected recovery must retain the startup reservation");
+    const competingRun = startRequest("run_coord_recovery_slot_competing");
+    assert.throws(
+      () => coordinator.start(competingRun),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT",
+    );
+    assert.equal(fixture.store.getRun(competingRun.runId), undefined, "a rejected recovery cannot free the slot for another Start");
   } finally {
     fixture.close();
   }
