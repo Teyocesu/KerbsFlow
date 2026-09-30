@@ -122,7 +122,29 @@ export class Phase2Loop {
     new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
     command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     await checkpoint();
-    const worktree = this.git.create(intake, request.runId);
+    let worktree: WorktreeRecord;
+    try {
+      worktree = this.git.create(intake, request.runId);
+    } catch (error) {
+      if (!(error instanceof KerbsFlowError)) throw error;
+      if (error.code === "WORKTREE_CREATION_UNCERTAIN") {
+        command = this.core.gatePlanWorktreeCreationUncertain(request.runId, command.stateVersion, `${request.runId}:worktree-creation-uncertain`);
+        return {
+          verdict: "HUMAN_GATE",
+          intake,
+          intakeIssue: { code: error.code, summary: "Worktree creation is uncertain; its durable intent marker and any partial Git state are preserved for review." },
+          stateVersion: command.stateVersion,
+        };
+      }
+      const reasonCode = error.code.toLowerCase().replace(/[^a-z0-9_]+/gu, "_").slice(0, 120) || "worktree_setup_failed";
+      command = this.core.failPlanWorktreeSetup(request.runId, command.stateVersion, `${request.runId}:worktree-setup-failed`, reasonCode);
+      return {
+        verdict: "FAILED",
+        intake,
+        intakeIssue: { code: error.code, summary: `Worktree setup failed before creation intent: ${reasonCode}.` },
+        stateVersion: command.stateVersion,
+      };
+    }
     this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
     await checkpoint();
     const planned = await this.acceptInitialPlan(request, command.stateVersion, planningMaster, controls.checkpoint);

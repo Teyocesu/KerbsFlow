@@ -14,6 +14,7 @@ import {
   asCommandId,
   asRunId,
   asTaskId,
+  parseExecutorResult,
   type RunId,
 } from "../src/contracts.js";
 import { KerbsFlowCore } from "../src/core.js";
@@ -158,57 +159,111 @@ test("startup refuses to report an unfinished historical Start as a live drive",
   }
 });
 
-test("rejected direct terminal recovery keeps the startup coordinator reservation", async () => {
-  const fixture = makeCoordinatorFixture();
-  const runId = asRunId("run_coord_recovery_slot");
-  try {
-    let command = fixture.core.startRun(runId, "preserve the recovery reservation", "coord:recovery-slot:start", asCommandId("command_coord_recovery_slot_start"));
-    command = fixture.core.completeIntake(runId, command.stateVersion, "coord:recovery-slot:intake");
-    const taskId = asTaskId("task_coord_recovery_slot");
-    const planned = createPhase2PlanningDecision({
-      decisionId: `decision_${runId}`,
-      runId,
-      taskId,
-      objective: "preserve the recovery reservation",
-      acceptance: ["ambiguous recovery cannot free the control-plane slot"],
-      positiveScope: ["src"],
-      negativeScope: ["external execution"],
-      model: "fixture-model",
-      canonicalContext: "direct terminal recovery reservation test",
+test("rejected direct terminal recovery keeps the startup coordinator reservation", async (suite) => {
+  for (const lifecycle of ["PREPARED", "RUNNING", "UNKNOWN"] as const) {
+    await suite.test(`${lifecycle} remains reserved after rejected terminal recovery`, async () => {
+      const fixture = makeCoordinatorFixture();
+      const runId = asRunId(`run_coord_recovery_slot_${lifecycle.toLowerCase()}`);
+      try {
+        const recovery = await stageCoordinatorRecovery(fixture, runId, lifecycle);
+        const coordinator = fixture.coordinator(new SettledDriver());
+        assert.equal(coordinator.activeRunId, runId);
+        assert.throws(
+          () => fixture.core.recover(runId, recovery.stateVersion, `coord:recovery-slot:reject:${lifecycle}`, {
+            schemaVersion: CONTRACT_VERSIONS.recoveryDecision,
+            runId,
+            target: "FAILED",
+            summary: "ambiguous attempts cannot be abandoned",
+            evidenceRefs: [],
+          }),
+          (error: unknown) => error instanceof KerbsFlowError && error.code === "RECOVERY_EVIDENCE_INSUFFICIENT",
+        );
+
+        assert.equal(coordinator.activeRunId, runId, "rejected recovery must retain the startup reservation");
+        const competingRun = startRequest(`run_coord_recovery_slot_competing_${lifecycle.toLowerCase()}`);
+        assert.throws(
+          () => coordinator.start(competingRun),
+          (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT",
+        );
+        assert.equal(fixture.store.getRun(competingRun.runId), undefined, "a rejected recovery cannot free the slot for another Start");
+      } finally {
+        fixture.close();
+      }
     });
-    const decision = { ...planned, route: { adapter: "fake" as const, model: "fake" }, requiredCapabilities: ["simulated_execution"], policyVersion: "phase1-test-policy" };
-    command = fixture.core.plan(runId, command.stateVersion, "coord:recovery-slot:plan", decision);
-    command = fixture.core.prepareExecution(runId, command.stateVersion, "coord:recovery-slot:prepare");
-    await fixture.core.beginFakeAttempt(runId, command.stateVersion, "coord:recovery-slot:begin");
+  }
+});
 
-    fixture.store.close();
-    fixture.reopen();
-    const recovery = fixture.core.readModel(runId);
-    assert.equal(recovery?.run.state, "RECOVERY");
-    assert.equal(recovery?.activeAttempt?.lifecycle, "RUNNING");
-    assert.ok(recovery);
+for (const target of ["FAILED", "CANCELLED"] as const) {
+  test(`terminal ${target} recovery releases the startup reservation for the next Start`, async () => {
+    const fixture = makeCoordinatorFixture();
+    const runId = asRunId(`run_coord_terminal_recovery_${target.toLowerCase()}`);
+    const nextRunId = asRunId(`run_coord_after_recovery_${target.toLowerCase()}`);
+    const driver = new BlockingDriver(fixture.store);
+    try {
+      const recovery = await stageCoordinatorRecovery(fixture, runId, "SUCCEEDED");
+      const coordinator = fixture.coordinator(driver);
+      assert.equal(coordinator.activeRunId, runId);
+      const outcome = fixture.store.getAttempt(recovery.attemptId)?.outcomeJson;
+      assert.ok(outcome);
+      assert.equal(parseExecutorResult(JSON.parse(outcome)).outcome, "succeeded");
 
-    const coordinator = fixture.coordinator(new SettledDriver());
-    assert.equal(coordinator.activeRunId, runId);
-    assert.throws(
-      () => fixture.core.recover(runId, recovery.run.stateVersion, "coord:recovery-slot:reject", {
+      const result = fixture.core.recover(runId, recovery.stateVersion, `coord:recovery-terminal:${target}`, {
         schemaVersion: CONTRACT_VERSIONS.recoveryDecision,
         runId,
-        target: "FAILED",
-        summary: "ambiguous attempts cannot be abandoned",
+        target,
+        summary: `terminal ${target} recovery with succeeded executor evidence`,
         evidenceRefs: [],
-      }),
-      (error: unknown) => error instanceof KerbsFlowError && error.code === "RECOVERY_EVIDENCE_INSUFFICIENT",
-    );
+      });
+      assert.equal(result.to, target);
+      if (target === "FAILED") {
+        assert.equal(coordinator.activeRunId, undefined, "activeRunId reconciles the exact terminal startup reservation");
+      }
 
-    assert.equal(coordinator.activeRunId, runId, "rejected recovery must retain the startup reservation");
-    const competingRun = startRequest("run_coord_recovery_slot_competing");
+      const next = coordinator.start(startRequest(nextRunId));
+      assert.equal(next.to, "INTAKE", "Start reconciliation releases the stale slot before checking for a conflict");
+      await driver.started.promise;
+      assert.equal(coordinator.activeRunId, nextRunId, "the next run acquires the released slot");
+    } finally {
+      driver.release.resolve();
+      if (driver.started.settled) await settleDriver(driver.done.promise);
+      fixture.close();
+    }
+  });
+}
+
+test("replaying an old terminal recovery cannot release a newer run reservation", async () => {
+  const fixture = makeCoordinatorFixture();
+  const runId = asRunId("run_coord_recovery_replay_old");
+  const nextRunId = asRunId("run_coord_recovery_replay_next");
+  const driver = new BlockingDriver(fixture.store);
+  try {
+    const recovery = await stageCoordinatorRecovery(fixture, runId, "SUCCEEDED");
+    const coordinator = fixture.coordinator(driver);
+    const recoveryKey = "coord:recovery-replay-old";
+    const decision = {
+      schemaVersion: CONTRACT_VERSIONS.recoveryDecision,
+      runId,
+      target: "FAILED" as const,
+      summary: "finish the historical recovered run",
+      evidenceRefs: [],
+    };
+    const terminal = fixture.core.recover(runId, recovery.stateVersion, recoveryKey, decision);
+    assert.equal(terminal.to, "FAILED");
+    assert.equal(coordinator.activeRunId, undefined);
+
+    coordinator.start(startRequest(nextRunId));
+    await driver.started.promise;
+    assert.equal(coordinator.activeRunId, nextRunId);
+    const replay = fixture.core.recover(runId, recovery.stateVersion, recoveryKey, decision);
+    assert.equal(replay.replayed, true);
+    assert.equal(coordinator.activeRunId, nextRunId, "old recovery replay cannot reconcile or clear the newer reservation");
     assert.throws(
-      () => coordinator.start(competingRun),
+      () => coordinator.start(startRequest("run_coord_recovery_replay_competing")),
       (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT",
     );
-    assert.equal(fixture.store.getRun(competingRun.runId), undefined, "a rejected recovery cannot free the slot for another Start");
   } finally {
+    driver.release.resolve();
+    if (driver.started.settled) await settleDriver(driver.done.promise);
     fixture.close();
   }
 });
@@ -725,6 +780,73 @@ function makeCoordinatorFixture(adapter = new FakeAdapter(fixedClock(), new Sequ
       rmSync(root, { recursive: true, force: true });
     },
   };
+}
+
+async function stageCoordinatorRecovery(
+  fixture: ReturnType<typeof makeCoordinatorFixture>,
+  runId: RunId,
+  lifecycle: "PREPARED" | "RUNNING" | "UNKNOWN" | "SUCCEEDED",
+): Promise<{ stateVersion: number; taskId: TaskId; attemptId: AttemptId }> {
+  let command = fixture.core.startRun(runId, "exercise startup recovery ownership", `coord:recovery-stage:${runId}`, asCommandId(`command_${runId}`));
+  command = fixture.core.completeIntake(runId, command.stateVersion, `coord:recovery-intake:${runId}`);
+  const taskId = asTaskId(`task_${runId}`);
+  const planned = createPhase2PlanningDecision({
+    decisionId: `decision_${runId}`,
+    runId,
+    taskId,
+    objective: "exercise startup recovery ownership",
+    acceptance: ["recovery evidence remains bound to its run and attempt"],
+    positiveScope: ["src"],
+    negativeScope: ["external execution"],
+    model: "fixture-model",
+    canonicalContext: "coordinator recovery reservation test",
+  });
+  const decision = { ...planned, route: { adapter: "fake" as const, model: "fake" }, requiredCapabilities: ["simulated_execution"], policyVersion: "phase1-test-policy" };
+  command = fixture.core.plan(runId, command.stateVersion, `coord:recovery-plan:${runId}`, decision);
+  command = fixture.core.prepareExecution(runId, command.stateVersion, `coord:recovery-prepare:${runId}`);
+  if (lifecycle !== "PREPARED") await fixture.core.beginFakeAttempt(runId, command.stateVersion, `coord:recovery-begin:${runId}`);
+
+  const model = fixture.core.readModel(runId);
+  const attemptId = model?.run.activeAttemptId;
+  assert.ok(attemptId);
+  if (lifecycle === "UNKNOWN" || lifecycle === "SUCCEEDED") {
+    const outcomeJson = lifecycle === "SUCCEEDED" ? JSON.stringify(parseExecutorResult({
+      schemaVersion: CONTRACT_VERSIONS.executorResult,
+      runId,
+      taskId,
+      attemptId,
+      executor: { adapter: "fake", adapterVersion: "fixture", provider: "synthetic", model: "fixture-model" },
+      outcome: "succeeded",
+      failureClass: null,
+      scopeClaim: "within_scope",
+      summary: "synthetic terminal executor success",
+      filesChanged: [],
+      checks: [],
+      evidence: [],
+      invariantViolations: [],
+      risks: [],
+      warnings: [],
+      artifacts: [],
+      humanGate: null,
+      recommendedNext: "verify_focused",
+      exit: { kind: "normal", code: 0 },
+    })) : null;
+    const database = new DatabaseSync(fixture.dbPath);
+    try {
+      database.prepare("UPDATE attempts SET lifecycle = ?, outcome_json = ?, ended_at = ?, updated_at = ? WHERE attempt_id = ?")
+        .run(lifecycle, outcomeJson, lifecycle === "SUCCEEDED" ? fixture.clock.now() : null, fixture.clock.now(), attemptId);
+    } finally {
+      database.close();
+    }
+  }
+
+  fixture.store.close();
+  fixture.reopen();
+  const recovery = fixture.core.readModel(runId);
+  assert.equal(recovery?.run.state, "RECOVERY");
+  assert.equal(recovery?.activeAttempt?.lifecycle, lifecycle);
+  assert.ok(recovery);
+  return { stateVersion: recovery.run.stateVersion, taskId, attemptId };
 }
 
 function coordinatorCore(store: StateStore, adapter: FakeAdapter | RoutedExecutorAdapter, artifacts: FakeArtifactStore, clock: FixedClock, ids: SequenceIdSource): KerbsFlowCore {

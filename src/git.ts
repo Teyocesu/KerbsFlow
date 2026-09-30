@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -139,7 +140,8 @@ export class GitWorktreeManager {
 
   create(intake: RepositoryIntake, runId: string, now = new Date().toISOString()): WorktreeRecord {
     const runKey = safeRunKey(runId);
-    const branch = `kerbsflow/run-${runKey.slice(0, 24)}`;
+    const digest = createHash("sha256").update(runKey, "utf8").digest("hex").slice(0, 20);
+    const branch = `kerbsflow/run-${runKey.slice(0, 24)}-${digest}`;
     const worktreesRoot = ensurePrivateDirectory(join(this.runtimeRoot, "worktrees"));
     const recordsRoot = ensurePrivateDirectory(join(this.runtimeRoot, "worktree-records"));
     const path = resolve(worktreesRoot, runKey);
@@ -161,22 +163,31 @@ export class GitWorktreeManager {
       markerPath,
       createdAt: now,
     };
-    atomicWritePrivateFile(recordsRoot, basename(markerPath), `${JSON.stringify(intent)}\n`);
-    git(intake.repositoryPath, ["worktree", "add", "--lock", "--reason", `kerbsflow run ${runKey}`, "-b", branch, path, intake.baseOid]);
-    const record: WorktreeRecord = {
-      schemaVersion: "kerbsflow.worktree/v1",
-      runKey,
-      repositoryPath: intake.repositoryPath,
-      gitCommonDirectory: intake.gitCommonDirectory,
-      worktreeGitDirectory: canonicalGitPath(path, git(path, ["rev-parse", "--git-dir"])),
-      baseOid: intake.baseOid,
-      branch,
-      path: realpathSync(path),
-      markerPath,
-      createdAt: now,
-    };
-    atomicWritePrivateFile(recordsRoot, basename(markerPath), `${JSON.stringify(record)}\n`, true);
-    return record;
+    try {
+      atomicWritePrivateFile(recordsRoot, basename(markerPath), `${JSON.stringify(intent)}\n`);
+    } catch (error) {
+      if (existsSync(markerPath)) throw uncertainWorktreeCreation(runKey, error);
+      throw error;
+    }
+    try {
+      git(intake.repositoryPath, ["worktree", "add", "--lock", "--reason", `kerbsflow run ${runKey}`, "-b", branch, path, intake.baseOid]);
+      const record: WorktreeRecord = {
+        schemaVersion: "kerbsflow.worktree/v1",
+        runKey,
+        repositoryPath: intake.repositoryPath,
+        gitCommonDirectory: intake.gitCommonDirectory,
+        worktreeGitDirectory: canonicalGitPath(path, git(path, ["rev-parse", "--git-dir"])),
+        baseOid: intake.baseOid,
+        branch,
+        path: realpathSync(path),
+        markerPath,
+        createdAt: now,
+      };
+      atomicWritePrivateFile(recordsRoot, basename(markerPath), `${JSON.stringify(record)}\n`, true);
+      return record;
+    } catch (error) {
+      throw uncertainWorktreeCreation(runKey, error);
+    }
   }
 
   discover(runId: string): WorktreeRecord | undefined {
@@ -525,6 +536,15 @@ function safeRunKey(runId: string): string {
     throw new KerbsFlowError("RUN_ID_PATH_INVALID", "run ID cannot form a safe worktree identity");
   }
   return key;
+}
+
+function uncertainWorktreeCreation(runKey: string, error: unknown): KerbsFlowError {
+  const failureCode = error instanceof KerbsFlowError ? error.code : "UNKNOWN";
+  return new KerbsFlowError(
+    "WORKTREE_CREATION_UNCERTAIN",
+    `worktree creation for ${runKey} crossed its durable intent boundary but did not reach a completed worktree record`,
+    { runKey, failureCode },
+  );
 }
 
 function parseWorktreeRecord(value: unknown): WorktreeRecord {

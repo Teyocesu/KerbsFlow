@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -200,6 +201,32 @@ test("owned worktree uses the recorded base, detects collisions, and retains dir
   }
 });
 
+test("new worktree branches distinguish run IDs with the same former 24-character prefix", () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-branch-identity-runtime-"));
+  const manager = new GitWorktreeManager(runtime);
+  const sharedPrefix = `run_${"a".repeat(20)}`;
+  const firstRunId = asRunId(`${sharedPrefix}_first`);
+  const secondRunId = asRunId(`${sharedPrefix}_second`);
+  try {
+    assert.equal(firstRunId.toLowerCase().slice(0, 24), secondRunId.toLowerCase().slice(0, 24));
+    const intake = manager.intake(repository.root);
+    const first = manager.create(intake, firstRunId);
+    const second = manager.create(intake, secondRunId);
+
+    assert.notEqual(first.branch, second.branch);
+    assert.match(first.branch, new RegExp(`^kerbsflow/run-${sharedPrefix}-[0-9a-f]{20}$`));
+    assert.match(second.branch, new RegExp(`^kerbsflow/run-${sharedPrefix}-[0-9a-f]{20}$`));
+    assert.ok(first.branch.length <= 64);
+    assert.ok(second.branch.length <= 64);
+    assert.equal(manager.discover(firstRunId)?.path, first.path);
+    assert.equal(manager.discover(secondRunId)?.path, second.path);
+  } finally {
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository.root, { recursive: true, force: true });
+  }
+});
+
 test("runtime root inside the human-owned repository is rejected", () => {
   const repository = createGitRepository();
   try {
@@ -216,7 +243,13 @@ test("failed worktree creation leaves a durable uncertainty marker instead of re
   const manager = new GitWorktreeManager(runtime);
   try {
     const intake = manager.intake(repository.root);
-    assert.throws(() => manager.create({ ...intake, baseOid: "0".repeat(40) }, "run_uncertain"), /git worktree failed/);
+    assert.throws(
+      () => manager.create({ ...intake, baseOid: "0".repeat(40) }, "run_uncertain"),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "WORKTREE_CREATION_UNCERTAIN",
+    );
+    const marker = JSON.parse(readFileSync(join(runtime, "worktree-records", "run_uncertain.json"), "utf8")) as Record<string, unknown>;
+    assert.equal(marker.schemaVersion, "kerbsflow.worktree-intent/v1", "uncertain creation preserves the durable intent marker");
+    assert.equal(marker.runKey, "run_uncertain");
     assert.throws(() => manager.discover("run_uncertain"), (error: unknown) => error instanceof KerbsFlowError && error.code === "WORKTREE_CREATION_UNCERTAIN");
   } finally {
     rmSync(repository.root, { recursive: true, force: true });
@@ -230,7 +263,9 @@ test("worktree creation rejects branch and unknown path collisions", () => {
   const manager = new GitWorktreeManager(runtime);
   try {
     const intake = manager.intake(repository.root);
-    git(repository.root, ["branch", "kerbsflow/run-run_branch"]);
+    const runKey = "run_branch";
+    const digest = createHash("sha256").update(runKey, "utf8").digest("hex").slice(0, 20);
+    git(repository.root, ["branch", `kerbsflow/run-${runKey}-${digest}`]);
     assert.throws(() => manager.create(intake, "run_branch"), /branch.*already exists/i);
     mkdirSync(join(runtime, "worktrees", "run_unknown"), { recursive: true });
     assert.throws(() => manager.create(intake, "run_unknown"), /already exists/i);

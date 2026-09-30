@@ -215,6 +215,53 @@ export class KerbsFlowCore {
     });
   }
 
+  failPlanWorktreeSetup(runId: RunId, expectedStateVersion: number, idempotencyKey: string, reasonCode: string): CommandResult {
+    const boundedReasonCode = reasonCode.toLowerCase().replace(/[^a-z0-9_]+/gu, "_").slice(0, 120) || "worktree_setup_failed";
+    const summary = `Worktree setup failed before its durable creation intent was recorded (${boundedReasonCode}). No Git worktree was created.`.slice(0, 1000);
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "FAILED", "core", boundedReasonCode, { summary });
+    return this.store.executeCommand(command, ({ run }) => {
+      if (run.state !== "PLAN") {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", `worktree setup failure requires PLAN, found ${run.state}`);
+      }
+      return {
+        transition: { to: "FAILED", actor: "core", reasonCode: boundedReasonCode, payload: { summary } },
+        runPatch: { recoveryRequired: false, recoveryReason: null },
+        details: { reasonCode: boundedReasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
+  gatePlanWorktreeCreationUncertain(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+    const reasonCode = "worktree_creation_uncertain";
+    const summary = "Worktree creation did not reach a durable completed record. The intent marker and any partial Git state are preserved for review; no automatic retry or cleanup will occur.";
+    const safeSummary = summary.slice(0, 1000);
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "HUMAN_GATE", "core", reasonCode, { summary: safeSummary });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (run.state !== "PLAN") {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", `uncertain worktree creation gate requires PLAN, found ${run.state}`);
+      }
+      const gate = parseHumanGate({
+        schemaVersion: CONTRACT_VERSIONS.humanGate,
+        gateId: asGateId(nextId("gate")),
+        runId,
+        reasonCode,
+        summary: safeSummary,
+        evidenceRefs: [],
+        options: [
+          { id: "fail", label: "Fail and preserve evidence", consequence: "Resolve the preserved intent marker and any partial Git state manually before starting another run.", target: "FAILED" },
+          { id: "cancel", label: "Cancel and preserve evidence", consequence: "Stop this run while keeping the intent marker and any partial Git state for manual review.", target: "CANCELLED" },
+        ],
+        status: "open",
+      });
+      this.insertGate(tx, gate, now);
+      return {
+        transition: { to: "HUMAN_GATE", actor: "core", reasonCode, gateId: gate.gateId, payload: { summary: safeSummary } },
+        runPatch: { currentGateId: gate.gateId, recoveryRequired: false, recoveryReason: null },
+        details: { gateId: gate.gateId, reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
   steer(runId: RunId, expectedStateVersion: number, idempotencyKey: string, text: string, commandId?: CommandId): CommandResult {
     const parsedText = parseSteerText(text, "text");
     if (containsLikelySecret(parsedText)) {

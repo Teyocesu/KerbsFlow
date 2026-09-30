@@ -155,6 +155,7 @@ export class RunCoordinator {
   }
 
   get activeRunId(): RunId | undefined {
+    this.reconcileTerminalReservation();
     return this.reservation?.runId;
   }
 
@@ -194,6 +195,7 @@ export class RunCoordinator {
       throw new KerbsFlowError("START_PRECONDITION_INVALID", "coordinator Start requires expectedStateVersion 0");
     }
 
+    this.reconcileTerminalReservation();
     if (this.reservation !== undefined) {
       if (this.reservation.runId !== request.runId) {
         throw new KerbsFlowError("ACTIVE_RUN_CONFLICT", `run ${this.reservation.runId} owns the coordinator slot`);
@@ -782,6 +784,18 @@ export class RunCoordinator {
       throw new KerbsFlowError("RUN_NOT_OWNED", `run ${runId} does not own the coordinator drive reservation`);
     }
     return reservation;
+  }
+
+  private reconcileTerminalReservation(): void {
+    const reservation = this.reservation;
+    if (reservation === undefined || (!reservation.startupBlocked && !reservation.driveSettled)
+      || reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
+      || reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined) return;
+
+    const run = this.store.getRun(reservation.runId);
+    if (this.reservation === reservation && run?.runId === reservation.runId && isTerminalState(run.state)) {
+      this.reservation = undefined;
+    }
   }
 
   private assertRequestVersion(runId: RunId, expectedStateVersion: number) {

@@ -1,13 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { realpathSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, realpathSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import { asCommandId, asGateId, asInstructionId, asRunId, asTaskId, type RunId } from "../src/contracts.js";
+import { GitWorktreeManager } from "../src/git.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { createPhase6CStack, deferred, waitFor, type Phase6CStack } from "./phase6c-harness.js";
+import { git } from "./phase2-helpers.js";
 
 interface HttpResponse {
   status: number;
@@ -377,6 +380,111 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
     } finally {
       hold.release();
       await stack.close();
+    }
+  });
+
+  await suite.test("deterministic worktree branch collision fails from PLAN and releases the slot", async () => {
+    const stack = createPhase6CStack();
+    const runId = asRunId("run_phase6c_preexisting_worktree_branch");
+    const nextRunId = asRunId("run_phase6c_after_worktree_branch_collision");
+    try {
+      const branch = generatedWorktreeBranch(runId);
+      git(stack.repository.root, ["branch", branch]);
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      const start = await post(stack.api, token, "/v1/runs", envelope("command_worktree_branch_collision_start", "idem_worktree_branch_collision_start", 0, {
+        runId,
+        objective: "persist a deterministic failure for an exact worktree branch collision",
+      }));
+      assert.equal(start.status, 200);
+      assert.equal(json(start).to, "INTAKE");
+
+      await waitFor(() => stack.store.getRun(runId)?.state === "FAILED" ? true : undefined, "durable FAILED after pre-existing generated branch collision");
+      const terminal = await snapshot(stack.api, token, runId);
+      assert.equal(terminal.run.state, "FAILED");
+      assert.notEqual(terminal.run.state, "PLAN", "worktree setup failure cannot leave the run stranded in PLAN");
+      assert.equal(stack.store.getWorktree(runId), undefined);
+      assert.equal(stack.store.listTransitions(runId).at(-1)?.reasonCode, "worktree_branch_collision");
+      assert.equal(stack.planningInputs.initial.length, 0, "Planning Master cannot run after worktree creation failed");
+      assert.equal(stack.adapter.requests.length, 0, "no executor may start without a completed worktree record");
+      assert.equal(stack.coordinator.activeRunId, undefined, "terminal drive settlement releases its exact reservation");
+
+      const next = await post(stack.api, token, "/v1/runs", envelope("command_after_worktree_branch_collision", "idem_after_worktree_branch_collision", 0, {
+        runId: nextRunId,
+        objective: "claim the slot after deterministic worktree setup failure",
+      }));
+      assert.equal(next.status, 200);
+      const nextRequest = await waitFor(() => stack.adapter.requests[0], "the next run reaches its executor after worktree setup failure");
+      assert.equal(nextRequest.runId, nextRunId);
+      stack.adapter.finishNext("succeeded");
+      await waitFor(() => stack.store.getRun(nextRunId)?.state === "HUMAN_GATE" ? true : undefined, "next run reaches its default phase validation gate after worktree setup failure");
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("uncertain worktree creation preserves its intent behind a terminal Human Gate", async () => {
+    for (const target of ["FAILED", "CANCELLED"] as const) {
+      const stack = createPhase6CStack();
+      const runId = asRunId(`run_phase6c_worktree_uncertain_${target.toLowerCase()}`);
+      try {
+        const manager = (stack.phase2 as unknown as { git: GitWorktreeManager }).git;
+        const create = manager.create.bind(manager);
+        manager.create = (intake, id, now) => create({ ...intake, baseOid: "0".repeat(40) }, id, now);
+
+        await stack.api.start();
+        const token = await bootstrapToken(stack.api);
+        const start = await post(stack.api, token, "/v1/runs", envelope(`command_worktree_uncertain_${target.toLowerCase()}_start`, `idem_worktree_uncertain_${target.toLowerCase()}_start`, 0, {
+          runId,
+          objective: "preserve ambiguous worktree creation for human resolution",
+        }));
+        assert.equal(start.status, 200);
+        assert.equal(json(start).to, "INTAKE");
+
+        await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "durable Human Gate after post-intent worktree failure");
+        const pending = await snapshot(stack.api, token, runId);
+        assert.equal(pending.run.state, "HUMAN_GATE");
+        assert.equal(pending.currentGate?.status, "open");
+        const gateId = asGateId(pending.currentGate!.gateId);
+        const storedGate = stack.store.getGate(gateId);
+        assert.equal(storedGate?.gate.reasonCode, "worktree_creation_uncertain");
+        assert.ok((storedGate?.gate.summary.length ?? 0) <= 4000);
+        assert.match(storedGate?.gate.summary ?? "", /intent marker and any partial Git state are preserved/i);
+        assert.deepEqual(storedGate?.gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"]);
+        assert.equal(storedGate?.gate.evidenceRefs.length, 0);
+
+        const markerPath = join(stack.root, "runtime", "owned", "worktree-records", `${runId}.json`);
+        const marker = JSON.parse(readFileSync(markerPath, "utf8")) as Record<string, unknown>;
+        assert.equal(marker.schemaVersion, "kerbsflow.worktree-intent/v1", "the durable creation intent remains available as recovery evidence");
+        assert.equal(marker.runKey, runId.toLowerCase());
+        assert.equal(stack.store.getWorktree(runId), undefined, "an incomplete creation cannot be represented as a complete WorktreeRecord");
+        assert.equal(stack.planningInputs.initial.length, 0, "uncertain worktree creation cannot invoke Planning Master");
+        assert.equal(stack.adapter.requests.length, 0, "uncertain worktree creation cannot start the executor");
+        assert.equal(stack.coordinator.activeRunId, runId, "the nonterminal Human Gate retains the reservation");
+
+        const competing = await post(stack.api, token, "/v1/runs", envelope(`command_worktree_uncertain_${target.toLowerCase()}_competing`, `idem_worktree_uncertain_${target.toLowerCase()}_competing`, 0, {
+          runId: `run_phase6c_worktree_uncertain_competing_${target.toLowerCase()}`,
+          objective: "the unresolved creation gate owns the coordinator slot",
+        }));
+        assert.equal(competing.status, 409);
+        assert.equal(errorCode(competing), "ACTIVE_RUN_CONFLICT");
+
+        const option = storedGate?.gate.options.find((candidate) => candidate.target === target);
+        assert.ok(option);
+        const resolved = await post(stack.api, token, `/v1/runs/${runId}/gates/${gateId}/resolve`, envelope(
+          `command_worktree_uncertain_${target.toLowerCase()}_resolve`,
+          `idem_worktree_uncertain_${target.toLowerCase()}_resolve`,
+          pending.run.stateVersion,
+          { optionId: option.id },
+        ));
+        assert.equal(resolved.status, 200);
+        assert.equal(json(resolved).to, target);
+        assert.equal(stack.store.getRun(runId)?.state, target);
+        assert.equal(stack.coordinator.activeRunId, undefined, "terminal gate resolution releases the settled drive reservation");
+        assert.equal(JSON.parse(readFileSync(markerPath, "utf8")).schemaVersion, "kerbsflow.worktree-intent/v1", "terminal resolution never guesses or cleans partial Git state");
+      } finally {
+        await stack.close();
+      }
     }
   });
 
@@ -917,6 +1025,12 @@ async function within<T>(promise: Promise<T>, description: string, timeoutMs = 5
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+}
+
+function generatedWorktreeBranch(runId: string): string {
+  const safeRunKey = runId.toLowerCase().replace(/[^a-z0-9._-]+/gu, "-").replace(/^-+|-+$/gu, "");
+  const digest = createHash("sha256").update(safeRunKey, "utf8").digest("hex").slice(0, 20);
+  return `kerbsflow/run-${safeRunKey.slice(0, 24)}-${digest}`;
 }
 
 function envelope(commandId: string, idempotencyKey: string, expectedStateVersion: number, payload: Record<string, unknown>) {
