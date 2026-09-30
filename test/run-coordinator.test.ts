@@ -23,7 +23,7 @@ import { createPhase2PlanningDecision, type PlanningMaster } from "../src/planni
 import { StateStore } from "../src/persistence.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { RunCoordinator, type CoordinatorCancelRequest, type CoordinatorControlRequest, type CoordinatorStartRequest, type TrustedLaunchProfile } from "../src/run-coordinator.js";
-import type { AdapterDescriptor, AttemptHandle, AttemptId, ReconcileOutcome, TaskId } from "../src/contracts.js";
+import type { AdapterDescriptor, AttemptHandle, AttemptId, GateId, ReconcileOutcome, TaskId } from "../src/contracts.js";
 import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery, createAttemptRoutingProvenance, type RouteModelPolicy } from "../src/routing.js";
 
 test("RunCoordinator binds Start atomically and owns only one drive across retries", async () => {
@@ -152,6 +152,43 @@ test("startup refuses to report an unfinished historical Start as a live drive",
     const competing = startRequest("run_coord_startup_competing");
     assert.throws(() => coordinator.start(competing), (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT");
     assert.equal(fixture.store.getRun(competing.runId), undefined);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("live executor REWORK is projected before Phase2 registers its held-gate checkpoint", async () => {
+  const fixture = makeCoordinatorFixture();
+  let coordinator!: RunCoordinator;
+  const driver = new ExecutorGateProjectionDriver(fixture.core, fixture.store, (runId, gateId) => coordinator.getActionableGateOptionIds(runId, gateId), fixture.adapter);
+  coordinator = fixture.coordinator(driver);
+  const request = startRequest("run_coord_gate_projection_race");
+  try {
+    coordinator.start(request);
+    const beforeHold = await Promise.race([
+      driver.beforeHold.promise,
+      driver.done.promise.then(() => { throw driver.error ?? new Error("driver exited before the gate projection"); }),
+    ]);
+    assert.deepEqual(beforeHold, ["rework"], "persisted blocked proof plus the live owned drive keeps REWORK visible before heldGate registration");
+
+    const afterHold = await driver.afterHold.promise;
+    assert.deepEqual([...afterHold].sort(), ["cancel", "fail", "rework"]);
+    const model = fixture.core.readModel(request.runId);
+    const gate = model?.currentGate;
+    assert.ok(model);
+    assert.ok(gate);
+    assert.ok(gate.attemptId);
+    const resolved = await coordinator.resolveGate({
+      runId: request.runId,
+      expectedStateVersion: model.run.stateVersion,
+      commandId: asCommandId("command_coord_gate_projection_cancel"),
+      idempotencyKey: "coord:gate-projection:cancel",
+      gateId: gate.gateId,
+      optionId: "cancel",
+    });
+    assert.equal(resolved.to, "CANCELLED");
+    await driver.done.promise;
+    assert.equal(coordinator.activeRunId, undefined);
   } finally {
     fixture.close();
   }
@@ -375,6 +412,57 @@ for (const intentStatus of ["REQUESTED", "SIGNAL_PENDING"] as const) {
       fixture.close();
     }
   });
+}
+
+class ExecutorGateProjectionDriver {
+  readonly beforeHold = deferred<readonly string[]>();
+  readonly afterHold = deferred<readonly string[]>();
+  readonly done = deferred<void>();
+  error: unknown;
+
+  constructor(
+    private readonly core: KerbsFlowCore,
+    private readonly store: StateStore,
+    private readonly project: (runId: RunId, gateId: GateId) => readonly string[],
+    private readonly adapter: FakeAdapter,
+  ) {}
+
+  async driveStarted(request: Phase2LoopRequest, controls?: Phase2DriveControls): Promise<Phase2LoopResult> {
+    try {
+      let command = this.core.completeIntake(request.runId, this.store.getRun(request.runId)!.stateVersion, `${request.runId}:gate-projection:intake`);
+      const planned = createPhase2PlanningDecision({
+        decisionId: `decision_${request.runId}`,
+        runId: request.runId,
+        taskId: request.taskId,
+        objective: request.objective,
+        acceptance: ["the blocked executor gate retains its exact actionability"],
+        positiveScope: ["src"],
+        negativeScope: ["out of scope"],
+        model: "fixture-model",
+        canonicalContext: "live executor gate projection race",
+      });
+      const decision = { ...planned, route: { adapter: "fake" as const, model: "fake" }, requiredCapabilities: ["simulated_execution"], policyVersion: "phase1-test-policy" };
+      command = this.core.plan(request.runId, command.stateVersion, `${request.runId}:gate-projection:plan`, decision);
+      command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:gate-projection:prepare`);
+      this.adapter.script(request.taskId, "blocked");
+      command = await this.core.beginFakeAttempt(request.runId, command.stateVersion, `${request.runId}:gate-projection:begin`);
+      command = await this.core.completeFakeAttempt(request.runId, command.stateVersion, `${request.runId}:gate-projection:complete`);
+      const model = this.core.readModel(request.runId);
+      const gate = model?.currentGate;
+      if (model === undefined || gate === undefined || gate.attemptId === null) throw new Error("synthetic executor did not persist an attempt-bound gate");
+
+      this.beforeHold.resolve(this.project(request.runId, gate.gateId));
+      const held = controls?.waitForGateResolution?.({ gateId: gate.gateId, taskId: request.taskId, attemptId: gate.attemptId });
+      this.afterHold.resolve(this.project(request.runId, gate.gateId));
+      const stateVersion = held === undefined ? command.stateVersion : await held;
+      return { verdict: "CANCELLED", stateVersion };
+    } catch (error) {
+      this.error = error;
+      throw error;
+    } finally {
+      this.done.resolve();
+    }
+  }
 }
 
 class BlockingDriver {

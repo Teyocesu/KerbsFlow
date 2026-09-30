@@ -14,6 +14,7 @@ import {
   type ArtifactId,
   type CommandId,
   type CommandResult,
+  type HumanGateOption,
   type RunId,
   type RunState,
 } from "./contracts.js";
@@ -34,7 +35,7 @@ export interface LocalApiServerOptions {
 
 export interface LocalApiServerDependencies {
   core: Pick<KerbsFlowCore, "readModel" | "steer" | "configuration">;
-  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate">;
+  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate" | "getActionableGateOptionIds">;
   store: StateStore;
   artifacts: ArtifactReader;
 }
@@ -52,6 +53,7 @@ interface LocalApiErrorShape {
 
 const MAX_TRANSITIONS = 50;
 const MAX_ARTIFACTS = 50;
+const MAX_GATE_OPTIONS = 10;
 const MAX_POLL_ROWS = 100;
 const MAX_REQUEST_BODY_BYTES = 64 * 1024;
 const HEARTBEAT_INTERVAL_MS = 15_000;
@@ -337,6 +339,9 @@ export class LocalApiServer {
     }
     const transitions = this.dependencies.store.listRecentTransitions(runId, MAX_TRANSITIONS);
     const artifacts = this.dependencies.store.listArtifactRecords(runId, MAX_ARTIFACTS);
+    const actionableGateOptionIds = model.currentGate === undefined
+      ? []
+      : this.dependencies.coordinator.getActionableGateOptionIds(runId, model.currentGate.gateId);
     const snapshot = {
       schemaVersion: "kerbsflow.local-snapshot/v1",
       run: {
@@ -352,7 +357,7 @@ export class LocalApiServer {
       project: snapshotProject(this.dependencies.store.getRunLaunchBinding(runId)?.canonicalRepositoryPath),
       currentTask: snapshotTask(model.currentTask),
       activeAttempt: snapshotAttempt(model),
-      currentGate: snapshotGate(model),
+      currentGate: snapshotGate(model, actionableGateOptionIds),
       pendingSteer: snapshotPendingSteer(this.dependencies.store.getPendingSteerInstruction(runId)),
       latestValidation: snapshotValidation(model),
       latestReview: snapshotReview(model),
@@ -825,16 +830,30 @@ function snapshotAttempt(model: ReadModel): unknown {
   };
 }
 
-function snapshotGate(model: ReadModel): unknown {
+function snapshotGate(model: ReadModel, actionableOptionIds: readonly string[]): unknown {
   const stored = model.currentGate;
   if (stored === undefined) return null;
   const gate = stored.gate;
+  const actionableIds = new Set(actionableOptionIds);
+  const actionableOptions = gate.options.filter((option) => actionableIds.has(option.id));
+  const retainedTerminalTargets = new Set<string>();
+  const retained = new Set<HumanGateOption>();
+  for (const option of actionableOptions) {
+    if ((option.target === "FAILED" || option.target === "CANCELLED") && !retainedTerminalTargets.has(option.target)) {
+      retainedTerminalTargets.add(option.target);
+      retained.add(option);
+    }
+  }
+  for (const option of actionableOptions) {
+    if (retained.size >= MAX_GATE_OPTIONS) break;
+    retained.add(option);
+  }
   return {
     gateId: stored.gateId,
     status: stored.status,
     reasonCode: safeSnapshotText(gate.reasonCode, 120),
     summary: safeSnapshotText(gate.summary, 500),
-    options: gate.options.slice(0, 10).map((option) => ({
+    options: actionableOptions.filter((option) => retained.has(option)).map((option) => ({
       id: snapshotControlId(option.id),
       label: safeSnapshotText(option.label, 200),
       consequence: safeSnapshotText(option.consequence, 300),

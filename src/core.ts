@@ -1438,6 +1438,9 @@ export class KerbsFlowCore {
       if (decision.target === "EXECUTE") {
         throw new KerbsFlowError("AMBIGUOUS_REPLAY", "Phase 1 never re-dispatches an uncertain fake attempt directly");
       }
+      if ((decision.target === "FAILED" || decision.target === "CANCELLED") && attempt !== undefined && !isTerminalAttempt(attempt.lifecycle)) {
+        throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", `${decision.target} recovery requires trusted terminal evidence for the active attempt`);
+      }
       if (decision.target === "VERIFY_FOCUSED") {
         if (attempt === undefined || !isTerminalAttempt(attempt.lifecycle) || attempt.outcomeJson === null) {
           throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "VERIFY_FOCUSED recovery requires a persisted terminal attempt result");
@@ -1480,9 +1483,6 @@ export class KerbsFlowCore {
           status: "open",
         };
         this.insertGate(tx, gate, now);
-      }
-      if (decision.target === "CANCELLED" && attempt !== undefined && !isTerminalAttempt(attempt.lifecycle)) {
-        tx.run("UPDATE attempts SET lifecycle = ?, failure_class = ?, ended_at = ?, updated_at = ? WHERE attempt_id = ?", "CANCELLED", "cancelled", now, now, attempt.attemptId);
       }
       return {
         transition: {
@@ -1791,22 +1791,19 @@ export class KerbsFlowCore {
       }
     }
     const canRework = this.store.countTaskAttempts(runId, taskId) < this.configuration.effectiveMaxImplementationAttempts;
-    const ownedCounts = new Map<string, number>();
-    const nextControlId = (target: HumanGate["options"][number]["target"]): string => {
-      const base = target === "REWORK" ? "rework" : target === "FAILED" ? "fail" : target === "CANCELLED" ? "cancel" : undefined;
-      if (base === undefined) {
-        throw new KerbsFlowError("GATE_TARGET_ILLEGAL", "executor human gate target has no Core-owned control ID");
-      }
-      const occurrence = (ownedCounts.get(base) ?? 0) + 1;
-      ownedCounts.set(base, occurrence);
-      return occurrence === 1 ? base : `${base}_${occurrence}`;
-    };
-    const options = gate.options
-      .filter((option) => option.target === "FAILED" || option.target === "CANCELLED" || (option.target === "REWORK" && canRework))
-      .map((option) => ({ ...option, id: nextControlId(option.target) }));
+    const controlIds = { REWORK: "rework", FAILED: "fail", CANCELLED: "cancel" } as const;
+    const seenTargets = new Set<keyof typeof controlIds>();
+    const options: HumanGate["options"] = [];
+    for (const option of gate.options) {
+      if (option.target !== "REWORK" && option.target !== "FAILED" && option.target !== "CANCELLED") continue;
+      if (option.target === "REWORK" && !canRework) continue;
+      if (seenTargets.has(option.target)) continue;
+      seenTargets.add(option.target);
+      options.push({ ...option, id: controlIds[option.target] });
+    }
     const addTerminal = (target: "FAILED" | "CANCELLED", label: string, consequence: string): void => {
       if (options.some((option) => option.target === target)) return;
-      options.push({ id: nextControlId(target), label, consequence, target });
+      options.push({ id: controlIds[target], label, consequence, target });
     };
     addTerminal("FAILED", "Fail conservatively", "Stop this run and preserve the blocked attempt and evidence.");
     addTerminal("CANCELLED", "Cancel this run", "Stop this run without granting the requested action; preserve evidence.");

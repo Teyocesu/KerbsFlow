@@ -400,7 +400,7 @@ test("executor gates accept unique REWORK and CANCELLED options", async () => {
   }
 });
 
-test("executor gate control IDs are deterministic, safe, and unique by semantic target", async () => {
+test("executor gate control IDs are Core-owned and preserve the first option per semantic target", async () => {
   const normalize = async (rawIds: readonly string[]) => {
     const fixture = createFixture();
     try {
@@ -422,7 +422,7 @@ test("executor gate control IDs are deterministic, safe, and unique by semantic 
       assert.ok(attempt?.outcomeJson);
       const rawResult = JSON.parse(attempt.outcomeJson) as ExecutorResult;
       assert.deepEqual(rawResult.humanGate?.options.map((option) => option.id), rawIds);
-      return normalized;
+      return { normalized, rawOptions: rawResult.humanGate?.options };
     } finally {
       fixture.close();
     }
@@ -432,19 +432,55 @@ test("executor gate control IDs are deterministic, safe, and unique by semantic 
   const secondRawIds = ["another/rework", "different/rework-two", "other/fail", "other/fail-two", "other/cancel", "other/cancel-two"];
   const first = await normalize(firstRawIds);
   const second = await normalize(secondRawIds);
-  const expectedIds = ["rework", "rework_2", "fail", "fail_2", "cancel", "cancel_2"];
-  assert.deepEqual(first.map((option) => option.id), expectedIds);
-  assert.deepEqual(second.map((option) => option.id), expectedIds);
-  assert.equal(new Set(first.map((option) => option.id)).size, first.length);
-  assert.ok(first.every((option) => /^[a-z][a-z0-9_]{0,99}$/u.test(option.id)));
-  assert.deepEqual(first.map(({ label, consequence, target }) => ({ label, consequence, target })), [
+  const expectedIds = ["rework", "fail", "cancel"];
+  assert.deepEqual(first.normalized.map((option) => option.id), expectedIds);
+  assert.deepEqual(second.normalized.map((option) => option.id), expectedIds);
+  assert.deepEqual(first.rawOptions?.map((option) => option.id), firstRawIds, "the complete executor claim remains persisted on the attempt");
+  assert.equal(new Set(first.normalized.map((option) => option.id)).size, first.normalized.length);
+  assert.ok(first.normalized.every((option) => /^[a-z][a-z0-9_]{0,99}$/u.test(option.id)));
+  assert.deepEqual(first.normalized.map(({ label, consequence, target }) => ({ label, consequence, target })), [
     { label: "First rework", consequence: "Keep the approved scope.", target: "REWORK" },
-    { label: "Second rework", consequence: "Repeat the bounded correction.", target: "REWORK" },
     { label: "First failure", consequence: "Stop and keep evidence.", target: "FAILED" },
-    { label: "Second failure", consequence: "Stop and retain the attempt.", target: "FAILED" },
     { label: "First cancel", consequence: "Cancel this run.", target: "CANCELLED" },
-    { label: "Second cancel", consequence: "Cancel and preserve evidence.", target: "CANCELLED" },
   ]);
+});
+
+test("ten executor REWORK proposals normalize to one option while preserving the raw attempt claim", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const proposals = Array.from({ length: 10 }, (_, index) => ({
+      id: `provider-rework-${index + 1}`,
+      label: index === 0 ? "First rework proposal" : `Duplicate rework ${index + 1}`,
+      consequence: index === 0 ? "Keep the approved scope." : `Duplicate consequence ${index + 1}.`,
+      target: "REWORK" as const,
+    }));
+    await fixture.core.completeFakeAttempt(fixture.runId, 4, "ten-rework-proposals", blockedResult(fixture, proposals));
+
+    const model = fixture.core.readModel(fixture.runId);
+    const attemptId = model?.run.activeAttemptId;
+    assert.ok(attemptId);
+    const attempt = fixture.store.getAttempt(attemptId);
+    assert.ok(attempt?.outcomeJson);
+    const rawResult = JSON.parse(attempt.outcomeJson) as ExecutorResult;
+    assert.equal(rawResult.humanGate?.options.length, 10);
+    assert.ok(rawResult.humanGate?.options.every((option) => option.target === "REWORK"));
+
+    const options = model?.currentGate?.gate.options ?? [];
+    assert.deepEqual(options.map((option) => option.target), ["REWORK", "FAILED", "CANCELLED"]);
+    assert.deepEqual(options.map((option) => option.id), ["rework", "fail", "cancel"]);
+    assert.deepEqual(options[0], {
+      id: "rework",
+      label: "First rework proposal",
+      consequence: "Keep the approved scope.",
+      target: "REWORK",
+    });
+    assert.equal(options.length, 3);
+    assert.equal(new Set(options.map((option) => option.id)).size, 3);
+    assert.ok(options.every((option) => /^[a-z][a-z0-9_]{0,99}$/u.test(option.id)));
+  } finally {
+    fixture.close();
+  }
 });
 
 test("executor gates synthesize both missing terminal choices into the Core-owned namespace", async () => {
@@ -458,8 +494,8 @@ test("executor gates synthesize both missing terminal choices into the Core-owne
     const accepted = await fixture.core.completeFakeAttempt(fixture.runId, 4, "synthesize-terminals", result);
     assert.equal(accepted.to, "HUMAN_GATE");
     const options = fixture.core.readModel(fixture.runId)?.currentGate?.gate.options ?? [];
-    assert.deepEqual(options.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK", "REWORK"]);
-    assert.deepEqual(options.map((option) => option.id), ["rework", "rework_2", "fail", "cancel"]);
+    assert.deepEqual(options.map((option) => option.target), ["REWORK", "FAILED", "CANCELLED"]);
+    assert.deepEqual(options.map((option) => option.id), ["rework", "fail", "cancel"]);
     assert.equal(new Set(options.map((option) => option.id)).size, options.length);
   } finally {
     fixture.close();

@@ -84,7 +84,7 @@ function executorResultForOutcome(fixture: TestFixture, outcome: ExecutorResult[
 function persistenceCounts(fixture: TestFixture): Record<string, number> {
   const db = new DatabaseSync(fixture.dbPath);
   try {
-    const count = (table: "commands" | "transitions" | "validations" | "reviews" | "human_gates"): number =>
+    const count = (table: "commands" | "transitions" | "validations" | "reviews" | "human_gates" | "cancellation_intents"): number =>
       (db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get() as { count: number }).count;
     return {
       commands: count("commands"),
@@ -92,6 +92,7 @@ function persistenceCounts(fixture: TestFixture): Record<string, number> {
       validations: count("validations"),
       reviews: count("reviews"),
       gates: count("human_gates"),
+      cancellationIntents: count("cancellation_intents"),
     };
   } finally {
     db.close();
@@ -118,6 +119,22 @@ function stageTerminalRecovery(fixture: TestFixture, lifecycle: AttemptLifecycle
   });
   reopen(fixture);
   assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "RECOVERY");
+}
+
+function stageRecoveryWithoutActiveAttempt(fixture: TestFixture): void {
+  primeExecute(fixture);
+  const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+  assert.ok(attemptId);
+  const database = new DatabaseSync(fixture.dbPath);
+  try {
+    database.prepare("UPDATE attempts SET lifecycle = ?, ended_at = ? WHERE attempt_id = ?").run("CANCELLED", fixture.clock.now(), attemptId);
+    database.prepare("UPDATE runs SET active_attempt_id = NULL WHERE run_id = ?").run(fixture.runId);
+  } finally {
+    database.close();
+  }
+  reopen(fixture);
+  assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "RECOVERY");
+  assert.equal(fixture.core.readModel(fixture.runId)?.run.activeAttemptId, null);
 }
 
 test("startup detects PREPARED attempts and moves EXECUTE to RECOVERY", () => {
@@ -216,16 +233,111 @@ test("RECOVERY with a settled attempt may still enter HUMAN_GATE", () => {
   }
 });
 
-test("startup detects RUNNING attempts without replaying them", async () => {
+for (const lifecycle of ["PREPARED", "RUNNING", "UNKNOWN"] as const) {
+  for (const target of ["FAILED", "CANCELLED"] as const) {
+    test(`RECOVERY cannot select ${target} while the attempt is ${lifecycle}`, async () => {
+      const fixture = createFixture();
+      const effects = { cancel: 0, reconcile: 0 };
+      try {
+        primeExecute(fixture);
+        if (lifecycle !== "PREPARED") {
+          await fixture.core.beginFakeAttempt(fixture.runId, 4, `begin-${lifecycle.toLowerCase()}`);
+        }
+        const stagedAttemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+        assert.ok(stagedAttemptId);
+        if (lifecycle === "UNKNOWN") {
+          const database = new DatabaseSync(fixture.dbPath);
+          try {
+            database.prepare("UPDATE attempts SET lifecycle = ?, updated_at = ? WHERE attempt_id = ?").run("UNKNOWN", fixture.clock.now(), stagedAttemptId);
+          } finally {
+            database.close();
+          }
+        }
+        const originalCancel = fixture.adapter.cancel.bind(fixture.adapter);
+        const originalReconcile = fixture.adapter.reconcile.bind(fixture.adapter);
+        fixture.adapter.cancel = (...args) => { effects.cancel += 1; return originalCancel(...args); };
+        fixture.adapter.reconcile = async (...args) => { effects.reconcile += 1; return originalReconcile(...args); };
+        reopen(fixture);
+
+        const beforeRun = fixture.store.getRun(fixture.runId);
+        const beforeAttempt = fixture.store.getAttempt(stagedAttemptId);
+        assert.equal(beforeRun?.state, "RECOVERY");
+        assert.equal(beforeAttempt?.lifecycle, lifecycle);
+        assert.ok(beforeRun?.recoveryRequired);
+        assert.ok(beforeRun.recoveryReason);
+        const beforeCounts = persistenceCounts(fixture);
+
+        assert.throws(
+          () => fixture.core.recover(fixture.runId, beforeRun.stateVersion, `recover-${lifecycle.toLowerCase()}-${target.toLowerCase()}`, recoveryDecision(fixture.runId, target)),
+          (error: unknown) => error instanceof KerbsFlowError && error.code === "RECOVERY_EVIDENCE_INSUFFICIENT",
+        );
+
+        const afterRun = fixture.store.getRun(fixture.runId);
+        const afterAttempt = fixture.store.getAttempt(stagedAttemptId);
+        assert.equal(afterRun?.state, "RECOVERY");
+        assert.equal(afterRun?.stateVersion, beforeRun.stateVersion);
+        assert.equal(afterRun?.recoveryRequired, beforeRun.recoveryRequired);
+        assert.equal(afterRun?.recoveryReason, beforeRun.recoveryReason);
+        assert.deepEqual(afterAttempt, beforeAttempt, "rejected recovery cannot rewrite attempt lifecycle or evidence");
+        assert.deepEqual(persistenceCounts(fixture), beforeCounts, "rejected recovery persists no command, transition, or cancellation intent");
+        assert.equal(fixture.store.getCancellationIntent(stagedAttemptId), undefined);
+        assert.deepEqual(effects, { cancel: 0, reconcile: 0 }, "recover cannot signal or reconcile an ambiguous attempt");
+      } finally {
+        fixture.close();
+      }
+    });
+  }
+}
+
+for (const target of ["FAILED", "CANCELLED"] as const) {
+  test(`RECOVERY may select ${target} when there is no active attempt`, () => {
+    const fixture = createFixture();
+    try {
+      stageRecoveryWithoutActiveAttempt(fixture);
+      const before = fixture.core.readModel(fixture.runId);
+      assert.ok(before);
+      const result = fixture.core.recover(fixture.runId, before.run.stateVersion, `recover-no-attempt-${target.toLowerCase()}`, recoveryDecision(fixture.runId, target));
+      assert.equal(result.to, target);
+      const after = fixture.core.readModel(fixture.runId);
+      assert.equal(after?.run.state, target);
+      assert.equal(after?.run.activeAttemptId, null);
+      assert.equal(after?.activeAttempt, undefined);
+    } finally {
+      fixture.close();
+    }
+  });
+}
+
+test("a terminal FAILED attempt may recover to FAILED without changing attempt evidence", () => {
   const fixture = createFixture();
   try {
     primeExecute(fixture);
-    await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin-running");
-    reopen(fixture);
-    assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "RECOVERY");
-    assert.equal(fixture.core.readModel(fixture.runId)?.activeAttempt?.lifecycle, "RUNNING");
-    const failed = fixture.core.recover(fixture.runId, 5, "recover-running", recoveryDecision(fixture.runId, "FAILED"));
+    const outcomeJson = JSON.stringify(executorResultForOutcome(fixture, "failed"));
+    stageTerminalRecovery(fixture, "FAILED", outcomeJson);
+    const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+    assert.ok(attemptId);
+    const beforeAttempt = fixture.store.getAttempt(attemptId);
+    const failed = fixture.core.recover(fixture.runId, 5, "recover-terminal-failed", recoveryDecision(fixture.runId, "FAILED"));
     assert.equal(failed.to, "FAILED");
+    assert.deepEqual(fixture.store.getAttempt(attemptId), beforeAttempt);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("a terminal FAILED attempt remains FAILED when recovery selects run CANCELLED", () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const outcomeJson = JSON.stringify(executorResultForOutcome(fixture, "failed"));
+    stageTerminalRecovery(fixture, "FAILED", outcomeJson);
+    const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+    assert.ok(attemptId);
+    const beforeAttempt = fixture.store.getAttempt(attemptId);
+    const cancelled = fixture.core.recover(fixture.runId, 5, "recover-failed-attempt-cancel-run", recoveryDecision(fixture.runId, "CANCELLED"));
+    assert.equal(cancelled.to, "CANCELLED");
+    assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "CANCELLED");
+    assert.deepEqual(fixture.store.getAttempt(attemptId), beforeAttempt, "run terminal intent must not rewrite the historical attempt outcome");
   } finally {
     fixture.close();
   }
@@ -289,6 +401,9 @@ test("a valid persisted cancelled result may recover to terminal CANCELLED", () 
   try {
     primeExecute(fixture);
     stageTerminalRecovery(fixture, "CANCELLED", JSON.stringify(executorResultForOutcome(fixture, "cancelled")));
+    const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+    assert.ok(attemptId);
+    const beforeAttempt = fixture.store.getAttempt(attemptId);
     const cancelled = fixture.core.recover(fixture.runId, 5, "recover-cancelled", recoveryDecision(fixture.runId, "CANCELLED"));
     assert.equal(cancelled.to, "CANCELLED");
     const model = fixture.core.readModel(fixture.runId);
@@ -297,6 +412,7 @@ test("a valid persisted cancelled result may recover to terminal CANCELLED", () 
     assert.equal(model?.activeAttempt?.lifecycle, "CANCELLED");
     assert.equal(model?.latestValidation, undefined);
     assert.equal(model?.latestReview, undefined);
+    assert.deepEqual(fixture.store.getAttempt(attemptId), beforeAttempt, "recovery keeps the terminal attempt's original evidence and timestamps");
   } finally {
     fixture.close();
   }

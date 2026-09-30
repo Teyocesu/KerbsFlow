@@ -60,7 +60,7 @@ interface RequestOptions {
 }
 
 type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "steer" | "configuration">;
-type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate">;
+type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate" | "getActionableGateOptionIds">;
 
 interface RunningApi {
   fixture: ApiFixture;
@@ -212,6 +212,10 @@ function localApiCoordinator(fixture: ApiFixture, overrides: Partial<LocalApiCoo
       value.note,
       value.commandId,
     ))))(request),
+    getActionableGateOptionIds: (runId, gateId) => (overrides.getActionableGateOptionIds ?? ((currentRunId, currentGateId) => {
+      const gate = fixture.store.getGate(currentGateId);
+      return gate?.runId === currentRunId ? gate.gate.options.map((option) => option.id) : [];
+    }))(runId, gateId),
   };
 }
 
@@ -894,6 +898,25 @@ test("snapshot preserves valid gate control IDs exactly and fails closed on malf
     assert.deepEqual(JSON.parse(rejected.body), { error: { code: "INTERNAL_ERROR", message: "internal server error" } });
     assert.doesNotMatch(rejected.body, /synthetic\/malformed-control|\[path redacted\]/u);
     assert.equal(fixture.store.getGate(gateId)?.gate.options[0]?.id, "/synthetic/malformed-control", "snapshot failure must not rewrite persisted identity");
+  });
+});
+
+test("snapshot projects only gate option IDs approved by RunCoordinator", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_gate_actionability");
+    assert.equal((await postMutation(api, "/v1/runs", token, mutationEnvelope("command_gate_actionability_start", "gate:actionability:start", 0, {
+      runId,
+      objective: "project coordinator-approved gate controls",
+    }))).status, 200);
+    fixture.core.gateIntake(runId, 1, "gate:actionability:create", "synthetic_human_gate", "Synthetic gate actionability projection.");
+    const gateId = fixture.core.readModel(runId)?.currentGate?.gateId;
+    assert.ok(gateId);
+    const response = await sendRequest(api, `/v1/runs/${runId}/snapshot`, { origin: `http://127.0.0.1:${api.port()}`, token });
+    assert.equal(response.status, 200);
+    const snapshot = JSON.parse(response.body) as { currentGate: { options: Array<{ id: string; target: string }> } };
+    assert.deepEqual(snapshot.currentGate.options.map(({ id, target }) => ({ id, target })), [{ id: "cancel", target: "CANCELLED" }]);
+  }, {
+    coordinator: () => ({ getActionableGateOptionIds: (_runId, _gateId) => ["cancel"] }),
   });
 });
 

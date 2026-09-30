@@ -57,6 +57,7 @@ test("LocalApiServer serves fixed dashboard assets with the bootstrap and securi
       resume: async () => { throw new Error("unexpected UI asset test Resume call"); },
       cancel: async () => { throw new Error("unexpected UI asset test Cancel call"); },
       resolveGate: async () => { throw new Error("unexpected UI asset test gate call"); },
+      getActionableGateOptionIds: () => [],
     },
     store: fixture.store,
     artifacts: {

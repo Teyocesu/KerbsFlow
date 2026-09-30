@@ -156,6 +156,135 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
     }
   });
 
+  await suite.test("ten executor REWORK proposals leave bounded HTTP options and both terminal choices resolvable", async () => {
+    for (const target of ["FAILED", "CANCELLED"] as const) {
+      const stack = createPhase6CStack({ phaseCheck: true, reworkProposalCount: 10 });
+      const runId = asRunId(`run_phase6c_ten_rework_${target.toLowerCase()}`);
+      try {
+        await stack.api.start();
+        const token = await bootstrapToken(stack.api);
+        assert.equal((await post(stack.api, token, "/v1/runs", envelope(`command_ten_rework_start_${target}`, `idem_ten_rework_start_${target}`, 0, { runId, objective: "bound duplicated executor gate targets" }))).status, 200);
+        const handle = await stack.adapter.started.promise;
+        const rawClaim = stack.adapter.finish(handle, "blocked");
+        await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "ten-proposal executor gate");
+
+        const gateSnapshot = await snapshot(stack.api, token, runId);
+        const gate = gateSnapshot.currentGate;
+        assert.ok(gate);
+        assert.deepEqual(gate.options.map((option) => option.id), ["rework", "cancel", "fail"]);
+        assert.deepEqual(gate.options.map((option) => option.target), ["REWORK", "CANCELLED", "FAILED"]);
+        const terminalOption = gate.options.find((option) => option.target === target);
+        assert.ok(terminalOption, `${target} remains visible in the bounded snapshot`);
+
+        const attempt = stack.store.getAttempt(handle.attemptId);
+        assert.ok(attempt?.outcomeJson);
+        const storedResult = JSON.parse(attempt.outcomeJson) as { humanGate: { options: Array<{ id: string; target: string }> } };
+        assert.equal(storedResult.humanGate.options.filter((option) => option.target === "REWORK").length, 10);
+        assert.deepEqual(storedResult.humanGate.options, rawClaim.humanGate?.options, "the complete raw executor claim remains on the attempt");
+
+        const path = `/v1/runs/${runId}/gates/${gate.gateId}/resolve`;
+        const resolved = await post(stack.api, token, path, envelope(`command_ten_rework_resolve_${target}`, `idem_ten_rework_resolve_${target}`, gateSnapshot.run.stateVersion, { optionId: terminalOption.id }));
+        assert.equal(resolved.status, 200, `${target} is actionable through RunCoordinator`);
+        assert.equal(json(resolved).to, target);
+      } finally {
+        await stack.close();
+      }
+    }
+  });
+
+  await suite.test("a restarted executor gate keeps historical REWORK but hides it from the actionable snapshot", async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId("run_phase6c_gate_restart_projection");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_restart_projection_start", "idem_restart_projection_start", 0, { runId, objective: "project only restart-safe gate choices" }))).status, 200);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "blocked");
+      await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "live executor gate before restart");
+      const beforeRestart = await snapshot(stack.api, token, runId);
+      const oldGate = beforeRestart.currentGate;
+      assert.ok(oldGate);
+      assert.deepEqual(oldGate.options.map((option) => option.id), ["rework", "cancel", "fail"]);
+      const gateId = asGateId(oldGate.gateId);
+      const rawOutcomeBefore = stack.store.getAttempt(handle.attemptId)?.outcomeJson;
+      assert.ok(rawOutcomeBefore);
+      const persistedOptionsBefore = stack.store.getGate(gateId)?.gate.options;
+      assert.ok(persistedOptionsBefore?.some((option) => option.id === "rework" && option.target === "REWORK"));
+
+      await stack.restartControlPlane();
+      await stack.api.start();
+      const restartedToken = await bootstrapToken(stack.api);
+      const afterRestart = await snapshot(stack.api, restartedToken, runId);
+      assert.deepEqual(afterRestart.currentGate?.options.map((option) => option.id), ["cancel", "fail"]);
+      assert.deepEqual(afterRestart.currentGate?.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"]);
+      assert.ok(stack.store.getGate(gateId)?.gate.options.some((option) => option.id === "rework" && option.target === "REWORK"), "persisted gate history retains its original REWORK option");
+      assert.equal(stack.store.getAttempt(handle.attemptId)?.outcomeJson, rawOutcomeBefore, "restart projection does not mutate the raw executor result");
+
+      const transitionsBefore = stack.store.listTransitions(runId).length;
+      const stale = await post(stack.api, restartedToken, `/v1/runs/${runId}/gates/${gateId}/resolve`, envelope("command_restart_stale_rework", "idem_restart_stale_rework", afterRestart.run.stateVersion, { optionId: "rework" }));
+      assert.equal(stale.status, 409);
+      assert.equal(errorCode(stale), "GATE_CONTINUATION_UNAVAILABLE");
+      assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
+      assert.equal(stack.store.getRun(runId)?.stateVersion, afterRestart.run.stateVersion);
+      assert.equal(stack.store.getGate(gateId)?.status, "open");
+      assert.deepEqual(stack.store.listTransitions(runId).length, transitionsBefore);
+      assert.equal(stack.coordinator.activeRunId, runId, "rejected stale REWORK does not release the startup reservation");
+      assert.equal(stack.store.getAttempt(handle.attemptId)?.outcomeJson, rawOutcomeBefore);
+    } finally {
+      await stack.close();
+    }
+  });
+
+  await suite.test("a terminal choice from a restarted gate releases the slot for the next Start", async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId("run_phase6c_gate_restart_terminal");
+    const nextRunId = asRunId("run_restart_next_start");
+    try {
+      await stack.api.start();
+      const token = await bootstrapToken(stack.api);
+      assert.equal((await post(stack.api, token, "/v1/runs", envelope("command_restart_terminal_start", "idem_restart_terminal_start", 0, { runId, objective: "resolve a restart-safe terminal choice" }))).status, 200);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.finish(handle, "blocked");
+      await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "executor gate before terminal restart resolution");
+      const beforeRestart = await snapshot(stack.api, token, runId);
+      const oldGate = beforeRestart.currentGate;
+      assert.ok(oldGate);
+      const gateId = asGateId(oldGate.gateId);
+      const rawOutcomeBefore = stack.store.getAttempt(handle.attemptId)?.outcomeJson;
+      assert.ok(rawOutcomeBefore);
+      const persistedOptionsBefore = stack.store.getGate(gateId)?.gate.options;
+      assert.ok(persistedOptionsBefore?.some((option) => option.target === "REWORK"));
+
+      await stack.restartControlPlane();
+      await stack.api.start();
+      const restartedToken = await bootstrapToken(stack.api);
+      const afterRestart = await snapshot(stack.api, restartedToken, runId);
+      const failOption = afterRestart.currentGate?.options.find((option) => option.target === "FAILED");
+      assert.ok(failOption);
+      assert.equal(afterRestart.currentGate?.options.some((option) => option.target === "REWORK"), false);
+
+      const terminal = await post(stack.api, restartedToken, `/v1/runs/${runId}/gates/${gateId}/resolve`, envelope("command_restart_terminal_fail", "idem_restart_terminal_fail", afterRestart.run.stateVersion, { optionId: failOption.id }));
+      assert.equal(terminal.status, 200);
+      assert.equal(json(terminal).to, "FAILED");
+      assert.equal(stack.store.getRun(runId)?.state, "FAILED");
+      assert.equal(stack.coordinator.activeRunId, undefined, "terminal resolution releases the startup reservation");
+      assert.deepEqual(stack.store.getGate(gateId)?.gate.options, persistedOptionsBefore, "closing the gate preserves its historical options");
+      assert.equal(stack.store.getAttempt(handle.attemptId)?.outcomeJson, rawOutcomeBefore, "terminal resolution preserves historical executor evidence");
+
+      const nextStart = await post(stack.api, restartedToken, "/v1/runs", envelope("command_restart_next_start", "idem_restart_next_start", 0, { runId: nextRunId, objective: "claim the released coordinator slot" }));
+      assert.equal(nextStart.status, 200);
+      assert.equal(json(nextStart).to, "INTAKE");
+      const reservation = (stack.coordinator as unknown as { reservation?: { driveError?: unknown; driveSettled: boolean } }).reservation;
+      await waitFor(() => stack.adapter.requests.length === 2 || reservation?.driveSettled ? true : undefined, "next Start drive after restart gate resolution");
+      assert.equal(stack.adapter.requests.length, 2, `the next drive must reach its executor: ${String(reservation?.driveError)}; state=${stack.store.getRun(nextRunId)?.state}`);
+      stack.adapter.finishNext("succeeded");
+      await waitFor(() => stack.store.getRun(nextRunId)?.state === "NEXT_PHASE" ? true : undefined, "next run completes through its owned drive");
+    } finally {
+      await stack.close();
+    }
+  });
+
   await suite.test("missing trusted phase validation offers only executable terminal choices over authenticated HTTP", async () => {
     for (const target of ["FAILED", "CANCELLED"] as const) {
       const stack = createPhase6CStack();

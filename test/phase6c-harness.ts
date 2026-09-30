@@ -59,6 +59,7 @@ export interface Phase6CStack {
   planningInputs: { initial: InitialPlanningInput[]; rework: Parameters<PlanningMaster["planRework"]>[0][] };
   firstInitialPlanStarted: Deferred<InitialPlanningInput>;
   releaseFirstInitialPlan: Deferred<void>;
+  restartControlPlane(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -69,7 +70,11 @@ export class SyntheticCodexAdapter implements ExecutorAdapter {
   private readonly waiters = new Map<string, Deferred<unknown>>();
   private readonly results = new Map<string, ExecutorResult>();
 
-  constructor(private readonly extraGateTarget?: RunState, private readonly reworkOptionId = "rework") {}
+  constructor(
+    private readonly extraGateTarget?: RunState,
+    private readonly reworkOptionId = "rework",
+    private readonly reworkProposalCount = 1,
+  ) {}
 
   probe(): AdapterDescriptor {
     return {
@@ -199,7 +204,12 @@ export class SyntheticCodexAdapter implements ExecutorAdapter {
         summary: "Synthetic QA requires an explicit human decision.",
         evidenceRefs: [],
         options: [
-          { id: this.reworkOptionId, label: "Create bounded rework", consequence: "Return to the bounded rework path.", target: "REWORK" },
+          ...Array.from({ length: this.reworkProposalCount }, (_, index) => ({
+            id: index === 0 ? this.reworkOptionId : `provider_rework_${index + 1}`,
+            label: index === 0 ? "Create bounded rework" : `Duplicate rework ${index + 1}`,
+            consequence: index === 0 ? "Return to the bounded rework path." : `Duplicate consequence ${index + 1}.`,
+            target: "REWORK" as const,
+          })),
           { id: "cancel", label: "Cancel the run", consequence: "Stop this run and preserve its evidence.", target: "CANCELLED" },
           ...(this.extraGateTarget === undefined ? [] : [{ id: "unsupported", label: "Unsupported path", consequence: "No continuation is registered for this target.", target: this.extraGateTarget }]),
         ],
@@ -227,7 +237,7 @@ export async function waitFor<T>(read: () => T | undefined, description: string,
   assert.fail(`timed out waiting for ${description}`);
 }
 
-export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState; reworkOptionId?: string } = {}): Phase6CStack {
+export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState; reworkOptionId?: string; reworkProposalCount?: number } = {}): Phase6CStack {
   const repository = createGitRepository();
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-phase6c-controls-"));
   mkdirSync(join(root, "runtime"), { mode: 0o700 });
@@ -236,7 +246,7 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
   const ids = new SequenceIdSource("phase6c_controls");
   const store = StateStore.open(join(runtime, "state.sqlite"), { clock, ids });
   const artifacts = new FileArtifactStore(join(runtime, "artifacts"), ids);
-  const adapter = new SyntheticCodexAdapter(options.extraGateTarget, options.reworkOptionId);
+  const adapter = new SyntheticCodexAdapter(options.extraGateTarget, options.reworkOptionId, options.reworkProposalCount);
   const core = new KerbsFlowCore(store, adapter, artifacts, {
     clock,
     ids,
@@ -284,8 +294,11 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
       };
     },
   };
-  const git = new GitWorktreeManager(join(runtime, "owned"));
-  const phase2 = new Phase2Loop(core, store, git, new FocusedVerifier(git, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
+  const makePhase2 = (currentCore: KerbsFlowCore, currentStore: StateStore): Phase2Loop => {
+    const currentGit = new GitWorktreeManager(join(runtime, "owned"));
+    return new Phase2Loop(currentCore, currentStore, currentGit, new FocusedVerifier(currentGit, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
+  };
+  const phase2 = makePhase2(core, store);
   const profile = {
     launchProfileId: "phase6c-synthetic-profile",
     launchProfileHash: "6".repeat(64),
@@ -296,15 +309,19 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
     executionTimeoutMs: 120_000,
     planningMaster,
   };
-  const coordinator = new RunCoordinator(core, store, phase2, profile, ids);
-  const api = new LocalApiServer({
-    core: { readModel: core.readModel.bind(core), steer: core.steer.bind(core), configuration: core.configuration },
-    coordinator,
-    store,
-    artifacts,
-  }, { pollIntervalMs: 20 });
-
-  return {
+  const makeCoordinator = (currentCore: KerbsFlowCore, currentStore: StateStore, currentPhase2: Phase2Loop): RunCoordinator =>
+    new RunCoordinator(currentCore, currentStore, currentPhase2, profile, ids);
+  const makeApi = (currentCore: KerbsFlowCore, currentStore: StateStore, currentArtifacts: FileArtifactStore, currentCoordinator: RunCoordinator): LocalApiServer =>
+    new LocalApiServer({
+      core: { readModel: currentCore.readModel.bind(currentCore), steer: currentCore.steer.bind(currentCore), configuration: currentCore.configuration },
+      coordinator: currentCoordinator,
+      store: currentStore,
+      artifacts: currentArtifacts,
+    }, { pollIntervalMs: 20 });
+  const coordinator = makeCoordinator(core, store, phase2);
+  const api = makeApi(core, store, artifacts, coordinator);
+  let stack: Phase6CStack;
+  stack = {
     root,
     repository,
     store,
@@ -318,11 +335,27 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
     planningInputs,
     firstInitialPlanStarted,
     releaseFirstInitialPlan,
+    async restartControlPlane() {
+      await stack.api.close();
+      stack.store.close();
+      const nextStore = StateStore.open(join(runtime, "state.sqlite"), { clock, ids });
+      const nextArtifacts = new FileArtifactStore(join(runtime, "artifacts"), ids);
+      const nextCore = new KerbsFlowCore(nextStore, adapter, nextArtifacts, { clock, ids, configuration: core.configuration });
+      const nextPhase2 = makePhase2(nextCore, nextStore);
+      const nextCoordinator = makeCoordinator(nextCore, nextStore, nextPhase2);
+      stack.store = nextStore;
+      stack.artifacts = nextArtifacts;
+      stack.core = nextCore;
+      stack.phase2 = nextPhase2;
+      stack.coordinator = nextCoordinator;
+      stack.api = makeApi(nextCore, nextStore, nextArtifacts, nextCoordinator);
+    },
     async close() {
-      await api.close();
-      store.close();
+      await stack.api.close();
+      stack.store.close();
       rmSync(root, { recursive: true, force: true });
       rmSync(repository.root, { recursive: true, force: true });
     },
   };
+  return stack;
 }
