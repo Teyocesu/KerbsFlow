@@ -80,12 +80,22 @@ test("persisted phase validation from a previous attempt cannot close the curren
   try {
     await reachVerifyPhase(fixture);
     const authority = await recordAuthoritativePhase(fixture);
-    writeFileSync(join(authority.repository.root, "docs/HANDOFF.md"), "drift to enter a human gate\n", "utf8");
-    let command = fixture.core.completeTrustedPhaseValidation(fixture.runId, 7, "phase3:old-attempt-gate", { validationId: authority.validationId });
-    const gate = fixture.core.readModel(fixture.runId)?.currentGate;
-    assert.ok(gate);
-    command = fixture.core.resolveGateScoped(fixture.runId, command.stateVersion, "phase3:old-attempt-resolve", gate.gateId, "rework");
-    writeFileSync(join(authority.repository.root, "docs/HANDOFF.md"), "synthetic handoff\n", "utf8");
+    const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
+    assert.ok(attemptId);
+    const policy = new FailurePolicyCoordinator(fixture.store, 2).recordAndDecide({
+      runId: fixture.runId,
+      taskId: fixture.taskId,
+      attemptId,
+      failureClass: "implementation_failure",
+      transient: false,
+      causalDiagnosis: true,
+      scopeUnchanged: true,
+      eligibleHigherRoute: false,
+      fingerprintInput: { failureClass: "implementation_failure", reasonCode: "phase-check-failed", diagnostic: "synthetic phase failure", category: "phase_verification" },
+      route: fixture.decision.route,
+    });
+    assert.equal(policy.resultingAction, "rework");
+    let command = fixture.core.applyPhaseFailurePolicy(fixture.runId, 7, "phase3:old-attempt-policy", policy.fingerprint);
     command = fixture.core.reworkToReady(fixture.runId, command.stateVersion, "phase3:old-attempt-ready");
     command = fixture.core.prepareExecution(fixture.runId, command.stateVersion, "phase3:old-attempt-prepare");
     fixture.adapter.script(fixture.taskId, "success");
@@ -149,6 +159,7 @@ test("lower validation and canonical drift cannot close a phase", async () => {
     const gate = drift.core.readModel(drift.runId)?.currentGate;
     assert.ok(gate);
     assert.equal(gate.gate.reasonCode, "canonical_intent_drift");
+    assert.deepEqual(gate.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
     assert.ok(gate.gate.evidence?.some((entry) => entry.classification === "automatically_tested"));
 
     assert.throws(() => drift.core.resolveGateScoped(drift.runId, 8, "wrong-gate", asGateId("gate_wrong"), "fail"), /scope/i);

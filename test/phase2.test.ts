@@ -556,6 +556,7 @@ test("unavailable verification sandbox creates a durable HUMAN_GATE without unre
     assert.equal(result.verdict, "HUMAN_GATE");
     assert.equal(fixture.store.readModel(fixture.runId)?.run.state, "HUMAN_GATE");
     assert.equal(fixture.store.readModel(fixture.runId)?.currentGate?.gate.reasonCode, "verification_sandbox_unavailable");
+    assert.deepEqual(fixture.store.readModel(fixture.runId)?.currentGate?.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
   } finally { fixture.close(); }
 });
 
@@ -582,6 +583,7 @@ test("focused evidence alone cannot close a phase without an explicit phase comm
     assert.equal(result.verdict, "HUMAN_GATE");
     assert.equal(store.getRun(runId)?.state, "HUMAN_GATE");
     assert.equal(store.readModel(runId)?.currentGate?.gate.reasonCode, "phase_validation_plan_missing");
+    assert.deepEqual(store.readModel(runId)?.currentGate?.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
     assert.equal(store.readModel(runId)?.latestValidation?.level, "focused");
   } finally {
     store.close();
@@ -693,6 +695,9 @@ for (const semantic of [
       });
       assert.equal(result.verdict, semantic.verdict);
       assert.equal(store.getRun(runId)?.state, semantic.state);
+      if (semantic.outcome === "evidence_insufficient") {
+        assert.deepEqual(store.readModel(runId)?.currentGate?.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
+      }
       const reviews = store.listSemanticReviewAttempts(runId);
       assert.equal(reviews.length, 1);
       assert.equal(reviews[0]?.lifecycle, "SUCCEEDED", reviews[0]?.failureSummary ?? "semantic reviewer did not succeed");
@@ -727,6 +732,7 @@ test("deterministic anti-greenwashing blockers never dispatch the semantic revie
     const result = await fixture.run({ reviewer });
     assert.equal(result.verdict, "HUMAN_GATE");
     assert.equal(dispatches, 0);
+    assert.deepEqual(fixture.store.readModel(fixture.runId)?.currentGate?.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
     assert.equal(fixture.store.listSemanticReviewAttempts(fixture.runId).length, 0);
     assert.ok(result.verification?.suspiciousSignals.some((signal) => signal.blocksPass));
   } finally {
@@ -781,6 +787,7 @@ test("transient execution failure performs exactly one same-route retry in one r
     assert.deepEqual(attempts.map((attempt) => JSON.parse(attempt.outcomeJson!).executor.model), ["fixture-model", "fixture-model"]);
     const failures = fixture.store.listFailureOccurrences(fixture.runId, fixture.taskId);
     assert.deepEqual(failures.map((failure) => failure.resultingAction), ["retry_same_route", "human_gate"]);
+    assert.deepEqual(fixture.store.readModel(fixture.runId)?.currentGate?.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
     assert.equal(failures[0]?.fingerprint, failures[1]?.fingerprint);
     assert.equal(fixture.store.listTransitions(fixture.runId).filter((transition) => transition.from === "IDLE" && transition.to === "INTAKE").length, 1);
   } finally {

@@ -638,8 +638,8 @@ export class KerbsFlowCore {
           reasonCode: decision.reasonCode,
           summary: decision.summary,
           options: [
-            { id: "rework", label: "Bounded rework", consequence: "Return to REWORK without changing scope.", target: "REWORK" },
             { id: "fail", label: "Fail the run", consequence: "Stop automatic continuation and preserve evidence.", target: "FAILED" },
+            { id: "cancel", label: "Cancel this run", consequence: "Stop this run without accepting the review outcome; preserve evidence for a new run.", target: "CANCELLED" },
           ],
           ...(decision.evidence === undefined ? {} : { evidence: decision.evidence }),
           ...(decision.failureClass === undefined || (decision.evidenceRefs.length === 0 && (decision.evidence?.length ?? 0) === 0) ? {} : { recommendation: `Investigate ${decision.failureClass} before continuing.` }),
@@ -782,8 +782,8 @@ export class KerbsFlowCore {
           evidenceRefs: reviewDecision.evidenceRefs,
           evidence: trusted.evidence,
           options: [
-            { id: "rework", label: "Bounded rework", consequence: "Return to REWORK without changing approved scope.", target: "REWORK" },
             { id: "fail", label: "Fail conservatively", consequence: "Stop automatic continuation and preserve all evidence.", target: "FAILED" },
+            { id: "cancel", label: "Cancel this run", consequence: "Stop without closing the phase; preserve the validation evidence.", target: "CANCELLED" },
           ],
           ...(trusted.evidence.length === 0 ? {} : { recommendation: "Resolve the cited evidence gap before continuing." }),
           status: "open",
@@ -826,8 +826,8 @@ export class KerbsFlowCore {
         summary: "an explicit phase-level validation command is required before phase closure",
         evidenceRefs: [],
         options: [
-          { id: "rework", label: "Provide phase validation", consequence: "Return to bounded rework without promoting focused evidence.", target: "REWORK" },
-          { id: "fail", label: "Fail conservatively", consequence: "Stop without closing the phase.", target: "FAILED" },
+          { id: "fail", label: "Fail conservatively", consequence: "Phase closure cannot proceed without the trusted phase validation profile; preserve evidence and stop this run.", target: "FAILED" },
+          { id: "cancel", label: "Cancel this run", consequence: "Stop without closing the phase; start a new run only after the host launch profile includes the required phase validation.", target: "CANCELLED" },
         ],
         status: "open",
       };
@@ -853,8 +853,8 @@ export class KerbsFlowCore {
         summary: "required filesystem and workload-network verification isolation is unavailable or unproven",
         evidenceRefs: [],
         options: [
-          { id: "rework", label: "Restore sandbox capability", consequence: "Retry from bounded rework after restoring isolation.", target: "REWORK" },
-          { id: "fail", label: "Fail conservatively", consequence: "Retain the worktree and evidence.", target: "FAILED" },
+          { id: "fail", label: "Fail conservatively", consequence: "Stop because required verification isolation is unavailable; retain the worktree and evidence.", target: "FAILED" },
+          { id: "cancel", label: "Cancel this run", consequence: "Stop without accepting unverified work; start a new run after the host restores verification isolation.", target: "CANCELLED" },
         ], status: "open",
       };
       this.insertGate(tx, gate, now);
@@ -910,8 +910,8 @@ export class KerbsFlowCore {
           summary: "phase failure policy requires human review",
           evidenceRefs: [],
           options: [
-            { id: "rework", label: "Bounded rework", consequence: "Continue only after human review without changing approved scope.", target: "REWORK" },
-            { id: "fail", label: "Fail", consequence: "Stop and preserve evidence.", target: "FAILED" },
+            { id: "fail", label: "Fail", consequence: "Stop and preserve the phase failure evidence.", target: "FAILED" },
+            { id: "cancel", label: "Cancel this run", consequence: "Stop without accepting the failed phase; preserve evidence for a new run.", target: "CANCELLED" },
           ],
           status: "open",
         };
@@ -1460,6 +1460,9 @@ export class KerbsFlowCore {
         throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "READY recovery requires a task and no active attempt");
       }
       let gate: HumanGate | undefined;
+      if (decision.target === "HUMAN_GATE" && attempt !== undefined && !isTerminalAttempt(attempt.lifecycle)) {
+        throw new KerbsFlowError("RECOVERY_EVIDENCE_INSUFFICIENT", "Human Gate recovery requires the uncertain executor activity to be reconciled or proven quiescent first.");
+      }
       if (decision.target === "HUMAN_GATE") {
         gate = {
           schemaVersion: CONTRACT_VERSIONS.humanGate,
@@ -1777,18 +1780,33 @@ export class KerbsFlowCore {
     if (gate.recommendation !== undefined && gate.evidenceRefs.length === 0 && (gate.evidence?.length ?? 0) === 0) {
       throw new KerbsFlowError("GATE_RECOMMENDATION_UNSUPPORTED", "executor gate recommendation requires classified supporting evidence");
     }
-    const optionIds = new Set<string>();
+    const seenOptionIds = new Set<string>();
     for (const option of gate.options) {
-      if (optionIds.has(option.id)) {
+      if (seenOptionIds.has(option.id)) {
         throw new KerbsFlowError("GATE_OPTION_DUPLICATE", `executor human gate repeats option ID ${option.id}`);
       }
-      optionIds.add(option.id);
+      seenOptionIds.add(option.id);
       if (!isLegalTransition("HUMAN_GATE", option.target)) {
         throw new KerbsFlowError("GATE_TARGET_ILLEGAL", `executor human gate option ${option.id} targets illegal transition HUMAN_GATE -> ${option.target}`);
       }
     }
+    const canRework = this.store.countTaskAttempts(runId, taskId) < this.configuration.effectiveMaxImplementationAttempts;
+    const options = gate.options.filter((option) => option.target === "FAILED" || option.target === "CANCELLED" || (option.target === "REWORK" && canRework));
+    const optionIds = new Set(options.map((option) => option.id));
+    const addTerminal = (target: "FAILED" | "CANCELLED", id: string, label: string, consequence: string): void => {
+      if (options.some((option) => option.target === target)) return;
+      let uniqueId = id;
+      while (optionIds.has(uniqueId)) uniqueId = `core_${uniqueId}`;
+      options.push({ id: uniqueId, label, consequence, target });
+      optionIds.add(uniqueId);
+    };
+    if (new Set(options.map((option) => option.target)).size < 2) {
+      addTerminal("FAILED", "fail", "Fail conservatively", "Stop this run and preserve the blocked attempt and evidence.");
+      addTerminal("CANCELLED", "cancel", "Cancel this run", "Stop this run without granting the requested action; preserve evidence.");
+    }
     return {
       ...gate,
+      options,
       ...(gate.evidence === undefined ? {} : {
         evidence: gate.evidence.map((evidence) => ({
           ...evidence,

@@ -14,6 +14,7 @@ import {
   parseCommand,
 } from "../src/contracts.js";
 import { KerbsFlowCore } from "../src/core.js";
+import { KerbsFlowError } from "../src/errors.js";
 import { StateStore } from "../src/persistence.js";
 import { createFixture, executorResultFor, primeExecute, TestFixture, validationFor } from "./helpers.js";
 
@@ -129,8 +130,87 @@ test("startup detects PREPARED attempts and moves EXECUTE to RECOVERY", () => {
     assert.equal(model?.run.stateVersion, 5);
     assert.equal(model?.activeAttempt?.lifecycle, "PREPARED");
     assert.equal(fixture.store.startupRecovery[0]?.automaticTransition, true);
-    const gated = fixture.core.recover(fixture.runId, 5, "recover-prepared", recoveryDecision(fixture.runId, "HUMAN_GATE"));
+    const before = persistenceCounts(fixture);
+    assert.throws(
+      () => fixture.core.recover(fixture.runId, 5, "recover-prepared", recoveryDecision(fixture.runId, "HUMAN_GATE")),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "RECOVERY_EVIDENCE_INSUFFICIENT",
+    );
+    const after = fixture.core.readModel(fixture.runId);
+    assert.equal(after?.run.state, "RECOVERY");
+    assert.equal(after?.run.stateVersion, 5);
+    assert.equal(after?.run.currentGateId, null);
+    assert.equal(after?.activeAttempt?.lifecycle, "PREPARED");
+    assert.deepEqual(persistenceCounts(fixture), before);
+  } finally {
+    fixture.close();
+  }
+});
+
+for (const lifecycle of ["RUNNING", "UNKNOWN"] as const) {
+  test(`RECOVERY cannot enter HUMAN_GATE while the attempt is ${lifecycle}`, async () => {
+    const fixture = createFixture();
+    try {
+      primeExecute(fixture);
+      await fixture.core.beginFakeAttempt(fixture.runId, 4, `begin-${lifecycle.toLowerCase()}`);
+      if (lifecycle === "UNKNOWN") {
+        const staged = fixture.core.readModel(fixture.runId);
+        const stagedAttemptId = staged?.run.activeAttemptId;
+        assert.ok(stagedAttemptId);
+        assert.ok(staged);
+        const markUnknown = parseCommand({
+          schemaVersion: CONTRACT_VERSIONS.command,
+          commandId: asCommandId("command_stage_unknown"),
+          idempotencyKey: "stage-unknown",
+          runId: fixture.runId,
+          expectedStateVersion: staged.run.stateVersion,
+          kind: "complete_attempt",
+          payload: { attemptId: stagedAttemptId },
+        });
+        fixture.store.executeCommand(markUnknown, ({ tx, now }) => {
+          tx.run("UPDATE attempts SET lifecycle = ?, updated_at = ? WHERE attempt_id = ?", "UNKNOWN", now, stagedAttemptId);
+          return { details: { staged: true } };
+        });
+      }
+      reopen(fixture);
+      const model = fixture.core.readModel(fixture.runId);
+      assert.equal(model?.run.state, "RECOVERY");
+      assert.equal(model?.run.stateVersion, 5);
+      assert.equal(model?.activeAttempt?.lifecycle, lifecycle);
+      const before = persistenceCounts(fixture);
+      assert.throws(
+        () => fixture.core.recover(fixture.runId, 5, `recover-${lifecycle.toLowerCase()}`, recoveryDecision(fixture.runId, "HUMAN_GATE")),
+        (error: unknown) => error instanceof KerbsFlowError && error.code === "RECOVERY_EVIDENCE_INSUFFICIENT",
+      );
+      const after = fixture.core.readModel(fixture.runId);
+      assert.equal(after?.run.state, "RECOVERY");
+      assert.equal(after?.run.stateVersion, 5);
+      assert.equal(after?.run.currentGateId, null);
+      assert.equal(after?.activeAttempt?.lifecycle, lifecycle);
+      assert.deepEqual(persistenceCounts(fixture), before);
+    } finally {
+      fixture.close();
+    }
+  });
+}
+
+test("RECOVERY with a settled attempt may still enter HUMAN_GATE", () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    stageTerminalRecovery(fixture, "FAILED", JSON.stringify(executorResultForOutcome(fixture, "failed")));
+    const before = persistenceCounts(fixture);
+    const gatesBefore = before.gates;
+    assert.ok(gatesBefore !== undefined);
+    const gated = fixture.core.recover(fixture.runId, 5, "recover-settled-gate", recoveryDecision(fixture.runId, "HUMAN_GATE"));
     assert.equal(gated.to, "HUMAN_GATE");
+    const model = fixture.core.readModel(fixture.runId);
+    assert.equal(model?.run.state, "HUMAN_GATE");
+    const gateId = model?.run.currentGateId;
+    assert.ok(gateId);
+    const gate = fixture.store.getGate(gateId);
+    assert.equal(gate?.status, "open");
+    assert.deepEqual(gate?.gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"]);
+    assert.equal(persistenceCounts(fixture).gates, gatesBefore + 1);
   } finally {
     fixture.close();
   }

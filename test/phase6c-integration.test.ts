@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage } from "node:http";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { asCommandId, asGateId, asInstructionId, asRunId, asTaskId, type RunId } from "../src/contracts.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
@@ -154,6 +156,49 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
     }
   });
 
+  await suite.test("missing trusted phase validation offers only executable terminal choices over authenticated HTTP", async () => {
+    for (const target of ["FAILED", "CANCELLED"] as const) {
+      const stack = createPhase6CStack();
+      const runId = asRunId(`run_phase6c_missing_phase_${target.toLowerCase()}`);
+      const nextRun = asRunId(`run_phase6c_after_missing_phase_${target.toLowerCase()}`);
+      try {
+        await stack.api.start();
+        const token = await bootstrapToken(stack.api);
+        assert.equal((await post(stack.api, token, "/v1/runs", envelope(`command_missing_start_${target}`, `idem_missing_start_${target}`, 0, { runId, objective: "complete synthetic work without a trusted phase check" }))).status, 200);
+        const handle = await stack.adapter.started.promise;
+        stack.adapter.finish(handle, "succeeded");
+        await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "missing phase validation gate");
+        const before = await snapshot(stack.api, token, runId);
+        const gate = before.currentGate;
+        assert.ok(gate);
+        assert.equal(stack.store.getGate(asGateId(gate.gateId))?.gate.reasonCode, "phase_validation_plan_missing");
+        assert.ok(gate.options.length >= 2);
+        assert.deepEqual(gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"]);
+        assert.equal(gate.options.some((option) => option.target === "REWORK"), false);
+        const option = gate.options.find((candidate) => candidate.target === target);
+        assert.ok(option);
+        const planningBefore = stack.planningInputs.initial.length + stack.planningInputs.rework.length;
+        const resolved = await post(stack.api, token, `/v1/runs/${runId}/gates/${gate.gateId}/resolve`, envelope(`command_missing_resolve_${target}`, `idem_missing_resolve_${target}`, before.run.stateVersion, { optionId: option.id }));
+        assert.equal(resolved.status, 200);
+        assert.equal(json(resolved).to, target);
+        assert.equal(stack.store.getRun(runId)?.state, target);
+        assert.equal((await snapshot(stack.api, token, runId)).run.state, target);
+        assert.equal(stack.coordinator.activeRunId, undefined);
+        assert.equal(stack.planningInputs.initial.length + stack.planningInputs.rework.length, planningBefore, "terminal choice must not invoke Planning Master");
+        assert.equal((await post(stack.api, token, "/v1/runs", envelope(`command_missing_next_${target}`, `idem_missing_next_${target}`, 0, { runId: nextRun, objective: "own the released slot" }))).status, 200);
+        assert.equal(stack.coordinator.activeRunId, nextRun);
+        await waitFor(() => stack.adapter.requests.length === 2 ? stack.adapter.requests[1] : undefined, "next run executor");
+        stack.adapter.finishNext("blocked");
+        await waitFor(() => stack.store.getRun(nextRun)?.state === "HUMAN_GATE" ? true : undefined, "next run gate");
+        const nextSnapshot = await snapshot(stack.api, token, nextRun);
+        assert.ok(nextSnapshot.currentGate);
+        assert.equal((await post(stack.api, token, `/v1/runs/${nextRun}/gates/${nextSnapshot.currentGate.gateId}/resolve`, envelope(`command_missing_cleanup_${target}`, `idem_missing_cleanup_${target}`, nextSnapshot.run.stateVersion, { optionId: "cancel" }))).status, 200);
+      } finally {
+        await stack.close();
+      }
+    }
+  });
+
   await suite.test("terminal gate resolution settles its drive, coalesces duplicates, and old replay preserves the next Start slot", async () => {
     const stack = createPhase6CStack({ phaseCheck: true });
     const firstRun = asRunId("run_phase6c_gate_terminal");
@@ -257,7 +302,7 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
     }
   });
 
-  await suite.test("unsupported gate targets and exhausted REWORK budget fail before mutation", async () => {
+  await suite.test("legacy unsupported gate targets and exhausted REWORK budget fail before mutation", async () => {
     const stack = createPhase6CStack({ maxImplementationAttempts: 1, extraGateTarget: "PLAN" });
     const runId = asRunId("run_phase6c_gate_fail_closed");
     try {
@@ -270,6 +315,23 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const gateSnapshot = await snapshot(stack.api, token, runId);
       const gate = gateSnapshot.currentGate;
       assert.ok(gate);
+      assert.deepEqual(gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"], "core filters executor proposals that cannot continue");
+      const persisted = stack.store.getGate(asGateId(gate.gateId));
+      assert.ok(persisted);
+      const legacy = {
+        ...persisted.gate,
+        options: [
+          ...persisted.gate.options,
+          { id: "rework", label: "Legacy rework", consequence: "Unsupported exhausted continuation.", target: "REWORK" },
+          { id: "unsupported", label: "Legacy plan", consequence: "Unsupported target.", target: "PLAN" },
+        ],
+      };
+      const database = new DatabaseSync(join(stack.root, "runtime", "state.sqlite"));
+      try {
+        database.prepare("UPDATE human_gates SET gate_json = ? WHERE gate_id = ?").run(JSON.stringify(legacy), gate.gateId);
+      } finally {
+        database.close();
+      }
       const transitionsBefore = stack.store.listTransitions(runId);
       const attemptCount = stack.store.countTaskAttempts(runId, handle.taskId);
       assert.equal(attemptCount, 1);
