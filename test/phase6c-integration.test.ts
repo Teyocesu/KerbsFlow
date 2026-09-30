@@ -246,7 +246,7 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
   });
 
   await suite.test("executor-blocked REWORK resumes the same drive after Pause during execution", async () => {
-    const stack = createPhase6CStack({ phaseCheck: true });
+    const stack = createPhase6CStack({ phaseCheck: true, reworkOptionId: "/synthetic/rework" });
     const runId = asRunId("run_phase6c_gate_rework");
     try {
       await stack.api.start();
@@ -258,7 +258,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       await new Promise((resolve) => setTimeout(resolve, 30));
       assert.equal(stack.store.getRun(runId)?.state, "EXECUTE", "Pause remains pending until the running executor returns");
 
-      stack.adapter.finish(firstHandle, "blocked");
+      const rawClaim = stack.adapter.finish(firstHandle, "blocked");
+      assert.equal(rawClaim.humanGate?.options.find((option) => option.target === "REWORK")?.id, "/synthetic/rework");
       const paused = await pausePromise;
       assert.equal(paused.status, 200);
       assert.equal(json(paused).to, "PAUSED");
@@ -271,14 +272,30 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const gate = gateSnapshot.currentGate;
       assert.ok(gate);
       assert.deepEqual(gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK"], "executor-blocked gates always preserve both terminal escape paths");
-      assert.ok(gate.options.some((option) => option.id === "rework"), "the supplied REWORK option is preserved");
-      assert.ok(gate.options.some((option) => option.id === "cancel"), "the supplied CANCELLED option is preserved");
+      const persistedGate = stack.store.getGate(asGateId(gate.gateId));
+      assert.ok(persistedGate);
+      const persistedRework = persistedGate.gate.options.find((option) => option.target === "REWORK");
+      const snapshotRework = gate.options.find((option) => option.target === "REWORK");
+      assert.ok(persistedRework);
+      assert.ok(snapshotRework);
+      assert.equal(persistedRework.id, "rework");
+      assert.match(persistedRework.id, /^[a-z][a-z0-9_]{0,99}$/u);
+      assert.equal(snapshotRework.id, persistedRework.id, "snapshot control identity must equal the persisted Core-owned ID exactly");
+      assert.notEqual(snapshotRework.id, "[path redacted]");
+      assert.doesNotMatch(JSON.stringify(gateSnapshot), /\/synthetic\/rework/u, "the raw executor ID must not reach the browser snapshot");
+      const persistedAttempt = stack.store.getAttempt(firstHandle.attemptId);
+      assert.ok(persistedAttempt?.outcomeJson);
+      const rawStoredResult = JSON.parse(persistedAttempt.outcomeJson) as { humanGate: { options: Array<{ id: string; target: string }> } };
+      assert.equal(rawStoredResult.humanGate.options.find((option) => option.target === "REWORK")?.id, "/synthetic/rework", "the attempt outcome retains the raw executor claim as evidence");
       const gatePath = `/v1/runs/${runId}/gates/${gate.gateId}/resolve`;
-      const reworkCommand = envelope("command_rework_gate", "idem_rework_gate", gateSnapshot.run.stateVersion, { optionId: "rework", note: "continue the persisted blocked result" });
+      const reworkCommand = envelope("command_rework_gate", "idem_rework_gate", gateSnapshot.run.stateVersion, { optionId: snapshotRework.id, note: "continue the persisted blocked result" });
       const worktreeBefore = stack.store.getWorktree(runId);
+      assert.ok(worktreeBefore);
+      assert.equal(stack.coordinator.activeRunId, runId, "the original Phase2 drive remains held at the gate");
       const accepted = await post(stack.api, token, gatePath, reworkCommand);
       assert.equal(accepted.status, 200);
       assert.equal(json(accepted).to, "REWORK");
+      assert.equal(stack.coordinator.activeRunId, runId, "REWORK continues the same live drive");
       const replay = await post(stack.api, token, gatePath, reworkCommand);
       assert.equal(replay.status, 200);
       assert.equal(json(replay).replayed, true);
@@ -290,8 +307,12 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.equal(stack.planningInputs.rework[0]?.failure.reasonCode, "security_or_privilege_gate");
       assert.equal(secondRequest.taskId, firstHandle.taskId);
       assert.notEqual(secondRequest.attemptId, firstHandle.attemptId);
-      assert.equal(stack.store.getWorktree(runId)?.worktreePath, worktreeBefore?.worktreePath, "the installed drive reuses its owned worktree");
+      const worktreeAfter = stack.store.getWorktree(runId);
+      assert.equal(worktreeAfter?.worktreeGitDirectory, worktreeBefore.worktreeGitDirectory, "REWORK must not recreate the owned worktree");
+      assert.equal(worktreeAfter?.createdAt, worktreeBefore.createdAt);
+      assert.equal(worktreeAfter?.worktreePath, worktreeBefore.worktreePath);
       assert.equal(stack.adapter.requests.length, 2, "replayed REWORK must not create another attempt");
+      assert.equal(stack.store.countTaskAttempts(runId, firstHandle.taskId), 2, "gate resolution starts exactly one bounded next attempt");
 
       stack.adapter.finishNext("succeeded");
       await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "focused and phase verification after REWORK");
@@ -300,6 +321,7 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.ok(transitions.some((transition) => transition.to === "VERIFY_FOCUSED"));
       assert.ok(transitions.some((transition) => transition.to === "VERIFY_PHASE"));
       assert.equal(stack.adapter.requests.length, 2, "the old blocked result is not replayed through execution or verification");
+      assert.equal(stack.store.countTaskAttempts(runId, firstHandle.taskId), 2, "no prior attempt or additional attempt is replayed");
     } finally {
       await stack.close();
     }

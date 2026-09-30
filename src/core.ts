@@ -1783,25 +1783,33 @@ export class KerbsFlowCore {
     const seenOptionIds = new Set<string>();
     for (const option of gate.options) {
       if (seenOptionIds.has(option.id)) {
-        throw new KerbsFlowError("GATE_OPTION_DUPLICATE", `executor human gate repeats option ID ${option.id}`);
+        throw new KerbsFlowError("GATE_OPTION_DUPLICATE", "executor human gate repeats option IDs");
       }
       seenOptionIds.add(option.id);
       if (!isLegalTransition("HUMAN_GATE", option.target)) {
-        throw new KerbsFlowError("GATE_TARGET_ILLEGAL", `executor human gate option ${option.id} targets illegal transition HUMAN_GATE -> ${option.target}`);
+        throw new KerbsFlowError("GATE_TARGET_ILLEGAL", `executor human gate targets illegal transition HUMAN_GATE -> ${option.target}`);
       }
     }
     const canRework = this.store.countTaskAttempts(runId, taskId) < this.configuration.effectiveMaxImplementationAttempts;
-    const options = gate.options.filter((option) => option.target === "FAILED" || option.target === "CANCELLED" || (option.target === "REWORK" && canRework));
-    const optionIds = new Set(options.map((option) => option.id));
-    const addTerminal = (target: "FAILED" | "CANCELLED", id: string, label: string, consequence: string): void => {
-      if (options.some((option) => option.target === target)) return;
-      let uniqueId = id;
-      while (optionIds.has(uniqueId)) uniqueId = `core_${uniqueId}`;
-      options.push({ id: uniqueId, label, consequence, target });
-      optionIds.add(uniqueId);
+    const ownedCounts = new Map<string, number>();
+    const nextControlId = (target: HumanGate["options"][number]["target"]): string => {
+      const base = target === "REWORK" ? "rework" : target === "FAILED" ? "fail" : target === "CANCELLED" ? "cancel" : undefined;
+      if (base === undefined) {
+        throw new KerbsFlowError("GATE_TARGET_ILLEGAL", "executor human gate target has no Core-owned control ID");
+      }
+      const occurrence = (ownedCounts.get(base) ?? 0) + 1;
+      ownedCounts.set(base, occurrence);
+      return occurrence === 1 ? base : `${base}_${occurrence}`;
     };
-    addTerminal("FAILED", "fail", "Fail conservatively", "Stop this run and preserve the blocked attempt and evidence.");
-    addTerminal("CANCELLED", "cancel", "Cancel this run", "Stop this run without granting the requested action; preserve evidence.");
+    const options = gate.options
+      .filter((option) => option.target === "FAILED" || option.target === "CANCELLED" || (option.target === "REWORK" && canRework))
+      .map((option) => ({ ...option, id: nextControlId(option.target) }));
+    const addTerminal = (target: "FAILED" | "CANCELLED", label: string, consequence: string): void => {
+      if (options.some((option) => option.target === target)) return;
+      options.push({ id: nextControlId(target), label, consequence, target });
+    };
+    addTerminal("FAILED", "Fail conservatively", "Stop this run and preserve the blocked attempt and evidence.");
+    addTerminal("CANCELLED", "Cancel this run", "Stop this run without granting the requested action; preserve evidence.");
     return {
       ...gate,
       options,

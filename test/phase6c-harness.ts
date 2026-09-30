@@ -69,7 +69,7 @@ export class SyntheticCodexAdapter implements ExecutorAdapter {
   private readonly waiters = new Map<string, Deferred<unknown>>();
   private readonly results = new Map<string, ExecutorResult>();
 
-  constructor(private readonly extraGateTarget?: RunState) {}
+  constructor(private readonly extraGateTarget?: RunState, private readonly reworkOptionId = "rework") {}
 
   probe(): AdapterDescriptor {
     return {
@@ -199,7 +199,7 @@ export class SyntheticCodexAdapter implements ExecutorAdapter {
         summary: "Synthetic QA requires an explicit human decision.",
         evidenceRefs: [],
         options: [
-          { id: "rework", label: "Create bounded rework", consequence: "Return to the bounded rework path.", target: "REWORK" },
+          { id: this.reworkOptionId, label: "Create bounded rework", consequence: "Return to the bounded rework path.", target: "REWORK" },
           { id: "cancel", label: "Cancel the run", consequence: "Stop this run and preserve its evidence.", target: "CANCELLED" },
           ...(this.extraGateTarget === undefined ? [] : [{ id: "unsupported", label: "Unsupported path", consequence: "No continuation is registered for this target.", target: this.extraGateTarget }]),
         ],
@@ -227,7 +227,7 @@ export async function waitFor<T>(read: () => T | undefined, description: string,
   assert.fail(`timed out waiting for ${description}`);
 }
 
-export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState } = {}): Phase6CStack {
+export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState; reworkOptionId?: string } = {}): Phase6CStack {
   const repository = createGitRepository();
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-phase6c-controls-"));
   mkdirSync(join(root, "runtime"), { mode: 0o700 });
@@ -236,7 +236,7 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
   const ids = new SequenceIdSource("phase6c_controls");
   const store = StateStore.open(join(runtime, "state.sqlite"), { clock, ids });
   const artifacts = new FileArtifactStore(join(runtime, "artifacts"), ids);
-  const adapter = new SyntheticCodexAdapter(options.extraGateTarget);
+  const adapter = new SyntheticCodexAdapter(options.extraGateTarget, options.reworkOptionId);
   const core = new KerbsFlowCore(store, adapter, artifacts, {
     clock,
     ids,

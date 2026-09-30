@@ -4,6 +4,7 @@ import { request as httpRequest, type ClientRequest, type IncomingHttpHeaders, t
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import type { ExecutorAdapter } from "../src/adapter.js";
 import { FileArtifactStore } from "../src/artifacts.js";
@@ -854,6 +855,45 @@ test("gate resolution is run-scoped, versioned, replayable, and persists the sup
     assert.equal(replayed.status, 200);
     assert.equal(JSON.parse(replayed.body).replayed, true);
     assert.equal(fixture.store.listTransitions(runId).length, 3);
+  });
+});
+
+test("snapshot preserves valid gate control IDs exactly and fails closed on malformed persisted IDs", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_gate_snapshot_identity");
+    assert.equal((await postMutation(api, "/v1/runs", token, mutationEnvelope("command_gate_snapshot_start", "gate:snapshot:start", 0, {
+      runId,
+      objective: "test persisted gate control identity",
+    }))).status, 200);
+    fixture.core.gateIntake(runId, 1, "gate:snapshot:create", "synthetic_human_gate", "Synthetic gate projection.");
+    const gateId = fixture.core.readModel(runId)?.currentGate?.gateId;
+    assert.ok(gateId);
+    const persisted = fixture.store.getGate(gateId);
+    assert.ok(persisted);
+
+    const path = `/v1/runs/${runId}/snapshot`;
+    const response = await sendRequest(api, path, { origin: `http://127.0.0.1:${api.port()}`, token });
+    assert.equal(response.status, 200);
+    const snapshot = JSON.parse(response.body) as { currentGate: { options: Array<{ id: string }> } };
+    assert.deepEqual(snapshot.currentGate.options.map((option) => option.id), persisted.gate.options.map((option) => option.id));
+    assert.ok(snapshot.currentGate.options.every((option) => option.id !== "[path redacted]"));
+
+    const malformed = {
+      ...persisted.gate,
+      options: persisted.gate.options.map((option, index) => index === 0 ? { ...option, id: "/synthetic/malformed-control" } : option),
+    };
+    const database = new DatabaseSync(join(fixture.root, "state.sqlite"));
+    try {
+      database.prepare("UPDATE human_gates SET gate_json = ? WHERE gate_id = ?").run(JSON.stringify(malformed), gateId);
+    } finally {
+      database.close();
+    }
+
+    const rejected = await sendRequest(api, path, { origin: `http://127.0.0.1:${api.port()}`, token });
+    assert.equal(rejected.status, 500);
+    assert.deepEqual(JSON.parse(rejected.body), { error: { code: "INTERNAL_ERROR", message: "internal server error" } });
+    assert.doesNotMatch(rejected.body, /synthetic\/malformed-control|\[path redacted\]/u);
+    assert.equal(fixture.store.getGate(gateId)?.gate.options[0]?.id, "/synthetic/malformed-control", "snapshot failure must not rewrite persisted identity");
   });
 });
 

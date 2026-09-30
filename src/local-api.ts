@@ -835,7 +835,7 @@ function snapshotGate(model: ReadModel): unknown {
     reasonCode: safeSnapshotText(gate.reasonCode, 120),
     summary: safeSnapshotText(gate.summary, 500),
     options: gate.options.slice(0, 10).map((option) => ({
-      id: safeSnapshotText(option.id, 100),
+      id: snapshotControlId(option.id),
       label: safeSnapshotText(option.label, 200),
       consequence: safeSnapshotText(option.consequence, 300),
       target: option.target,
@@ -925,6 +925,13 @@ function safeSnapshotText(value: string, maximumLength: number): string {
     .replace(/(^|[\s"'(=:])\/[^\s"'<>),;]*/gu, "$1[path redacted]")
     .replace(/(^|[\s"'(=:])[A-Za-z]:\\[^\s"'<>),;]*/gu, "$1[path redacted]")
     .slice(0, maximumLength);
+}
+
+function snapshotControlId(value: string): string {
+  if (!/^[a-z][a-z0-9_]{0,99}$/u.test(value)) {
+    throw new KerbsFlowError("SNAPSHOT_CONTROL_ID_INVALID", "persisted Human Gate control ID is malformed");
+  }
+  return value;
 }
 
 function serializeSseTransition(transition: StoredTransition): string {
