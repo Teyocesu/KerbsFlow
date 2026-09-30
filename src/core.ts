@@ -1800,10 +1800,8 @@ export class KerbsFlowCore {
       options.push({ id: uniqueId, label, consequence, target });
       optionIds.add(uniqueId);
     };
-    if (new Set(options.map((option) => option.target)).size < 2) {
-      addTerminal("FAILED", "fail", "Fail conservatively", "Stop this run and preserve the blocked attempt and evidence.");
-      addTerminal("CANCELLED", "cancel", "Cancel this run", "Stop this run without granting the requested action; preserve evidence.");
-    }
+    addTerminal("FAILED", "fail", "Fail conservatively", "Stop this run and preserve the blocked attempt and evidence.");
+    addTerminal("CANCELLED", "cancel", "Cancel this run", "Stop this run without granting the requested action; preserve evidence.");
     return {
       ...gate,
       options,

@@ -270,6 +270,9 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const gateSnapshot = await snapshot(stack.api, token, runId);
       const gate = gateSnapshot.currentGate;
       assert.ok(gate);
+      assert.deepEqual(gate.options.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK"], "executor-blocked gates always preserve both terminal escape paths");
+      assert.ok(gate.options.some((option) => option.id === "rework"), "the supplied REWORK option is preserved");
+      assert.ok(gate.options.some((option) => option.id === "cancel"), "the supplied CANCELLED option is preserved");
       const gatePath = `/v1/runs/${runId}/gates/${gate.gateId}/resolve`;
       const reworkCommand = envelope("command_rework_gate", "idem_rework_gate", gateSnapshot.run.stateVersion, { optionId: "rework", note: "continue the persisted blocked result" });
       const worktreeBefore = stack.store.getWorktree(runId);

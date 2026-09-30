@@ -4,6 +4,10 @@ import { DatabaseSync } from "node:sqlite";
 
 import {
   CONTRACT_VERSIONS,
+  DEFAULT_HARD_INVARIANTS,
+  DEFAULT_PROJECT_POLICY,
+  DEFAULT_RUN_OVERRIDE,
+  DEFAULT_USER_PREFERENCES,
   ExecutorResult,
   HumanGate,
   asAttemptId,
@@ -312,7 +316,10 @@ test("fake blocked result creates a durable human gate", async () => {
     const blocked = await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete-blocked");
     assert.equal(blocked.to, "HUMAN_GATE");
     const model = fixture.core.readModel(fixture.runId);
-    assert.equal(model?.currentGate?.gate.options.length, 2);
+    const blockedOptions = model?.currentGate?.gate.options ?? [];
+    assert.deepEqual(blockedOptions.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK"]);
+    assert.ok(blockedOptions.some((option) => option.id === "rework"), "the supplied REWORK option is preserved");
+    assert.ok(blockedOptions.some((option) => option.id === "cancel"), "the supplied CANCELLED option is preserved");
     reopen(fixture);
     assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "HUMAN_GATE");
     const resolved = fixture.core.resolveGate(fixture.runId, 5, "resolve-gate", "rework", "keep scope bounded");
@@ -377,7 +384,58 @@ test("executor gates accept unique REWORK and CANCELLED options", async () => {
     ]);
     const accepted = await fixture.core.completeFakeAttempt(fixture.runId, 4, "valid-options", result);
     assert.equal(accepted.to, "HUMAN_GATE");
-    assert.deepEqual(fixture.core.readModel(fixture.runId)?.currentGate?.gate.options.map((option) => option.target), ["REWORK", "CANCELLED"]);
+    const options = fixture.core.readModel(fixture.runId)?.currentGate?.gate.options ?? [];
+    assert.deepEqual(options.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK"]);
+    assert.ok(options.some((option) => option.id === "rework"), "the supplied REWORK option is preserved");
+    assert.ok(options.some((option) => option.id === "cancel"), "the supplied CANCELLED option is preserved");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("executor gates synthesize the missing terminal CANCELLED choice", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    const result = blockedResult(fixture, [
+      { id: "rework", label: "Rework", consequence: "Return to bounded rework.", target: "REWORK" },
+      { id: "failed", label: "Failed", consequence: "Supplied failure.", target: "FAILED" },
+    ]);
+    const accepted = await fixture.core.completeFakeAttempt(fixture.runId, 4, "synthesize-cancelled", result);
+    assert.equal(accepted.to, "HUMAN_GATE");
+    const options = fixture.core.readModel(fixture.runId)?.currentGate?.gate.options ?? [];
+    assert.deepEqual(options.map((option) => option.target).sort(), ["CANCELLED", "FAILED", "REWORK"]);
+    assert.ok(options.some((option) => option.id === "rework"), "the supplied REWORK option is preserved");
+    assert.ok(options.some((option) => option.id === "failed"), "the supplied FAILED option is preserved");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("executor gates drop REWORK but keep both terminal choices when budget is exhausted", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    fixture.core = new KerbsFlowCore(fixture.store, fixture.adapter, fixture.artifacts, {
+      clock: fixture.clock,
+      ids: fixture.ids,
+      configuration: {
+        hardInvariants: DEFAULT_HARD_INVARIANTS,
+        projectPolicy: { ...DEFAULT_PROJECT_POLICY, maxImplementationAttempts: 1 },
+        userPreferences: DEFAULT_USER_PREFERENCES,
+        runOverride: DEFAULT_RUN_OVERRIDE,
+      },
+    });
+    const result = blockedResult(fixture, [
+      { id: "rework", label: "Rework", consequence: "Return to bounded rework.", target: "REWORK" },
+      { id: "failed", label: "Failed", consequence: "Supplied failure.", target: "FAILED" },
+    ]);
+    const accepted = await fixture.core.completeFakeAttempt(fixture.runId, 4, "exhausted-budget", result);
+    assert.equal(accepted.to, "HUMAN_GATE");
+    const options = fixture.core.readModel(fixture.runId)?.currentGate?.gate.options ?? [];
+    assert.deepEqual(options.map((option) => option.target).sort(), ["CANCELLED", "FAILED"]);
+    assert.ok(options.every((option) => option.target !== "REWORK"), "exhausted REWORK is removed");
+    assert.ok(options.some((option) => option.id === "failed"), "the supplied FAILED option is preserved");
   } finally {
     fixture.close();
   }
