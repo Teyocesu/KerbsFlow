@@ -1,4 +1,4 @@
 # KerbsFlow handoff
 
-- N1/N2 independently verified **PASS**; exact reviewed remediation committed and pushed on `phase6/thin-local-ui` at approved implementation baseline `b5b3a8ed8fe0faaaf66da6a108274b009cf4a4ff`. Historical blockers 1–23 remain **FIX VERIFIED** as of that independent review. Phase 6 OPEN; Phase 6E OPEN; full Phase 6E re-audit pending; physical macOS Chrome QA NOT TESTED; Phase 7 NOT started.
-- Next action: full Phase 6E re-audit against that approved implementation baseline, followed immediately by complete physical macOS Chrome QA if and only if the technical audit has zero blockers. Independent Phase 6/6E closure review has NOT occurred and comes only after Phase 6E validation succeeds.
+- Bug Cleanup Run 1 completed on `phase6/thin-local-ui` against baseline `961b9a349761c7e938b559a1d6cbf698f188304f`: B24 / R1-B1 and R1-B2–R1-B7 FIX VERIFIED; 341/341 relevant, 394/394 full, typecheck/build/diff-check PASS; two final consecutive discovery passes found no new confirmed blocker. No unresolved Run 1 technical blocker. Phase 6 OPEN; Phase 6E OPEN; Phase 6E validation NOT complete; physical macOS Chrome QA pending / NOT TESTED; Phase 7 NOT started.
+- Exact next action: fresh total Bug Cleanup Run 2 against the published Run 1 HEAD. No physical Chrome QA or phase closure in this checkpoint.

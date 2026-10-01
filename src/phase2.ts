@@ -113,28 +113,68 @@ export class Phase2Loop {
     if (started.state !== "INTAKE" || this.store.getWorktree(request.runId) !== undefined || started.currentTaskId !== null || started.activeAttemptId !== null) {
       throw new KerbsFlowError("PHASE2_START_BOUNDARY_INVALID", "already-started Phase2 drive requires a fresh INTAKE run with no worktree, task, or attempt");
     }
+    try {
+      return await this.drive(request, controls);
+    } catch (error) {
+      const category = classifyInitialPlanningFailure(error);
+      if (category === "control" || category === "integrity") throw error;
+      if (controls.claimFailureDisposition === undefined) await controls.checkpoint?.();
+      const boundary = await controls.claimFailureDisposition?.();
+      try {
+        const current = this.store.getRun(request.runId);
+        if (current === undefined) throw error;
+        const disposition = this.core.disposeDriveFailure(request.runId, boundary?.stateVersion ?? current.stateVersion,
+          `${request.runId}:drive-failure:${current.stateVersion}`, category === "trust" ? "trust" : category === "unknown" ? "unknown" : "failure");
+        const state = this.store.getRun(request.runId)!.state;
+        return { verdict: state === "FAILED" ? "FAILED" : state === "CANCELLED" ? "CANCELLED" : state === "RECOVERY" ? "RECOVERY" : state === "NEXT_PHASE" ? "PASS" : "HUMAN_GATE", stateVersion: disposition.stateVersion };
+      } finally {
+        boundary?.release();
+      }
+    }
+  }
+
+  private async drive(request: Phase2LoopRequest, controls: Phase2DriveControls): Promise<Phase2LoopResult> {
+    const planningMaster = controls.planningMaster ?? this.planningMaster;
+    const started = this.store.getRun(request.runId)!;
     let command: Pick<CommandResult, "to" | "stateVersion"> = { to: started.state, stateVersion: started.stateVersion };
     const checkpoint = async (): Promise<void> => {
       const observed = await controls.checkpoint?.();
       const current = observed ?? this.store.getRun(request.runId)?.stateVersion;
       if (current !== undefined) command = { ...command, stateVersion: current };
     };
+    const atDisposition = async (mutate: (stateVersion: number) => CommandResult): Promise<CommandResult> => {
+      if (controls.claimFailureDisposition === undefined) await checkpoint();
+      const boundary = await controls.claimFailureDisposition?.();
+      try {
+        return mutate(boundary?.stateVersion ?? command.stateVersion);
+      } finally {
+        boundary?.release();
+      }
+    };
     await checkpoint();
     let intake: RepositoryIntake;
     try {
       intake = this.git.intake(request.repositoryPath, request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid });
+      await checkpoint();
+      new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
+      command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     } catch (error) {
-      if (!(error instanceof KerbsFlowError)) throw error;
-      const gateable = error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH"
-        || error.code === "GIT_EXECUTABLE_CONFIG_GATE" || error.code === "GIT_CHECKOUT_FILTER_GATE";
-      command = gateable
-        ? this.core.gateIntake(request.runId, command.stateVersion, `${request.runId}:intake-gate`, error.code, error.message)
-        : this.core.failIntake(request.runId, command.stateVersion, `${request.runId}:intake-failed`, error.code, error.message);
-      return { verdict: gateable ? "HUMAN_GATE" : "FAILED", intakeIssue: { code: error.code, summary: error.message }, stateVersion: command.stateVersion };
+      const category = classifyInitialPlanningFailure(error);
+      if (category === "control" || category === "integrity") throw error;
+      const environmentFailure = error instanceof Error && "errno" in error && typeof error.errno === "number"
+        && "syscall" in error && typeof error.syscall === "string";
+      const gateable = category === "trust" || (category === "unknown" && !(error instanceof KerbsFlowError) && !environmentFailure) || (error instanceof KerbsFlowError && (
+        error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH"
+        || error.code === "GIT_EXECUTABLE_CONFIG_GATE" || error.code === "GIT_CHECKOUT_FILTER_GATE"));
+      const code = error instanceof KerbsFlowError ? error.code : "INTAKE_ENVIRONMENT_FAILED";
+      const summary = gateable
+        ? "Repository or canonical intake is unsafe or ambiguous. No planner or executor started; review the trusted input before another run."
+        : "Repository or canonical intake could not complete. No planner or executor started; repair the environment before another run.";
+      command = await atDisposition(version => gateable
+        ? this.core.gateIntake(request.runId, version, `${request.runId}:intake-gate`, code, summary)
+        : this.core.failIntake(request.runId, version, `${request.runId}:intake-failed`, code, summary));
+      return { verdict: gateable ? "HUMAN_GATE" : "FAILED", intakeIssue: { code, summary }, stateVersion: command.stateVersion };
     }
-    await checkpoint();
-    new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
-    command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     await checkpoint();
     let worktree: WorktreeRecord | undefined;
     let worktreeFailure: unknown;
@@ -298,8 +338,7 @@ export class Phase2Loop {
         focused = await this.verifier.verify(intake, worktree, decision, executorResult, request.focusedCheck);
       } catch (error) {
         if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
-        await checkpoint();
-        command = this.core.gateVerificationSandboxUnavailable(request.runId, command.stateVersion, `${request.runId}:focused-sandbox-gate:${attempts}`);
+        command = await atDisposition(version => this.core.gateVerificationSandboxUnavailable(request.runId, version, `${request.runId}:focused-sandbox-gate:${attempts}`));
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, attempts, stateVersion: command.stateVersion };
       }
       await checkpoint();
@@ -307,7 +346,7 @@ export class Phase2Loop {
       await checkpoint();
       if (focused.bundle.outcome !== "passed") {
         const policy = this.recordFailure(request, decision, executorResult, focused, "focused_verification");
-        command = this.core.review(request.runId, command.stateVersion, `${request.runId}:focused-policy:${attempts}`, this.reviewForPolicy(request, policy));
+        command = await atDisposition(version => this.core.review(request.runId, version, `${request.runId}:focused-policy:${attempts}`, this.reviewForPolicy(request, policy)));
         const terminal = this.policyTerminalResult(command.to, intake, worktree, executorResult, focused, attempts, command.stateVersion);
         if (terminal !== undefined) return terminal;
         const reworkFailure = this.reworkFailureContext(request, policy, focused.bundle.summary);
@@ -337,7 +376,7 @@ export class Phase2Loop {
         reasonCode: "focused_validation_passed",
       });
       if (request.phaseCheck === undefined) {
-        command = this.core.gateMissingPhaseValidation(request.runId, command.stateVersion, `${request.runId}:phase-plan-missing`);
+        command = await atDisposition(version => this.core.gateMissingPhaseValidation(request.runId, version, `${request.runId}:phase-plan-missing`));
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, verification: focused, attempts, stateVersion: command.stateVersion };
       }
       let phase: Awaited<ReturnType<FocusedVerifier["verifyPhase"]>>;
@@ -346,8 +385,7 @@ export class Phase2Loop {
         phase = await this.verifier.verifyPhase(intake, worktree, decision, executorResult, request.phaseCheck);
       } catch (error) {
         if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
-        await checkpoint();
-        command = this.core.gateVerificationSandboxUnavailable(request.runId, command.stateVersion, `${request.runId}:phase-sandbox-gate:${attempts}`);
+        command = await atDisposition(version => this.core.gateVerificationSandboxUnavailable(request.runId, version, `${request.runId}:phase-sandbox-gate:${attempts}`));
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, verification: focused, attempts, stateVersion: command.stateVersion };
       }
       await checkpoint();
@@ -355,7 +393,7 @@ export class Phase2Loop {
       await checkpoint();
       if (phase.verification.bundle.outcome !== "passed") {
         const policy = this.recordFailure(request, decision, executorResult, phase.verification, "phase_verification");
-        command = this.core.applyPhaseFailurePolicy(request.runId, command.stateVersion, `${request.runId}:phase-policy:${attempts}`, policy.fingerprint);
+        command = await atDisposition(version => this.core.applyPhaseFailurePolicy(request.runId, version, `${request.runId}:phase-policy:${attempts}`, policy.fingerprint));
         const terminal = this.policyTerminalResult(command.to, intake, worktree, executorResult, phase.verification, attempts, command.stateVersion);
         if (terminal !== undefined) return terminal;
         const reworkFailure = this.reworkFailureContext(request, policy, phase.verification.bundle.summary);
@@ -395,13 +433,34 @@ export class Phase2Loop {
             evidenceRefs: phase.verification.bundle.evidence.flatMap((evidence) => evidence.artifactRef === undefined ? [] : [evidence.artifactRef]),
             ...(providerSessionId(afterExecution.activeAttempt.providerIdentityJson) === undefined ? {} : { implementerProviderSessionId: providerSessionId(afterExecution.activeAttempt.providerIdentityJson)! }),
           });
-        } catch {
+        } catch (error) {
+          const category = classifyInitialPlanningFailure(error);
+          if (category === "control" || category === "integrity") throw error;
           semanticReviewId = undefined;
         }
         await checkpoint();
       }
-      command = this.core.completeTrustedPhaseValidation(request.runId, command.stateVersion, `${request.runId}:phase-close:${attempts}`, { validationId: phase.authoritative.bundle.validationId, ...(semanticReviewId === undefined ? {} : { semanticReviewId }) });
-      return { verdict: command.to === "NEXT_PHASE" ? "PASS" : command.to === "REWORK" ? "REWORK" : command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: phase.verification, attempts, stateVersion: command.stateVersion };
+      command = await atDisposition(version => this.core.completeTrustedPhaseValidation(request.runId, version, `${request.runId}:phase-close:${attempts}`, { validationId: phase.authoritative.bundle.validationId, ...(semanticReviewId === undefined ? {} : { semanticReviewId }) }));
+      if (command.to === "REWORK") {
+        const review = this.store.readModel(request.runId)?.latestReview?.decision;
+        if (review === undefined) throw new KerbsFlowError("REVIEW_EVIDENCE_UNPERSISTED", "trusted rework requires its persisted review diagnosis");
+        const diagnosed = semanticReviewId === undefined ? review.summary : this.store.getSemanticReviewAttempt(semanticReviewId)?.result?.summary ?? review.summary;
+        const policy = this.recordFailure(request, decision, executorResult, phase.verification, "semantic_review", { ...review, summary: diagnosed });
+        if (policy.resultingAction === "human_gate" || policy.resultingAction === "failed") {
+          command = await atDisposition(version => this.core.applyPhaseFailurePolicy(request.runId, version, `${request.runId}:semantic-policy:${attempts}`, policy.fingerprint));
+          return this.policyTerminalResult(command.to, intake, worktree, executorResult, phase.verification, attempts, command.stateVersion)!;
+        }
+        const failure = this.reworkFailureContext(request, policy, diagnosed);
+        nextSelectionReason = `failure policy selected ${policy.resultingAction} after semantic review`;
+        nextEscalationReason = failure.resultingAction === "escalate" ? failure.escalationReason : undefined;
+        const reworked = await this.acceptRework(request, command.stateVersion, decision, failure, `${request.runId}:semantic-continue:${attempts}`, currentRoutingDecision, nextSelectionReason, planningMaster, controls.checkpoint);
+        command = reworked.command;
+        decision = reworked.decision;
+        currentRoutingDecision = reworked.routingDecision;
+        this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
+        continue;
+      }
+      return { verdict: command.to === "NEXT_PHASE" ? "PASS" : command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: phase.verification, attempts, stateVersion: command.stateVersion };
     }
   }
 
@@ -469,8 +528,8 @@ export class Phase2Loop {
     if (routing !== undefined) this.store.recordRoutingDecision(routing);
   }
 
-  private recordFailure(request: Phase2LoopRequest, decision: PlanningDecision, executorResult: ExecutorResult, verification: FocusedVerificationResult, category: "focused_verification" | "phase_verification"): StoredFailureOccurrence {
-    const failureClass = verification.scopeViolations.length > 0 ? "scope_violation" : executorResult.failureClass ?? "validation_failure";
+  private recordFailure(request: Phase2LoopRequest, decision: PlanningDecision, executorResult: ExecutorResult, verification: FocusedVerificationResult, category: "focused_verification" | "phase_verification" | "semantic_review", diagnosis?: ReviewDecision): StoredFailureOccurrence {
+    const failureClass = verification.scopeViolations.length > 0 ? "scope_violation" : diagnosis?.failureClass ?? executorResult.failureClass ?? "validation_failure";
     const higher = request.failurePolicy?.higherCodexRoute;
     return new FailurePolicyCoordinator(this.store, this.core.configuration.effectiveMaxImplementationAttempts).recordAndDecide({
       runId: request.runId,
@@ -481,7 +540,7 @@ export class Phase2Loop {
       causalDiagnosis: verification.scopeViolations.length === 0 && failureClass !== "requirement_or_architecture_ambiguity" && failureClass !== "security_or_privilege_gate",
       scopeUnchanged: verification.scopeViolations.length === 0,
       eligibleHigherRoute: higher !== undefined && (higher.model !== decision.route.model || higher.reasoning !== decision.route.reasoning),
-      fingerprintInput: { failureClass, reasonCode: `${category}_failed`, diagnostic: verification.bundle.summary, category, checkIdentity: category === "phase_verification" ? request.phaseCheck?.commandId ?? "missing_phase_check" : request.focusedCheck.name },
+      fingerprintInput: { failureClass, reasonCode: diagnosis?.reasonCode ?? `${category}_failed`, diagnostic: diagnosis?.summary ?? verification.bundle.summary, category, checkIdentity: category === "focused_verification" ? request.focusedCheck.name : request.phaseCheck?.commandId ?? "missing_phase_check" },
       route: decision.route,
     });
   }
@@ -655,6 +714,7 @@ type InitialPlanningFailureCategory = "control" | "integrity" | "trust" | "invoc
 function classifyInitialPlanningFailure(error: unknown): InitialPlanningFailureCategory {
   if (error instanceof Phase2DriveControlStop) return "control";
   if (error instanceof DatabaseIntegrityError || error instanceof StateVersionConflictError || error instanceof IdempotencyConflictError) return "integrity";
+  if (error instanceof Error && "code" in error && typeof error.code === "string" && error.code.startsWith("ERR_SQLITE_")) return "integrity";
   if (error instanceof KerbsFlowError) {
     if (/^(CONTROL_|PAUSE_|CANCEL_|RUN_DRIVE_)/u.test(error.code)) return "control";
     if (/^(DATABASE_|PERSISTED_|SQLITE_)|(?:^|_)(STATE|CONFLICT|IDEMPOTENCY)(?:_|$)/u.test(error.code)) return "integrity";

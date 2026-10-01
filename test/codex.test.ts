@@ -122,6 +122,40 @@ test("Codex reviewer concurrently drains events and persists one terminal proces
   }
 });
 
+test("Codex executor concurrently drains events and persists one terminal process result", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-"));
+  try {
+    const adapter = new CodexAdapter({ cliPath: createFakeCodex(root), runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    const handle = adapter.start(executionRequest(root, "succeeded", "attempt_concurrent_terminal"));
+    const [raw, evidence] = await Promise.all([
+      adapter.wait(handle),
+      adapter.processEvidence(handle.attemptId),
+      (async () => { for await (const _event of adapter.events(handle)) { /* Drain the real supervised process. */ } })(),
+    ]);
+    assert.equal(parseExecutorResult(raw).outcome, "succeeded");
+    assert.equal(evidence?.exitKind, "normal");
+    assert.match(readFileSync(join(root, "codex-attempts", handle.attemptId, "process-result.json"), "utf8"), /"exitKind":"normal"/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codex terminal process persistence failure cannot become cached success", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-"));
+  try {
+    const adapter = new CodexAdapter({ cliPath: createFakeCodex(root), runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    const handle = adapter.start(executionRequest(root, "succeeded", "attempt_persistence_failure"));
+    const evidencePath = join(root, "codex-attempts", handle.attemptId, "process-result.json");
+    writeFileSync(evidencePath, "synthetic collision preserved\n", { flag: "wx" });
+    const collision = (error: unknown) => error instanceof Error && "code" in error && error.code === "EEXIST";
+    await assert.rejects(adapter.wait(handle), collision);
+    await assert.rejects(adapter.processEvidence(handle.attemptId), collision);
+    assert.equal(readFileSync(evidencePath, "utf8"), "synthetic collision preserved\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex reviewer availability fails closed when its profile permits a synthetic mutation", () => {
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-review-"));
   try {

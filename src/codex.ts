@@ -542,9 +542,10 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   }
 
   private async awaitProcess(session: CodexSession): Promise<ProcessResult> {
+    const completed = await session.process.completion;
     if (session.processResult === undefined) {
-      session.processResult = await session.process.completion;
-      writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(session.processResult))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      session.processResult = completed;
     }
     return session.processResult;
   }
@@ -552,8 +553,8 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   private async awaitReviewProcess(session: CodexReviewSession): Promise<ProcessResult> {
     const completed = await session.process.completion;
     if (session.processResult === undefined) {
-      session.processResult = completed;
       writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      session.processResult = completed;
     }
     return session.processResult;
   }

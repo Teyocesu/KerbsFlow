@@ -416,6 +416,56 @@ test("active-session close uses native interrupt, and close/listener failures ar
   }
 });
 
+for (const closeFails of [false, true]) {
+  test(`host inspection rejection retains ownership for ${closeFails ? "failed" : "successful"} close`, async () => {
+    const fixture = adapterFixture({ closeFails });
+    const error = new Error("synthetic host inspection failed");
+    fixture.host.server.info = async () => { throw error; };
+    let creations = 0;
+    const adapter = new OpenCodeAdapter({ runtimeRoot: fixture.root, createHost: async () => { creations += 1; return fixture.host; } });
+    try {
+      await assert.rejects(adapter.readiness(fixture.root), actual => actual === error);
+      await assert.rejects(adapter.readiness(fixture.root), actual => actual === error);
+      assert.equal(creations, 1, "do not lose an acquired host and create a replacement");
+      if (closeFails) {
+        await assert.rejects(adapter.close(), /close failed/i);
+        await assert.rejects(adapter.close(), /close failed/i);
+      } else {
+        await adapter.close();
+        await adapter.close();
+      }
+      assert.equal(fixture.host.closed, 1, "explicit shutdown reaches the acquired host exactly once");
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test("late acquired host closes without waiting for inspection after shutdown timed out", { timeout: 5_000 }, async () => {
+  const fixture = adapterFixture();
+  const acquired = deferred<void>();
+  const inspection = deferred<void>();
+  const error = new Error("synthetic late inspection failure");
+  let inspections = 0;
+  fixture.host.server.info = async () => { inspections += 1; await inspection.promise; throw error; };
+  const adapter = new OpenCodeAdapter({ runtimeRoot: fixture.root, closePreparationTimeoutMs: 10, createHost: async () => { await acquired.promise; return fixture.host; } });
+  const readiness = assert.rejects(adapter.readiness(fixture.root), /synthetic late inspection failure|cannot open after close begins/);
+  try {
+    await assert.rejects(adapter.close(), /coordination deadline/i);
+    acquired.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(fixture.host.closed, 1);
+    assert.equal(inspections, 0, "shutdown must not await a new inspection of its late acquired host");
+    await readiness;
+    await assert.rejects(adapter.close(), /coordination deadline/i, "late cleanup cannot rewrite the original uncertain close result");
+  } finally {
+    acquired.resolve();
+    inspection.resolve();
+    await readiness;
+    fixture.cleanup();
+  }
+});
+
 test("close before session creation aborts preparation and proves that no session exists", async () => {
   const modelGate = deferred<void>();
   const fixture = adapterFixture({ modelListGate: modelGate });

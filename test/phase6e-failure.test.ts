@@ -1,16 +1,17 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { asCommandId, asRunId, type RunId } from "../src/contracts.js";
 import { DatabaseIntegrityError, KerbsFlowError, StateVersionConflictError } from "../src/errors.js";
-import type { GitWorktreeManager } from "../src/git.js";
+import { GitWorktreeManager } from "../src/git.js";
 import type { PlanningMasterResult } from "../src/planning.js";
 import { LocalApiServer } from "../src/local-api.js";
-import { Phase2DriveControlStop } from "../src/run-coordinator.js";
+import { Phase2DriveControlStop, RunCoordinator } from "../src/run-coordinator.js";
 import { PHASE4_ROUTING_POLICY } from "../src/routing.js";
 import { createPhase6CStack, deferred, waitFor, type Phase6CStack } from "./phase6c-harness.js";
+import { git } from "./phase2-helpers.js";
 
 async function client(stack: Phase6CStack) {
   await stack.api.start();
@@ -55,6 +56,228 @@ async function nextRunStarts(stack: Phase6CStack, api: Awaited<ReturnType<typeof
 function startDrive(stack: Phase6CStack, runId: RunId) {
   stack.coordinator.start({ runId, objective: "exercise a classified failure boundary", commandId: asCommandId(`command_${runId}`), idempotencyKey: `start:${runId}`, expectedStateVersion: 0 });
   return (stack.coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown; driveSettled: boolean; pauseClaim?: unknown; cancelClaim?: unknown; failureDispositionClaim?: unknown } }).reservation;
+}
+
+for (const failure of ["missing", "permission", "escape"] as const) {
+  test(`accepted API Start durably disposes canonical intake ${failure}`, async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId(`run_canonical_${failure}`);
+    const spec = join(stack.repository.root, "docs/SPEC-v0.1.0.md");
+    const contents = readFileSync(spec);
+    try {
+      if (failure === "missing") rmSync(spec);
+      if (failure === "escape") {
+        const outside = join(stack.root, "outside-spec.md");
+        writeFileSync(outside, "synthetic outside canonical content\n");
+        rmSync(spec);
+        symlinkSync(outside, spec);
+      }
+      if (failure !== "permission") {
+        git(stack.repository.root, ["add", "docs"]);
+        git(stack.repository.root, ["commit", "--quiet", "-m", "synthetic canonical failure"]);
+      } else {
+        const manager = (stack.phase2 as unknown as { git: GitWorktreeManager }).git;
+        const intake = manager.intake.bind(manager);
+        manager.intake = (...args) => {
+          const result = intake(...args);
+          chmodSync(spec, 0o000);
+          assert.throws(() => readFileSync(spec), (error: unknown) => error instanceof Error && "code" in error && error.code === "EACCES");
+          return result;
+        };
+      }
+      stack.coordinator = new RunCoordinator(stack.core, stack.store, stack.phase2, {
+        launchProfileId: "canonical-failure-fixture", launchProfileHash: "c".repeat(64),
+        canonicalRepositoryPath: stack.repository.root,
+        focusedCheck: { name: "synthetic", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
+        phaseCheck: { level: "phase", commandId: "synthetic-phase", name: "synthetic", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
+        executionTimeoutMs: 5_000, planningMaster: stack.planningMaster,
+      });
+      stack.api = new LocalApiServer({ core: stack.core, store: stack.store, artifacts: stack.artifacts, coordinator: stack.coordinator });
+      const api = await client(stack);
+      assert.equal((await api.post("/v1/runs", 0, { runId, objective: "canonical intake failure" })).status, 200);
+      const reservation = (stack.coordinator as unknown as { reservation?: { drivePromise: Promise<void> } }).reservation;
+      await reservation?.drivePromise;
+      assert.equal(stack.store.getRun(runId)?.state, failure === "escape" ? "HUMAN_GATE" : "FAILED");
+      assert.equal(stack.planningInputs.initial.length, 0);
+      assert.equal(stack.adapter.requests.length, 0);
+      assert.equal(stack.store.getWorktree(runId), undefined);
+      const snapshot = await api.snapshot(runId);
+      assert.equal(JSON.stringify(snapshot).includes(stack.repository.root), false);
+      assert.equal(JSON.stringify(stack.store.listTransitions(runId)).includes(stack.root), false);
+      if (failure === "escape") {
+        assert.equal(stack.coordinator.activeRunId, runId);
+        const gate = stack.core.readModel(runId)!.currentGate!;
+        assert.equal((await api.post(`/v1/runs/${runId}/gates/${gate.gateId}/resolve`, 2, { optionId: "fail" })).status, 200);
+      }
+      assert.equal(stack.coordinator.activeRunId, undefined);
+      if (failure === "permission") {
+        chmodSync(spec, 0o644);
+        const manager = (stack.phase2 as unknown as { git: GitWorktreeManager }).git;
+        manager.intake = GitWorktreeManager.prototype.intake;
+      }
+      else {
+        if (failure === "escape") rmSync(spec);
+        writeFileSync(spec, contents);
+        git(stack.repository.root, ["add", "docs"]);
+        git(stack.repository.root, ["commit", "--quiet", "-m", "restore synthetic canonical file"]);
+      }
+      await nextRunStarts(stack, api, `run_after_canonical_${failure}`);
+    } finally {
+      if (failure === "permission") chmodSync(spec, 0o644);
+      await stack.close();
+    }
+  });
+}
+
+for (const boundary of ["rework", "focused", "phase", "start", "events", "artifact", "worktree-record"] as const) {
+  test(`drive exception at ${boundary} leaves a truthful durable disposition`, async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId(`run_drive_exception_${boundary}`);
+    const error = new Error("synthetic operation failed at /private/test with token=synthetic-sensitive-value");
+    const fail = () => { throw error; };
+    const verifier = (stack.phase2 as unknown as { verifier: { verify: unknown; verifyPhase: unknown } }).verifier;
+    if (boundary === "rework") stack.planningMaster.planRework = fail;
+    if (boundary === "focused") verifier.verify = fail;
+    if (boundary === "phase") verifier.verifyPhase = fail;
+    if (boundary === "start") stack.adapter.start = fail;
+    if (boundary === "events") stack.adapter.events = async function* () { throw error; };
+    if (boundary === "artifact") stack.artifacts.put = fail;
+    if (boundary === "worktree-record") stack.store.recordWorktree = fail;
+    try {
+      const api = await client(stack);
+      const reservation = startDrive(stack, runId);
+      if (!["start", "events", "worktree-record"].includes(boundary)) {
+        const handle = await stack.adapter.started.promise;
+        stack.adapter.finish(handle, boundary === "rework" ? "success_without_change" : "succeeded");
+      }
+      await reservation.drivePromise;
+      const ambiguous = ["start", "events", "artifact"].includes(boundary);
+      assert.equal(stack.store.getRun(runId)?.state, ambiguous || boundary === "focused" ? "RECOVERY" : "FAILED");
+      assert.equal(reservation.failureDispositionClaim, undefined);
+      assert.equal(JSON.stringify(stack.store.listTransitions(runId)).includes(error.message), false);
+      assert.equal(JSON.stringify(await api.snapshot(runId)).includes("synthetic-sensitive-value"), false);
+      assert.equal(stack.adapter.requests.length, boundary === "start" || boundary === "worktree-record" ? 0 : 1);
+      if (ambiguous) {
+        assert.equal(stack.coordinator.activeRunId, runId);
+        assert.equal(stack.store.getRun(runId)?.recoveryRequired, true);
+        const conflict = await api.post("/v1/runs", 0, { runId: `run_competing_${boundary}`, objective: "cannot replay ambiguous work" });
+        assert.equal(conflict.status, 409);
+        assert.equal(stack.adapter.cancelCalls, 0);
+      } else {
+        if (boundary === "focused") {
+          const run = stack.store.getRun(runId)!;
+          assert.equal(run.recoveryRequired, true);
+          assert.equal((await api.post(`/v1/runs/${runId}/cancel`, run.stateVersion, { reason: "cancel after the executor is proven terminal" })).status, 200);
+        }
+        assert.equal(stack.coordinator.activeRunId, undefined);
+      }
+    } finally {
+      await stack.close();
+    }
+  });
+}
+
+for (const boundary of ["intake", "focused"] as const) {
+  for (const control of ["pause", "cancel"] as const) {
+    test(`${boundary} exception yields durable disposition to earlier ${control}`, async () => {
+      const stack = createPhase6CStack({ phaseCheck: true });
+      const runId = asRunId(`run_failure_control_${boundary}_${control}`);
+      let operation: Promise<unknown> | undefined;
+      const fail = () => {
+        const version = stack.store.getRun(runId)!.stateVersion;
+        const command = { runId, commandId: asCommandId(`command_${boundary}_${control}`), idempotencyKey: `failure-control:${boundary}:${control}`, expectedStateVersion: version };
+        queueMicrotask(() => {
+          operation = control === "pause" ? stack.coordinator.pause(command) : stack.coordinator.cancel({ ...command, reason: "control owns the failed operation boundary" });
+          void operation.catch(() => undefined);
+        });
+        throw new Error("synthetic operation failure");
+      };
+      if (boundary === "intake") (stack.phase2 as unknown as { git: GitWorktreeManager }).git.intake = fail;
+      else (stack.phase2 as unknown as { verifier: { verify: unknown } }).verifier.verify = fail;
+      const reservation = startDrive(stack, runId);
+      try {
+        if (boundary === "focused") stack.adapter.finish(await stack.adapter.started.promise, "succeeded");
+        await waitFor(() => operation, "control claim after the failed operation");
+        await operation;
+        if (control === "pause") {
+          const paused = stack.store.getRun(runId)!;
+          assert.equal(paused.state, "PAUSED");
+          assert.equal(paused.pauseContract?.resumeTarget, boundary === "intake" ? "INTAKE" : "VERIFY_FOCUSED");
+          assert.equal(reservation.driveSettled, false);
+          assert.equal(stack.coordinator.activeRunId, runId);
+          await stack.coordinator.resume({ runId, commandId: asCommandId(`command_resume_${boundary}`), idempotencyKey: `failure-control:resume:${boundary}`, expectedStateVersion: paused.stateVersion });
+        }
+        await reservation.drivePromise;
+        assert.equal(stack.store.getRun(runId)?.state, control === "cancel" ? "CANCELLED" : boundary === "intake" ? "FAILED" : "RECOVERY");
+        assert.equal(reservation.failureDispositionClaim, undefined);
+        assert.equal(stack.adapter.requests.length, boundary === "intake" ? 0 : 1);
+      } finally {
+        const run = stack.store.getRun(runId)!;
+        if (run.state === "PAUSED") await stack.coordinator.cancel({ runId, commandId: asCommandId(`command_cleanup_${boundary}_${control}`), idempotencyKey: `failure-control:cleanup:${boundary}:${control}`, expectedStateVersion: run.stateVersion, reason: "settle the synthetic hold" });
+        await operation?.catch(() => undefined);
+        await reservation.drivePromise;
+        await stack.close();
+      }
+    });
+  }
+}
+
+for (const boundary of ["focused-sandbox", "phase-sandbox", "focused-policy"] as const) {
+  for (const control of ["pause", "cancel"] as const) {
+    test(`${boundary} disposition honors ${control} claimed after a free checkpoint`, async () => {
+      const stack = createPhase6CStack({ phaseCheck: true, maxImplementationAttempts: 1 });
+      const runId = asRunId(`run_late_dispose_${boundary}_${control}`);
+      const coordinator = stack.coordinator as unknown as { checkpoint(reservation: unknown): Promise<number> };
+      const checkpoint = coordinator.checkpoint.bind(coordinator);
+      let failureReady = boundary === "focused-policy";
+      let operation: Promise<unknown> | undefined;
+      const verifier = (stack.phase2 as unknown as { verifier: { verify: unknown; verifyPhase: unknown } }).verifier;
+      const fail = () => {
+        failureReady = true;
+        throw new KerbsFlowError("VERIFICATION_SANDBOX_UNAVAILABLE", "synthetic sandbox failure");
+      };
+      if (boundary === "focused-sandbox") verifier.verify = fail;
+      if (boundary === "phase-sandbox") verifier.verifyPhase = fail;
+      const state = boundary === "focused-policy" ? "REVIEW" : boundary === "phase-sandbox" ? "VERIFY_PHASE" : "VERIFY_FOCUSED";
+      coordinator.checkpoint = async reservation => {
+        const version = await checkpoint(reservation);
+        if (failureReady && operation === undefined && stack.store.getRun(runId)?.state === state) {
+          failureReady = false;
+          queueMicrotask(() => {
+            const request = { runId, commandId: asCommandId(`command_late_dispose_${boundary}_${control}`), idempotencyKey: `late-dispose:${boundary}:${control}`, expectedStateVersion: version };
+            operation = control === "pause" ? stack.coordinator.pause(request) : stack.coordinator.cancel({ ...request, reason: "claim before failure disposition" });
+            void operation.catch(() => undefined);
+          });
+        }
+        return version;
+      };
+      const reservation = startDrive(stack, runId);
+      try {
+        stack.adapter.finish(await stack.adapter.started.promise, boundary === "focused-policy" ? "success_without_change" : "succeeded");
+        await waitFor(() => operation, "late control ownership");
+        await operation;
+        assert.equal(stack.store.listTransitions(runId).some(t => t.to === "HUMAN_GATE" || t.to === "FAILED"), false, "earlier controls must precede failure disposition");
+        if (control === "pause") {
+          const paused = stack.store.getRun(runId)!;
+          assert.equal(paused.state, "PAUSED");
+          assert.equal(paused.pauseContract?.resumeTarget, state);
+          assert.equal(reservation.driveSettled, false);
+          assert.equal(stack.coordinator.activeRunId, runId);
+          await stack.coordinator.resume({ runId, commandId: asCommandId(`command_late_dispose_resume_${boundary}`), idempotencyKey: `late-dispose:resume:${boundary}`, expectedStateVersion: paused.stateVersion });
+        }
+        await reservation.drivePromise;
+        assert.equal(stack.store.getRun(runId)?.state, control === "cancel" ? "CANCELLED" : "HUMAN_GATE");
+        assert.equal(stack.adapter.requests.length, 1);
+        assert.equal(reservation.failureDispositionClaim, undefined);
+      } finally {
+        const run = stack.store.getRun(runId)!;
+        if (run.state === "PAUSED") await stack.coordinator.cancel({ runId, commandId: asCommandId(`command_late_dispose_cleanup_${boundary}_${control}`), idempotencyKey: `late-dispose:cleanup:${boundary}:${control}`, expectedStateVersion: run.stateVersion, reason: "settle the synthetic hold" });
+        await operation?.catch(() => undefined);
+        await reservation.drivePromise;
+        await stack.close();
+      }
+    });
+  }
 }
 
 for (const control of ["pause", "cancel"] as const) {
@@ -668,7 +891,7 @@ const classificationCases = [
   { name: "internal", error: new TypeError("synthetic internal diagnostic at /private/test"), state: "FAILED", reason: "initial_planning_internal_error" },
   { name: "canonical", error: new KerbsFlowError("CANONICAL_INTENT_DRIFT", "synthetic canonical diagnostic"), state: "HUMAN_GATE", reason: "initial_planning_trust_violation" },
   { name: "security", error: new KerbsFlowError("STEER_SECRET_REJECTED", "synthetic secret diagnostic"), state: "HUMAN_GATE", reason: "initial_planning_trust_violation" },
-  { name: "unknown", error: { message: "synthetic unknown object diagnostic" }, state: "PLAN", reason: undefined },
+  { name: "unknown", error: { message: "synthetic unknown object diagnostic" }, state: "HUMAN_GATE", reason: "drive_failure_unclassified" },
 ] as const;
 
 for (const entry of classificationCases) {
@@ -730,7 +953,7 @@ for (const entry of classificationCases) {
 }
 
 for (const boundary of ["result", "identity", "routing", "core"] as const) {
-  test(`successful planner leaves ${boundary} validation errors outside invocation handling`, async () => {
+  test(`successful planner ${boundary} rejection gates without claiming invocation failure`, async () => {
     const stack = createPhase6CStack();
     const runId = asRunId(`run_after_plan_${boundary}`);
     const planInitial = stack.planningMaster.planInitial.bind(stack.planningMaster);
@@ -743,15 +966,20 @@ for (const boundary of ["result", "identity", "routing", "core"] as const) {
         case "core": return { decision: { ...result.decision, route: { adapter: "opencode", model: "synthetic" } } };
       }
     };
-    const expected = { result: "PLANNING_MASTER_RESULT_INVALID", identity: "COMMAND_SCOPE_MISMATCH", routing: "ROUTING_AUTHORITY_REQUIRED", core: "ROUTE_NOT_ALLOWED" };
     try {
       const reservation = startDrive(stack, runId);
       await reservation.drivePromise;
-      assert.ok(reservation.driveError instanceof KerbsFlowError);
-      assert.equal(reservation.driveError.code, expected[boundary]);
-      assert.deepEqual(stack.store.listTransitions(runId).map(t => t.to), ["INTAKE", "PLAN"]);
+      assert.equal(reservation.driveError, undefined);
+      assert.deepEqual(stack.store.listTransitions(runId).map(t => t.to), ["INTAKE", "PLAN", "HUMAN_GATE"]);
+      assert.equal(stack.core.readModel(runId)?.currentGate?.gate.reasonCode, boundary === "result" ? "drive_failure_unclassified" : "drive_trust_violation");
+      assert.equal(stack.store.getRun(runId)?.currentTaskId, null);
+      assert.equal(stack.store.listTransitions(runId).some(t => t.reasonCode === "initial_planning_failed"), false);
       assert.equal(stack.coordinator.activeRunId, runId);
       assert.equal(stack.adapter.requests.length, 0);
+      const gate = stack.core.readModel(runId)!.currentGate!;
+      assert.deepEqual(gate.gate.options.map(o => o.target), ["FAILED", "CANCELLED"]);
+      await stack.coordinator.resolveGate({ runId, gateId: gate.gateId, optionId: "fail", commandId: asCommandId(`command_rejected_${boundary}`), idempotencyKey: `rejected:${boundary}`, expectedStateVersion: 3 });
+      assert.equal(stack.coordinator.activeRunId, undefined);
     } finally {
       await stack.close();
     }
@@ -801,7 +1029,7 @@ for (const boundary of ["setup", "planner"] as const) {
   }
 }
 
-test("unexpected setup programmer error propagates without claiming ordinary OS failure", async () => {
+test("unexpected setup programmer error fails durably without claiming ordinary OS failure", async () => {
   const stack = createPhase6CStack();
   const runId = asRunId("run_setup_internal");
   const error = new TypeError("synthetic setup invariant bug");
@@ -810,9 +1038,11 @@ test("unexpected setup programmer error propagates without claiming ordinary OS 
   try {
     const reservation = startDrive(stack, runId);
     await reservation.drivePromise;
-    assert.strictEqual(reservation.driveError, error);
-    assert.deepEqual(stack.store.listTransitions(runId).map(t => t.to), ["INTAKE", "PLAN"]);
-    assert.equal(stack.coordinator.activeRunId, runId);
+    assert.equal(reservation.driveError, undefined);
+    assert.deepEqual(stack.store.listTransitions(runId).map(t => t.to), ["INTAKE", "PLAN", "FAILED"]);
+    assert.equal(stack.store.listTransitions(runId).at(-1)?.reasonCode, "drive_operation_failed");
+    assert.equal(stack.store.listTransitions(runId).some(t => t.reasonCode === "worktree_setup_failed"), false);
+    assert.equal(stack.coordinator.activeRunId, undefined);
     assert.equal(stack.store.getWorktree(runId), undefined);
     assert.equal(stack.adapter.requests.length, 0);
   } finally {

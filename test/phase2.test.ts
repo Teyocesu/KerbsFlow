@@ -25,7 +25,7 @@ import {
 } from "../src/contracts.js";
 import type { ExecutorAdapter, SemanticReviewAdapter } from "../src/adapter.js";
 import { KerbsFlowCore } from "../src/core.js";
-import { KerbsFlowError } from "../src/errors.js";
+import { DatabaseIntegrityError, KerbsFlowError } from "../src/errors.js";
 import { GitWorktreeManager } from "../src/git.js";
 import { Phase2Loop, type Phase2LoopRequest } from "../src/phase2.js";
 import { createPhase2PlanningDecision, type PlanningMaster } from "../src/planning.js";
@@ -289,8 +289,9 @@ test("Planning Master rejects run and task identity mismatches before READY", as
         planInitial: () => ({ decision }),
         planRework: () => ({ decision }),
       };
-      await assert.rejects(fixture.run({ planningMaster }), (error: unknown) => error instanceof KerbsFlowError && error.code === "COMMAND_SCOPE_MISMATCH");
-      assert.equal(fixture.store.getRun(fixture.runId)?.state, "PLAN");
+      assert.equal((await fixture.run({ planningMaster })).verdict, "HUMAN_GATE");
+      assert.equal(fixture.store.getRun(fixture.runId)?.state, "HUMAN_GATE");
+      assert.equal(fixture.store.readModel(fixture.runId)?.currentGate?.gate.reasonCode, "drive_trust_violation");
       assert.equal(fixture.store.getTask(fixture.taskId), undefined);
       assert.equal(fixture.store.listTaskAttempts(fixture.runId, fixture.taskId).length, 0);
     } finally {
@@ -314,11 +315,9 @@ test("Planning Master cannot pass a structurally cloned Phase 4 routing decision
       }),
       planRework: () => ({ decision: routed.planningDecision, routingDecision: routed.routingDecision }),
     };
-    await assert.rejects(
-      fixture.run({ planningMaster }),
-      (error: unknown) => error instanceof KerbsFlowError && error.code === "ROUTING_AUTHORITY_REQUIRED",
-    );
-    assert.equal(fixture.store.getRun(fixture.runId)?.state, "PLAN");
+    assert.equal((await fixture.run({ planningMaster })).verdict, "HUMAN_GATE");
+    assert.equal(fixture.store.getRun(fixture.runId)?.state, "HUMAN_GATE");
+    assert.equal(fixture.store.readModel(fixture.runId)?.currentGate?.gate.reasonCode, "drive_trust_violation");
     assert.equal(fixture.store.getTask(fixture.taskId), undefined);
     assert.equal(fixture.store.getRoutingDecision(routed.planningDecision.decisionId), undefined);
     assert.equal(fixture.store.listTaskAttempts(fixture.runId, fixture.taskId).length, 0);
@@ -628,7 +627,7 @@ test("phase-command failure stays phase-scoped and cannot inherit focused succes
 
 for (const semantic of [
   { outcome: "supports_continuation", verdict: "PASS", state: "NEXT_PHASE" },
-  { outcome: "rework_required", verdict: "REWORK", state: "REWORK" },
+  { outcome: "rework_required", verdict: "HUMAN_GATE", state: "HUMAN_GATE" },
   { outcome: "evidence_insufficient", verdict: "HUMAN_GATE", state: "HUMAN_GATE" },
 ] as const) {
   test(`real semantic-review path maps ${semantic.outcome} to ${semantic.state}`, async () => {
@@ -699,7 +698,12 @@ for (const semantic of [
         assert.deepEqual(store.readModel(runId)?.currentGate?.gate.options.map((option) => option.target), ["FAILED", "CANCELLED"]);
       }
       const reviews = store.listSemanticReviewAttempts(runId);
-      assert.equal(reviews.length, 1);
+      assert.equal(reviews.length, semantic.outcome === "rework_required" ? 2 : 1);
+      if (semantic.outcome === "rework_required") {
+        assert.equal(result.attempts, 2);
+        assert.deepEqual(store.listFailureOccurrences(runId, taskId).map(f => f.resultingAction), ["rework", "human_gate"]);
+        assert.equal(store.readModel(runId)?.currentGate?.gate.options.some(o => o.target === "REWORK"), false);
+      }
       assert.equal(reviews[0]?.lifecycle, "SUCCEEDED", reviews[0]?.failureSummary ?? "semantic reviewer did not succeed");
       const validationId = reviews[0]!.request.validationIds[0]!;
       const authority = store.getPhaseValidationAuthority(validationId);
@@ -713,6 +717,21 @@ for (const semantic of [
     }
   });
 }
+
+test("semantic review cannot absorb a database integrity error as missing review evidence", async () => {
+  const fixture = integratedLoopFixture("semantic-review");
+  const error = new DatabaseIntegrityError("synthetic review persistence failure");
+  const reviewer = new IndependentSemanticReviewer(fixture.store, fixture.adapter, fixture.gitManager);
+  reviewer.review = async () => { throw error; };
+  try {
+    await assert.rejects(fixture.run({ reviewer }), actual => actual === error);
+    assert.equal(fixture.store.getRun(fixture.runId)?.state, "VERIFY_PHASE");
+    assert.equal(fixture.store.readModel(fixture.runId)?.currentGate, undefined);
+    assert.equal(fixture.store.listTaskAttempts(fixture.runId, fixture.taskId).length, 1);
+  } finally {
+    fixture.close();
+  }
+});
 
 test("deterministic anti-greenwashing blockers never dispatch the semantic reviewer", async () => {
   const fixture = await integratedLoopFixture("deterministic-blocker");

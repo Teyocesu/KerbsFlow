@@ -204,6 +204,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   private readonly databasePath: string;
   private readonly attempts = new Map<string, OpenCodeAttempt>();
   private hostPromise: Promise<OpenCodeHostBoundary> | undefined;
+  private ownedHost: OpenCodeHostBoundary | undefined;
   private closePromise: Promise<void> | undefined;
   private lifecycle: "open" | "closing" | "closed" = "open";
   private generation = 0;
@@ -446,22 +447,21 @@ export class OpenCodeAdapter implements ExecutorAdapter {
 
   private async closeOwnedHost(): Promise<void> {
     for (const attempt of this.attempts.values()) attempt.abort.abort();
-    const hostPromise = this.hostPromise;
+    const hostPromise = this.hostPromise ?? (this.ownedHost === undefined ? undefined : Promise.resolve(this.ownedHost));
     if (hostPromise === undefined) {
       this.lifecycle = "closed";
       return;
     }
     const hostSettlement = await boundedSettlement(hostPromise, this.closePreparationTimeoutMs);
-    if (hostSettlement.status !== "fulfilled") {
+    if (hostSettlement.status !== "fulfilled" && this.ownedHost === undefined) {
       this.lifecycle = "closed";
       this.hostPromise = undefined;
       if (hostSettlement.status === "pending") {
-        void hostPromise.then((host) => host.close()).catch(() => undefined);
         throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", "OpenCode host creation did not settle before the close coordination deadline");
       }
       throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", `OpenCode host creation failed during close: ${message(hostSettlement.reason)}`);
     }
-    const host = hostSettlement.value;
+    const host = hostSettlement.status === "fulfilled" ? hostSettlement.value : this.ownedHost!;
     const uncertain: string[] = [];
     for (const attempt of this.attempts.values()) {
       const preparation = await boundedSettlement(attempt.preparation, this.closePreparationTimeoutMs);
@@ -497,6 +497,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       throw new KerbsFlowError("OPENCODE_CLOSE_FAILED", `OpenCode embedded host close failed: ${message(error)}`);
     }
     this.hostPromise = undefined;
+    this.ownedHost = undefined;
     this.lifecycle = "closed";
     if (uncertain.length > 0) {
       throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", `OpenCode host closed with unproven active sessions: ${uncertain.join(", ")}`);
@@ -515,14 +516,21 @@ export class OpenCodeAdapter implements ExecutorAdapter {
         fs: { filewatcher: false },
       };
       this.hostPromise = this.createHost(options).then(async (host) => {
-        const info = await host.server.info();
-        if (info.urls.length !== 0) {
-          await host.close().catch(() => undefined);
+        this.ownedHost = host;
+        const rejected = this.lifecycle !== "open" ? "closing" : (await host.server.info()).urls.length !== 0 ? "listener" : undefined;
+        if (rejected !== undefined) {
+          try {
+            await host.close();
+            this.ownedHost = undefined;
+          } catch (error) {
+            throw new KerbsFlowError("OPENCODE_CLOSE_FAILED", `OpenCode unusable host close failed: ${message(error)}`);
+          }
+          if (rejected === "closing") throw new KerbsFlowError("OPENCODE_ADAPTER_CLOSING", "OpenCode embedded host cannot open after close begins");
           throw new KerbsFlowError("OPENCODE_LISTENER_UNEXPECTED", "embedded OpenCode host reported a listener URL");
         }
         return host;
       }).catch((error) => {
-        this.hostPromise = undefined;
+        if (this.ownedHost === undefined) this.hostPromise = undefined;
         throw error;
       });
     }

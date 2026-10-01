@@ -310,6 +310,55 @@ export class KerbsFlowCore {
     });
   }
 
+  disposeDriveFailure(runId: RunId, expectedStateVersion: number, idempotencyKey: string, category: "failure" | "trust" | "unknown"): CommandResult {
+    const reasonCode = category === "trust" ? "drive_trust_violation" : category === "unknown" ? "drive_failure_unclassified" : "drive_operation_failed";
+    const summary = "The owned workflow stopped before its next durable boundary. Preserve the worktree and artifacts; no automatic retry or cleanup will occur.";
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "recovery", { category });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (isTerminalState(run.state) || run.state === "HUMAN_GATE" || run.state === "RECOVERY"
+        || run.state === "NEXT_PHASE" || run.state === "HUMAN_RELEASE_GATE") {
+        return { details: { reasonCode, existingDisposition: run.state } } satisfies CommandMutation;
+      }
+      const attempt = run.activeAttemptId === null ? undefined : this.attemptInTransaction(tx, run.activeAttemptId);
+      const uncertain = attempt !== undefined && !isTerminalAttempt(attempt.lifecycle);
+      if (uncertain || run.state === "EXECUTE" || run.state === "VERIFY_FOCUSED") {
+        if (!isLegalTransition(run.state, "RECOVERY")) {
+          throw new KerbsFlowError("DRIVE_DISPOSITION_UNSAFE", "an uncertain attempt has no legal recovery transition at this boundary");
+        }
+        if (run.currentTaskId !== null) tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", "recovery_required", now, run.currentTaskId);
+        return {
+          transition: { to: "RECOVERY", actor: "core", reasonCode, taskId: run.currentTaskId, attemptId: run.activeAttemptId, payload: { summary } },
+          runPatch: { recoveryRequired: true, recoveryReason: summary },
+          details: { reasonCode },
+        } satisfies CommandMutation;
+      }
+      const target = category === "failure" && isLegalTransition(run.state, "FAILED") ? "FAILED" : "HUMAN_GATE";
+      assertLegalTransition(run.state, target);
+      let gate: HumanGate | undefined;
+      if (target === "HUMAN_GATE") {
+        gate = parseHumanGate({
+          schemaVersion: CONTRACT_VERSIONS.humanGate,
+          gateId: asGateId(nextId("gate")), runId,
+          ...(run.currentTaskId === null ? {} : { taskId: run.currentTaskId }),
+          ...(run.activeAttemptId === null ? {} : { attemptId: run.activeAttemptId }),
+          reasonCode, summary, evidenceRefs: [],
+          options: [
+            { id: "fail", label: "Fail and preserve evidence", consequence: "Stop this run and retain its worktree and artifacts for manual review.", target: "FAILED" },
+            { id: "cancel", label: "Cancel and preserve evidence", consequence: "Cancel this run and retain its worktree and artifacts for manual review.", target: "CANCELLED" },
+          ],
+          status: "open",
+        });
+        this.insertGate(tx, gate, now);
+      }
+      if (run.currentTaskId !== null) tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", target === "FAILED" ? "failed" : "blocked", now, run.currentTaskId);
+      return {
+        transition: { to: target, actor: "core", reasonCode, taskId: run.currentTaskId, attemptId: run.activeAttemptId, gateId: gate?.gateId ?? null, payload: { summary } },
+        runPatch: { currentGateId: gate?.gateId ?? null, recoveryRequired: false, recoveryReason: null },
+        details: { reasonCode, ...(gate === undefined ? {} : { gateId: gate.gateId }) },
+      } satisfies CommandMutation;
+    });
+  }
+
   steer(runId: RunId, expectedStateVersion: number, idempotencyKey: string, text: string, commandId?: CommandId): CommandResult {
     const parsedText = parseSteerText(text, "text");
     if (containsLikelySecret(parsedText)) {
@@ -976,7 +1025,8 @@ export class KerbsFlowCore {
       : policy.resultingAction === "failed" ? "FAILED" : "HUMAN_GATE";
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", { fingerprint, action: policy.resultingAction });
     return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
-      if (run.state !== "VERIFY_PHASE" || run.currentTaskId !== policy.taskId || run.activeAttemptId !== attemptId) {
+      if ((run.state !== "VERIFY_PHASE" && !(run.state === "REWORK" && (target === "HUMAN_GATE" || target === "FAILED")))
+        || run.currentTaskId !== policy.taskId || run.activeAttemptId !== attemptId) {
         throw new KerbsFlowError("FAILURE_POLICY_SCOPE_MISMATCH", "persisted phase failure policy is stale for the current run/task/attempt");
       }
       const reviewId = asReviewId(nextId("review"));

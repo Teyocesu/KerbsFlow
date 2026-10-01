@@ -72,6 +72,28 @@ test("RunCoordinator binds Start atomically and owns only one drive across retri
   }
 });
 
+test("trusted launch binding keeps its escalation route when caller configuration changes", async () => {
+  const fixture = makeCoordinatorFixture();
+  const higherRoute = { model: "approved-model", reasoning: "high" };
+  fixture.profile.failurePolicy = { higherCodexRoute: higherRoute };
+  const observed = deferred<Phase2LoopRequest>();
+  const coordinator = fixture.coordinator({
+    async driveStarted(request) {
+      observed.resolve(request);
+      return { verdict: "HUMAN_GATE", stateVersion: 1 };
+    },
+  });
+  try {
+    higherRoute.model = "changed-model";
+    coordinator.start(startRequest("run_profile_route"));
+    const request = await observed.promise;
+    assert.deepEqual(request.failurePolicy?.higherCodexRoute, { model: "approved-model", reasoning: "high" });
+    assert.equal(fixture.store.getRunLaunchBinding(asRunId("run_profile_route"))?.launchProfileHash, fixture.profile.launchProfileHash);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("Pause waits for owned work, concurrent Resume commits once, and later Cancel preserves its receipt", { timeout: 5_000 }, async () => {
   const fixture = makeCoordinatorFixture();
   const driver = new BlockingDriver(fixture.store);

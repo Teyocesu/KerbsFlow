@@ -976,7 +976,11 @@ function canonicalTrustedLaunchProfile(value: TrustedLaunchProfile): TrustedLaun
     : Object.freeze({ ...value.phaseCheck, args: [...value.phaseCheck.args] });
   const failurePolicy = value.failurePolicy === undefined
     ? undefined
-    : Object.freeze({ ...value.failurePolicy, ...(value.failurePolicy.transientFailureClasses === undefined ? {} : { transientFailureClasses: [...value.failurePolicy.transientFailureClasses] }) });
+    : Object.freeze({
+      ...value.failurePolicy,
+      ...(value.failurePolicy.transientFailureClasses === undefined ? {} : { transientFailureClasses: [...value.failurePolicy.transientFailureClasses] }),
+      ...(value.failurePolicy.higherCodexRoute === undefined ? {} : { higherCodexRoute: Object.freeze({ ...value.failurePolicy.higherCodexRoute }) }),
+    });
   const semanticReview = value.semanticReview === undefined ? undefined : Object.freeze({ ...value.semanticReview });
   return Object.freeze({
     launchProfileId: value.launchProfileId,
