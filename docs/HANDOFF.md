@@ -1,4 +1,4 @@
 # KerbsFlow handoff
 
-- Phase 6E B1/B2 findings at `005c8ab6951a9b4ef27bb8e40d0bb41cc395f100` are remediated on `phase6/thin-local-ui`; focused suites passed 141/141, full suite 327/327, and typecheck/build/diff check passed. Phase 6 and 6E remain OPEN; Phase 6E still needs its full re-audit and complete physical macOS QA. Phase 7 has NOT started.
-- Next action: complete the full Phase 6E re-audit and physical macOS QA; do not mark 6E PASS before both.
+- B15/B16 and approved Resume remediation remain dirty on `phase6/thin-local-ui` / HEAD `740cdce`. Resume commits at exact Pause-checkpoint release: Core commit, success acknowledgement, and exact retirement are synchronous. Earlier Cancel rejects Resume without a receipt; later Cancel preserves committed Resume/replay. Core errors preserve the original error and usable paused hold. Failure-disposition ownership/classification remain enforced. Focused 174/174, full 360/360; zero failures/cancellations/skips; typecheck/build/diff check passed on Node `v24.15.0` / npm `11.12.1`. No commit/push. Phase 6 OPEN; Phase 6E OPEN; physical macOS QA NOT TESTED; Phase 7 NOT started.
+- Next action: fresh independent review of the dirty remediation; full Phase 6E re-audit and physical macOS QA remain pending on an approved baseline. Do not suspend the Mac.

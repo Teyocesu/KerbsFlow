@@ -231,6 +231,54 @@ export class KerbsFlowCore {
     });
   }
 
+  failInitialPlanning(runId: RunId, expectedStateVersion: number, idempotencyKey: string, failure: "invocation" | "internal" = "invocation"): CommandResult {
+    const reasonCode = failure === "internal" ? "initial_planning_internal_error" : "initial_planning_failed";
+    const summary = failure === "internal"
+      ? "Initial planning stopped because of an internal error before a decision was accepted. The owned worktree is retained; no executor was started."
+      : "Initial planning failed before a decision was accepted. The owned worktree is retained; no executor was started.";
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "FAILED", "core", reasonCode, { summary });
+    return this.store.executeCommand(command, ({ run }) => {
+      if (run.state !== "PLAN" || run.currentTaskId !== null || run.activeAttemptId !== null) {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", "initial planning failure requires PLAN without an accepted task or active attempt");
+      }
+      return {
+        transition: { to: "FAILED", actor: "core", reasonCode, payload: { summary } },
+        runPatch: { recoveryRequired: false, recoveryReason: null },
+        details: { reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
+  gateInitialPlanningTrustFailure(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
+    const reasonCode = "initial_planning_trust_violation";
+    const summary = "Initial planning encountered a canonical, security, or policy violation. No decision was accepted or executor started; the owned worktree is retained for human review.";
+    const command = this.transitionCommand(runId, expectedStateVersion, idempotencyKey, "HUMAN_GATE", "core", reasonCode, { summary });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      if (run.state !== "PLAN" || run.currentTaskId !== null || run.activeAttemptId !== null) {
+        throw new KerbsFlowError("INVALID_COMMAND_STATE", "initial planning trust failure requires PLAN without an accepted task or active attempt");
+      }
+      const gate = parseHumanGate({
+        schemaVersion: CONTRACT_VERSIONS.humanGate,
+        gateId: asGateId(nextId("gate")),
+        runId,
+        reasonCode,
+        summary,
+        evidenceRefs: [],
+        options: [
+          { id: "fail", label: "Fail and preserve evidence", consequence: "Stop this run and retain the owned worktree for manual review.", target: "FAILED" },
+          { id: "cancel", label: "Cancel and preserve evidence", consequence: "Cancel this run and retain the owned worktree for manual review.", target: "CANCELLED" },
+        ],
+        status: "open",
+      });
+      this.insertGate(tx, gate, now);
+      return {
+        transition: { to: "HUMAN_GATE", actor: "core", reasonCode, gateId: gate.gateId, payload: { summary } },
+        runPatch: { currentGateId: gate.gateId, recoveryRequired: false, recoveryReason: null },
+        details: { gateId: gate.gateId, reasonCode },
+      } satisfies CommandMutation;
+    });
+  }
+
   gatePlanWorktreeCreationUncertain(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
     const reasonCode = "worktree_creation_uncertain";
     const summary = "Worktree creation did not reach a durable completed record. The intent marker and any partial Git state are preserved for review; no automatic retry or cleanup will occur.";

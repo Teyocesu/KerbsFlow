@@ -20,7 +20,7 @@ import {
 } from "./contracts.js";
 import { KerbsFlowCore } from "./core.js";
 import { KerbsFlowError, StateVersionConflictError } from "./errors.js";
-import { Phase2Loop, type Phase2LoopRequest, type Phase2LoopResult } from "./phase2.js";
+import { Phase2Loop, type FailureDispositionBoundary, type Phase2LoopRequest, type Phase2LoopResult } from "./phase2.js";
 import type { PlanningMaster } from "./planning.js";
 import { StateStore, type RunLaunchBinding, type StoredGate } from "./persistence.js";
 import { RandomIdSource, type IdSource } from "./runtime.js";
@@ -70,11 +70,22 @@ interface Deferred<T> {
   resolve(value: T): void;
 }
 
+type ResumeOutcome =
+  | { kind: "resumed"; result: CommandResult }
+  | { kind: "cancelled" }
+  | { kind: "error"; error: unknown };
+
+interface ResumeClaim {
+  request: CoordinatorControlRequest;
+  acknowledgement: Deferred<ResumeOutcome>;
+  operation: Promise<CommandResult>;
+}
+
 interface PauseClaim {
   request: CoordinatorControlRequest;
   quiescent: Deferred<void>;
   resume: Deferred<"resume" | "cancel">;
-  resumed: Deferred<number>;
+  resumeClaim?: ResumeClaim;
   status: "claimed" | "paused" | "resuming";
   operation?: Promise<CommandResult>;
 }
@@ -105,6 +116,10 @@ interface HeldGateBoundary extends GateBoundaryIdentity {
   wake: Deferred<void>;
 }
 
+interface FailureDispositionClaim {
+  stateVersion: number;
+}
+
 type GateOptionPreflight =
   | { kind: "immediate"; held?: HeldGateBoundary }
   | { kind: "await-held"; boundary: GateBoundaryIdentity };
@@ -125,6 +140,7 @@ interface RunReservation {
   cancelClaim?: CancelClaim;
   gateResolutionClaim?: GateResolutionClaim;
   heldGate?: HeldGateBoundary;
+  failureDispositionClaim?: FailureDispositionClaim;
   signalledAttempts: Set<string>;
 }
 
@@ -230,6 +246,7 @@ export class RunCoordinator {
       reservation.drivePromise = Promise.resolve().then(() => this.phase2.driveStarted(driveRequest, {
         planningMaster: this.profile.planningMaster,
         checkpoint: () => this.checkpoint(reservation),
+        claimFailureDisposition: () => this.claimFailureDisposition(reservation),
         waitForGateResolution: (boundary) => this.waitForGateResolution(reservation, boundary),
       })).then(
         (result) => { reservation.driveResult = result; },
@@ -238,10 +255,7 @@ export class RunCoordinator {
         reservation.driveSettled = true;
         reservation.settled.resolve();
         try {
-          const current = this.store.getRun(reservation.runId);
-          if (current !== undefined && isTerminalState(current.state) && this.reservation === reservation) {
-            this.reservation = undefined;
-          }
+          this.reconcileTerminalReservation(reservation);
         } catch (error) {
           reservation.driveError ??= error;
         }
@@ -272,6 +286,9 @@ export class RunCoordinator {
     if (replay !== undefined) return Promise.resolve(replay);
 
     const reservation = this.requireReservation(request.runId);
+    if (reservation.failureDispositionClaim !== undefined) {
+      throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "failure disposition already owns this run's control boundary");
+    }
     if (reservation.startupBlocked) throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "startup found an unfinished run without an owned Phase2 drive; pause cannot claim it");
     if (reservation.driveSettled) throw new KerbsFlowError("RUN_DRIVE_NOT_PAUSABLE", "Pause requires a live owned Phase2 drive that can be held at a control checkpoint");
     const run = this.assertRequestVersion(request.runId, request.expectedStateVersion);
@@ -289,7 +306,6 @@ export class RunCoordinator {
       request,
       quiescent: deferred<void>(),
       resume: deferred<"resume" | "cancel">(),
-      resumed: deferred<number>(),
       status: "claimed",
     };
     reservation.pauseClaim = claim;
@@ -299,6 +315,7 @@ export class RunCoordinator {
         delete reservation.pauseClaim;
         claim.resume.resolve("resume");
       }
+      this.reconcileTerminalReservation(reservation);
       throw error;
     });
     return claim.operation;
@@ -320,24 +337,36 @@ export class RunCoordinator {
       if (reservation?.runId === request.runId && reservation.startupBlocked) {
         throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "startup found no owned drive or proven restart checkpoint; replayed Resume cannot claim continuation");
       }
-      const pending = reservation?.pauseClaim;
-      if (pending?.status === "resuming" && pending.request.runId === request.runId) await pending.resumed.promise;
       return replay;
     }
 
     const reservation = this.requireReservation(request.runId);
     if (reservation.startupBlocked) throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "startup found no owned drive or proven restart checkpoint; Resume is fail-closed");
-    this.assertRequestVersion(request.runId, request.expectedStateVersion);
     const claim = reservation.pauseClaim;
+    const pending = claim?.resumeClaim;
+    if (pending !== undefined) {
+      if (sameControlRequest(pending.request, request)) return pending.operation;
+      throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another Resume already owns this Pause boundary");
+    }
+    this.assertRequestVersion(request.runId, request.expectedStateVersion);
     if (claim === undefined || claim.status !== "paused" || reservation.driveSettled) {
       throw new KerbsFlowError("RUN_DRIVE_NOT_RESUMABLE", "Resume requires a durable Pause with a live owned Phase2 drive at its checkpoint");
     }
     if (reservation.cancelRequested) throw new KerbsFlowError("CANCEL_ALREADY_CLAIMED", "Cancel superseded this run's Pause");
-    const resumed = this.core.resume(request.runId, request.expectedStateVersion, request.idempotencyKey, request.commandId);
+    const acknowledgement = deferred<ResumeOutcome>();
+    const resume: ResumeClaim = {
+      request: { ...request },
+      acknowledgement,
+      operation: acknowledgement.promise.then((outcome) => {
+        if (outcome.kind === "resumed") return outcome.result;
+        if (outcome.kind === "error") throw outcome.error;
+        throw new KerbsFlowError("CANCEL_ALREADY_CLAIMED", "Cancel superseded Resume before its checkpoint committed continuation");
+      }),
+    };
+    claim.resumeClaim = resume;
     claim.status = "resuming";
     claim.resume.resolve("resume");
-    await claim.resumed.promise;
-    return resumed;
+    return resume.operation;
   }
 
   cancel(request: CoordinatorCancelRequest): Promise<CommandResult> {
@@ -358,8 +387,8 @@ export class RunCoordinator {
     }
 
     const reservation = this.requireReservation(request.runId);
-    if (reservation.gateResolutionClaim !== undefined) {
-      throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "a gate resolution already owns this run's control boundary");
+    if (reservation.gateResolutionClaim !== undefined || reservation.failureDispositionClaim !== undefined) {
+      throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another control command already owns this run's control boundary");
     }
     const existing = reservation.cancelClaim;
     if (existing !== undefined) {
@@ -382,22 +411,23 @@ export class RunCoordinator {
     reservation.cancelRequested = true;
     reservation.heldGate?.wake.resolve();
     const claim: CancelClaim = { request };
-    claim.operation = this.finishCancel(reservation, request).then((result) => {
+    claim.operation = this.finishCancel(reservation, request).finally(async () => {
       const current = this.store.getRun(reservation.runId);
-      if (reservation.driveSettled && current !== undefined && isTerminalState(current.state) && this.reservation === reservation) {
-        this.reservation = undefined;
+      const pause = reservation.pauseClaim;
+      if (current?.state === "CANCELLED" && pause !== undefined && (pause.status === "paused" || pause.status === "resuming")) {
+        await pause.operation;
+        pause.resumeClaim?.acknowledgement.resolve({ kind: "cancelled" });
+        if (reservation.pauseClaim === pause) delete reservation.pauseClaim;
       }
-      return result;
-    }).finally(() => {
       if (reservation.cancelClaim === claim) delete reservation.cancelClaim;
-      const current = this.store.getRun(reservation.runId);
       const attemptId = current?.activeAttemptId;
       const intent = attemptId === null || attemptId === undefined ? undefined : this.store.getCancellationIntent(attemptId);
-      if (intent === undefined) {
+      if (intent === undefined || intent.status === "CANCELLED") {
         reservation.cancelRequested = false;
       } else if (intent.status === "REQUESTED") {
         reservation.signalledAttempts.delete(intent.attemptId);
       }
+      this.reconcileTerminalReservation(reservation);
     });
     reservation.cancelClaim = claim;
     return claim.operation;
@@ -454,6 +484,7 @@ export class RunCoordinator {
       ? this.finishGateResolution(reservation, request, option.target, preflight.held)
       : this.finishPreHoldGateResolution(reservation, claim, option.target)).finally(() => {
       if (reservation.gateResolutionClaim === claim) delete reservation.gateResolutionClaim;
+      this.reconcileTerminalReservation(reservation);
     });
     return claim.operation;
   }
@@ -466,6 +497,7 @@ export class RunCoordinator {
     claimOwner?: GateResolutionClaim,
   ): GateOptionPreflight {
     if (reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
+      || reservation.failureDispositionClaim !== undefined
       || (reservation.gateResolutionClaim !== undefined && reservation.gateResolutionClaim !== claimOwner)) {
       throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "Pause, Cancel, or another gate resolution already owns this run's control boundary");
     }
@@ -578,7 +610,6 @@ export class RunCoordinator {
       if (terminal === undefined || terminal.state !== target || !isTerminalState(terminal.state)) {
         throw new KerbsFlowError("GATE_TERMINAL_UNCONFIRMED", "the persisted run state did not confirm terminal gate resolution");
       }
-      if (this.reservation === reservation) this.reservation = undefined;
     }
     return result;
   }
@@ -755,27 +786,83 @@ export class RunCoordinator {
   }
 
   private async checkpoint(reservation: RunReservation): Promise<number> {
-    if (reservation.cancelRequested) {
-      reservation.cancelCheckpoint.resolve();
-      reservation.pauseClaim?.quiescent.resolve();
-      reservation.pauseClaim?.resume.resolve("cancel");
-      throw new Phase2DriveControlStop();
-    }
-    const pause = reservation.pauseClaim;
-    if (pause !== undefined) {
+    while (true) {
+      if (reservation.cancelRequested) {
+        reservation.cancelCheckpoint.resolve();
+        reservation.pauseClaim?.quiescent.resolve();
+        reservation.pauseClaim?.resume.resolve("cancel");
+        reservation.pauseClaim?.resumeClaim?.acknowledgement.resolve({ kind: "cancelled" });
+        throw new Phase2DriveControlStop();
+      }
+      const pause = reservation.pauseClaim;
+      if (pause === undefined) return this.store.getRun(reservation.runId)?.stateVersion ?? 0;
       pause.quiescent.resolve();
       const decision = await pause.resume.promise;
+      const resume = pause.resumeClaim;
       if (decision === "cancel" || reservation.cancelRequested) {
+        resume?.acknowledgement.resolve({ kind: "cancelled" });
         reservation.cancelCheckpoint.resolve();
         throw new Phase2DriveControlStop();
       }
-      const run = this.store.getRun(reservation.runId);
-      if (run === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${reservation.runId} disappeared at a control checkpoint`);
-      pause.resumed.resolve(run.stateVersion);
+      if (resume === undefined) {
+        if (reservation.pauseClaim !== pause) continue;
+        throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "Pause checkpoint woke without an owned Resume request");
+      }
+      let result: CommandResult;
+      try {
+        if (this.reservation !== reservation || reservation.startupBlocked || reservation.driveSettled
+          || reservation.pauseClaim !== pause || pause.status !== "resuming" || pause.resumeClaim !== resume
+          || resume.request.runId !== reservation.runId) {
+          throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "Resume no longer owns its exact live Pause checkpoint");
+        }
+        const request = resume.request;
+        const run = this.assertRequestVersion(request.runId, request.expectedStateVersion);
+        if (run.state !== "PAUSED" || run.pauseContract === null) {
+          throw new KerbsFlowError("RESUME_NOT_PAUSED", "Resume requires its persisted Pause boundary at the checkpoint");
+        }
+        result = this.core.resume(request.runId, request.expectedStateVersion, request.idempotencyKey, request.commandId);
+      } catch (error) {
+        resume.acknowledgement.resolve({ kind: "error", error });
+        if (this.reservation === reservation && reservation.pauseClaim === pause && pause.resumeClaim === resume
+          && !reservation.startupBlocked && !reservation.driveSettled && this.store.getRun(reservation.runId)?.state === "PAUSED") {
+          delete pause.resumeClaim;
+          pause.status = "paused";
+          pause.resume = deferred<"resume" | "cancel">();
+          continue;
+        }
+        throw error;
+      }
+      resume.acknowledgement.resolve({ kind: "resumed", result });
       if (reservation.pauseClaim === pause) delete reservation.pauseClaim;
-      return run.stateVersion;
+      this.reconcileTerminalReservation(reservation);
+      return result.stateVersion;
     }
-    return this.store.getRun(reservation.runId)?.stateVersion ?? 0;
+  }
+
+  private async claimFailureDisposition(reservation: RunReservation): Promise<FailureDispositionBoundary> {
+    while (true) {
+      await this.checkpoint(reservation);
+      if (this.reservation !== reservation || reservation.startupBlocked || reservation.driveSettled) {
+        throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "failure disposition requires the live owned Phase2 drive");
+      }
+      if (reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested) continue;
+      if (reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined) {
+        throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another control command already owns this run's control boundary");
+      }
+      const run = this.store.getRun(reservation.runId);
+      if (run === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${reservation.runId} disappeared before failure disposition`);
+      const claim: FailureDispositionClaim = { stateVersion: run.stateVersion };
+      reservation.failureDispositionClaim = claim;
+      return {
+        stateVersion: claim.stateVersion,
+        release: () => {
+          if (reservation.failureDispositionClaim === claim) {
+            delete reservation.failureDispositionClaim;
+            this.reconcileTerminalReservation(reservation);
+          }
+        },
+      };
+    }
   }
 
   private requireReservation(runId: RunId): RunReservation {
@@ -786,11 +873,10 @@ export class RunCoordinator {
     return reservation;
   }
 
-  private reconcileTerminalReservation(): void {
-    const reservation = this.reservation;
-    if (reservation === undefined || (!reservation.startupBlocked && !reservation.driveSettled)
+  private reconcileTerminalReservation(reservation = this.reservation): void {
+    if (reservation === undefined || this.reservation !== reservation || (!reservation.startupBlocked && !reservation.driveSettled)
       || reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
-      || reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined) return;
+      || reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined) return;
 
     const run = this.store.getRun(reservation.runId);
     if (this.reservation === reservation && run?.runId === reservation.runId && isTerminalState(run.state)) {

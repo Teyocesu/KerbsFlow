@@ -72,7 +72,7 @@ test("RunCoordinator binds Start atomically and owns only one drive across retri
   }
 });
 
-test("Pause waits for owned work, and Resume continues the same drive", async () => {
+test("Pause waits for owned work, concurrent Resume commits once, and later Cancel preserves its receipt", { timeout: 5_000 }, async () => {
   const fixture = makeCoordinatorFixture();
   const driver = new BlockingDriver(fixture.store);
   const coordinator = fixture.coordinator(driver);
@@ -96,11 +96,28 @@ test("Pause waits for owned work, and Resume continues the same drive", async ()
     assert.equal(fixture.store.getRun(started.runId)?.state, "PAUSED");
     assert.equal(driver.continued.settled, false, "the drive must remain blocked until Resume commits");
 
-    const resumed = await coordinator.resume(controlRequest(started.runId, paused.stateVersion, "command_coord_resume", "coord:resume"));
+    const resumeRequest = controlRequest(started.runId, paused.stateVersion, "command_coord_resume", "coord:resume");
+    const resume = coordinator.resume(resumeRequest);
+    const duplicate = coordinator.resume({ ...resumeRequest });
+    const incompatible = assert.rejects(coordinator.resume({ ...resumeRequest, commandId: asCommandId("command_coord_resume_other"), idempotencyKey: "coord:resume:other" }),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "CONTROL_COMMAND_IN_PROGRESS");
+    assert.equal(fixture.store.getRun(started.runId)?.state, "PAUSED");
+    assert.equal(fixture.store.getCommandIdempotencyKey(resumeRequest.commandId), undefined);
+    const [resumed, sameOutcome] = await Promise.all([resume, duplicate]);
+    await incompatible;
+    assert.strictEqual(sameOutcome, resumed, "identical pending requests share the exact operational result");
     assert.equal(resumed.to, "INTAKE");
+    assert.equal(fixture.store.getCommandIdempotencyKey(resumeRequest.commandId), resumeRequest.idempotencyKey);
+    assert.equal(fixture.store.listTransitions(started.runId).filter(t => t.reasonCode === "resume_persisted_target").length, 1);
     await driver.continued.promise;
     await driver.done.promise;
     assert.equal(driver.calls, 1, "Resume must continue the owned drive rather than create another one");
+    const cancelled = await coordinator.cancel(cancelRequest(started.runId, resumed.stateVersion, "command_coord_later_cancel", "coord:later-cancel"));
+    assert.equal(cancelled.to, "CANCELLED");
+    const replay = await coordinator.resume(resumeRequest);
+    assert.equal(replay.replayed, true);
+    assert.deepEqual({ ...replay, replayed: false }, resumed, "later Cancel cannot revoke the successful operational receipt");
+    assert.equal(coordinator.activeRunId, undefined);
   } finally {
     driver.release.resolve();
     if (driver.started.settled) {
@@ -108,6 +125,58 @@ test("Pause waits for owned work, and Resume continues the same drive", async ()
       await Promise.resolve();
       await Promise.resolve();
     }
+    fixture.close();
+  }
+});
+
+test("a Resume Core error reaches every waiter and preserves the held checkpoint for an explicit Resume", { timeout: 5_000 }, async () => {
+  const fixture = makeCoordinatorFixture();
+  const driver = new BlockingDriver(fixture.store);
+  const coordinator = fixture.coordinator(driver);
+  const started = startRequest("run_coord_resume_error");
+  const originalError = new Error("synthetic Resume transaction failure");
+  const coreResume = fixture.core.resume.bind(fixture.core);
+  let calls = 0;
+  fixture.core.resume = (...args) => {
+    calls += 1;
+    if (calls === 1) throw originalError;
+    return coreResume(...args);
+  };
+  try {
+    coordinator.start(started);
+    await driver.started.promise;
+    const pause = coordinator.pause(controlRequest(started.runId, 1, "command_coord_error_pause", "coord:error:pause"));
+    driver.release.resolve();
+    const paused = await pause;
+    const failedRequest = controlRequest(started.runId, paused.stateVersion, "command_coord_error_resume", "coord:error:resume");
+    const failed = coordinator.resume(failedRequest);
+    const duplicate = coordinator.resume({ ...failedRequest });
+    await Promise.all([
+      assert.rejects(failed, (error: unknown) => error === originalError),
+      assert.rejects(duplicate, (error: unknown) => error === originalError),
+    ]);
+    assert.equal(calls, 1, "Core errors do not trigger automatic retries");
+    assert.equal(fixture.store.getRun(started.runId)?.state, "PAUSED");
+    assert.equal(fixture.store.getRun(started.runId)?.stateVersion, paused.stateVersion);
+    assert.equal(fixture.store.getCommandIdempotencyKey(failedRequest.commandId), undefined);
+    assert.equal(driver.continued.settled, false);
+    assert.equal(coordinator.activeRunId, started.runId);
+    assert.throws(() => coordinator.start(startRequest("run_coord_error_competing")),
+      (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT");
+
+    const resumed = await coordinator.resume(controlRequest(started.runId, paused.stateVersion, "command_coord_error_explicit_resume", "coord:error:explicit-resume"));
+    assert.equal(resumed.to, "INTAKE");
+    assert.equal(calls, 2);
+    await driver.continued.promise;
+    await driver.done.promise;
+    assert.equal(driver.calls, 1);
+    assert.equal(fixture.store.getCommandIdempotencyKey(failedRequest.commandId), undefined);
+    assert.equal(fixture.store.listTransitions(started.runId).filter(t => t.reasonCode === "resume_persisted_target").length, 1);
+  } finally {
+    driver.release.resolve();
+    const current = fixture.store.getRun(started.runId);
+    if (current?.state === "PAUSED") await coordinator.cancel(cancelRequest(started.runId, current.stateVersion, "command_coord_error_cleanup", "coord:error:cleanup"));
+    await driver.done.promise;
     fixture.close();
   }
 });
@@ -131,6 +200,103 @@ test("Pause refuses to create PAUSED when its Phase2 drive has already settled",
     fixture.close();
   }
 });
+
+for (const control of ["pause", "cancel"] as const) {
+  test(`a terminal settled drive retains its reservation until its ${control} claim clears`, async () => {
+    const fixture = makeCoordinatorFixture();
+    const release = deferred<void>();
+    const driver = {
+      async driveStarted(request: Phase2LoopRequest): Promise<Phase2LoopResult> {
+        await release.promise;
+        const failed = fixture.core.failIntake(request.runId, 1, `${request.runId}:fail`, "synthetic_failure", "Synthetic terminal failure.");
+        return { verdict: "FAILED", stateVersion: failed.stateVersion };
+      },
+    };
+    const coordinator = fixture.coordinator(driver);
+    const start = startRequest(`run_coord_terminal_claim_${control}`);
+    let operation: Promise<unknown> | undefined;
+    try {
+      coordinator.start(start);
+      const reservation = (coordinator as unknown as { reservation: { settled: Deferred<void>; drivePromise: Promise<void>; pauseClaim?: unknown; cancelClaim?: unknown } }).reservation;
+      const observed = reservation.settled.promise.then(() => {
+        assert.ok(reservation[control === "pause" ? "pauseClaim" : "cancelClaim"]);
+        assert.equal(fixture.store.getRun(start.runId)?.state, "FAILED");
+        assert.equal(coordinator.activeRunId, start.runId);
+        assert.throws(() => coordinator.start(startRequest(`run_coord_terminal_competing_${control}`)),
+          (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT");
+      });
+      operation = control === "pause"
+        ? coordinator.pause(controlRequest(start.runId, 1, `command_terminal_pause_${control}`, `terminal:pause:${control}`))
+        : coordinator.cancel(cancelRequest(start.runId, 1, `command_terminal_cancel_${control}`, `terminal:cancel:${control}`));
+      const rejected = assert.rejects(operation, (error: unknown) => error instanceof KerbsFlowError
+        && error.code === (control === "pause" ? "RUN_DRIVE_NOT_PAUSABLE" : "CANCEL_NOT_ALLOWED"));
+      release.resolve();
+      await Promise.all([observed, rejected, reservation.drivePromise]);
+      assert.equal(coordinator.activeRunId, undefined);
+      assert.equal(coordinator.start(startRequest(`run_coord_terminal_after_${control}`)).to, "INTAKE");
+      const next = (coordinator as unknown as { reservation: { drivePromise: Promise<void> } }).reservation;
+      await next.drivePromise;
+    } finally {
+      release.resolve();
+      await operation?.catch(() => undefined);
+      fixture.close();
+    }
+  });
+}
+
+for (const control of ["pause", "cancel"] as const) {
+  test(`failure disposition claims before its continuation and excludes later ${control}`, { timeout: 5_000 }, async () => {
+    const fixture = makeCoordinatorFixture();
+    const runId = asRunId(`run_disposition_first_${control}`);
+    const driver = {
+      async driveStarted(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
+        const runId = request.runId;
+        fixture.core.completeIntake(request.runId, 1, `${request.runId}:intake`);
+        assert.ok(controls.claimFailureDisposition);
+        const acquiring = controls.claimFailureDisposition();
+        const observed = acquiring.then((boundary) => {
+          const reservation = (coordinator as unknown as { reservation: { failureDispositionClaim?: unknown; pauseClaim?: unknown; cancelClaim?: unknown } }).reservation;
+          assert.ok(reservation.failureDispositionClaim, "the claim is installed before acquisition resolves");
+          assert.equal(boundary.stateVersion, 2);
+          assert.throws(() => control === "pause"
+            ? coordinator.pause(controlRequest(runId, 2, `command_disposition_pause_${control}`, `disposition:pause:${control}`))
+            : coordinator.cancel(cancelRequest(runId, 2, `command_disposition_cancel_${control}`, `disposition:cancel:${control}`)),
+          (error: unknown) => error instanceof KerbsFlowError && error.code === "CONTROL_COMMAND_IN_PROGRESS");
+          assert.equal(reservation.pauseClaim, undefined);
+          assert.equal(reservation.cancelClaim, undefined);
+          return boundary;
+        });
+        const boundary = await observed;
+        try {
+          const result = fixture.core.failInitialPlanning(runId, boundary.stateVersion, `${runId}:fail`);
+          assert.equal(coordinator.activeRunId, runId, "terminal state retains the live failure claim");
+          return { verdict: "FAILED", stateVersion: result.stateVersion };
+        } finally {
+          boundary.release();
+          boundary.release();
+        }
+      },
+    };
+    const coordinator = fixture.coordinator(driver);
+    try {
+      coordinator.start(startRequest(runId));
+      const reservation = (coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown; failureDispositionClaim?: unknown } }).reservation;
+      await reservation.drivePromise;
+      assert.equal(reservation.driveError, undefined);
+      assert.equal(reservation.failureDispositionClaim, undefined);
+      assert.equal(fixture.store.getRun(runId)?.state, "FAILED");
+      assert.equal(fixture.store.getRun(runId)?.stateVersion, 3);
+      assert.equal(fixture.store.listTransitions(runId).filter(t => t.to === "FAILED").length, 1);
+      assert.equal(coordinator.activeRunId, undefined);
+      assert.equal(coordinator.start(startRequest(`run_after_disposition_${control}`)).to, "INTAKE");
+      const next = (coordinator as unknown as { reservation: { drivePromise: Promise<void> } }).reservation;
+      await next.drivePromise;
+      assert.equal(coordinator.activeRunId, undefined);
+    } finally {
+      fixture.close();
+    }
+  });
+}
 
 test("startup refuses to report an unfinished historical Start as a live drive", () => {
   const fixture = makeCoordinatorFixture();

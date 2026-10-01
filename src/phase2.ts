@@ -1,5 +1,6 @@
 import {
   CONTRACT_VERSIONS,
+  ContractValidationError,
   type ExecutorResult,
   type AttemptId,
   type FailureClassification,
@@ -16,7 +17,7 @@ import {
 } from "./contracts.js";
 import { CanonicalIntentGuard } from "./canonical.js";
 import { KerbsFlowCore } from "./core.js";
-import { KerbsFlowError } from "./errors.js";
+import { DatabaseIntegrityError, IdempotencyConflictError, KerbsFlowError, StateVersionConflictError } from "./errors.js";
 import { GitWorktreeManager, type RepositoryIntake, type WorktreeRecord } from "./git.js";
 import { FailurePolicyCoordinator, escalatePlanningRoute, type FailureAction } from "./phase3.js";
 import {
@@ -37,6 +38,7 @@ import {
 import { StateStore, type StoredFailureOccurrence } from "./persistence.js";
 import { IndependentSemanticReviewer } from "./reviewer.js";
 import type { IdSource } from "./runtime.js";
+import { Phase2DriveControlStop } from "./run-coordinator.js";
 import { FocusedVerifier, type FocusedCheckCommand, type FocusedVerificationResult, type PhaseCheckCommand } from "./verifier.js";
 
 export interface Phase2LoopRequest {
@@ -68,8 +70,14 @@ export interface Phase2LoopResult {
   stateVersion: number;
 }
 
+export interface FailureDispositionBoundary {
+  stateVersion: number;
+  release(): void;
+}
+
 export interface Phase2DriveControls {
   checkpoint?: () => Promise<number | void>;
+  claimFailureDisposition?: () => Promise<FailureDispositionBoundary>;
   waitForGateResolution?: (boundary: { gateId: GateId; taskId: TaskId; attemptId: AttemptId }) => Promise<number>;
   planningMaster?: PlanningMaster;
 }
@@ -122,33 +130,51 @@ export class Phase2Loop {
     new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
     command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
     await checkpoint();
-    let worktree: WorktreeRecord;
+    let worktree: WorktreeRecord | undefined;
+    let worktreeFailure: unknown;
     try {
       worktree = this.git.create(intake, request.runId);
     } catch (error) {
-      if (!(error instanceof KerbsFlowError)) throw error;
-      if (error.code === "WORKTREE_CREATION_UNCERTAIN") {
-        command = this.core.gatePlanWorktreeCreationUncertain(request.runId, command.stateVersion, `${request.runId}:worktree-creation-uncertain`);
+      worktreeFailure = error;
+    }
+    if (worktree === undefined) {
+      const error = worktreeFailure;
+      const uncertain = error instanceof KerbsFlowError && error.code === "WORKTREE_CREATION_UNCERTAIN";
+      const reasonCode = classifyPreIntentWorktreeFailure(error);
+      if (!uncertain && reasonCode === undefined) {
+        await checkpoint();
+        throw error;
+      }
+      if (controls.claimFailureDisposition === undefined) await checkpoint();
+      const boundary = await controls.claimFailureDisposition?.();
+      try {
+        if (boundary !== undefined) command = { ...command, stateVersion: boundary.stateVersion };
+        if (uncertain) {
+          command = this.core.gatePlanWorktreeCreationUncertain(request.runId, command.stateVersion, `${request.runId}:worktree-creation-uncertain`);
+          return {
+            verdict: "HUMAN_GATE",
+            intake,
+            intakeIssue: { code: "WORKTREE_CREATION_UNCERTAIN", summary: "Worktree creation is uncertain; its durable intent marker and any partial Git state are preserved for review." },
+            stateVersion: command.stateVersion,
+          };
+        }
+        if (reasonCode === undefined) throw error;
+        command = this.core.failPlanWorktreeSetup(request.runId, command.stateVersion, `${request.runId}:worktree-setup-failed`, reasonCode);
         return {
-          verdict: "HUMAN_GATE",
+          verdict: "FAILED",
           intake,
-          intakeIssue: { code: error.code, summary: "Worktree creation is uncertain; its durable intent marker and any partial Git state are preserved for review." },
+          intakeIssue: { code: error instanceof KerbsFlowError ? error.code : "WORKTREE_SETUP_FAILED", summary: `Worktree setup failed before creation intent: ${reasonCode}.` },
           stateVersion: command.stateVersion,
         };
+      } finally {
+        boundary?.release();
       }
-      const reasonCode = error.code.toLowerCase().replace(/[^a-z0-9_]+/gu, "_").slice(0, 120) || "worktree_setup_failed";
-      command = this.core.failPlanWorktreeSetup(request.runId, command.stateVersion, `${request.runId}:worktree-setup-failed`, reasonCode);
-      return {
-        verdict: "FAILED",
-        intake,
-        intakeIssue: { code: error.code, summary: `Worktree setup failed before creation intent: ${reasonCode}.` },
-        stateVersion: command.stateVersion,
-      };
     }
     this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
     await checkpoint();
-    const planned = await this.acceptInitialPlan(request, command.stateVersion, planningMaster, controls.checkpoint);
+    const planned = await this.acceptInitialPlan(request, command.stateVersion, planningMaster, controls.checkpoint, controls.claimFailureDisposition);
     command = planned.command;
+    if (planned.decision === null) return { verdict: command.to === "HUMAN_GATE" ? "HUMAN_GATE" : "FAILED", intake, worktree, stateVersion: command.stateVersion };
     await checkpoint();
     let decision = planned.decision;
     let currentRoutingDecision = planned.routingDecision;
@@ -490,7 +516,8 @@ export class Phase2Loop {
     initialStateVersion: number,
     planningMaster: PlanningMaster | undefined,
     controlCheckpoint?: Phase2DriveControls["checkpoint"],
-  ): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision; routingDecision?: TrustedRoutingDecision }> {
+    claimFailureDisposition?: Phase2DriveControls["claimFailureDisposition"],
+  ): Promise<{ command: ReturnType<KerbsFlowCore["plan"]>; decision: PlanningDecision | null; routingDecision?: TrustedRoutingDecision }> {
     let stateVersion = initialStateVersion;
     if (planningMaster === undefined) {
       if (request.planningDecision === undefined) throw new KerbsFlowError("PLANNING_DECISION_REQUIRED", "legacy Phase2Loop requests require a precomputed planning decision");
@@ -507,7 +534,31 @@ export class Phase2Loop {
       const observed = await controlCheckpoint?.();
       if (observed !== undefined) stateVersion = observed;
       const steer = this.observeSteer(request.runId);
-      const result = parsePlanningMasterResult(await planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer }));
+      let result: PlanningMasterResult | undefined;
+      let failure: { error: unknown; category: InitialPlanningFailureCategory } | undefined;
+      try {
+        result = await planningMaster.planInitial({ runId: request.runId, taskId: request.taskId, objective: request.objective, steer });
+      } catch (error) {
+        failure = { error, category: classifyInitialPlanningFailure(error) };
+      }
+      if (failure !== undefined) {
+        if (failure.category === "control" || failure.category === "integrity" || failure.category === "unknown") throw failure.error;
+        if (claimFailureDisposition === undefined) {
+          const observed = await controlCheckpoint?.();
+          if (observed !== undefined) stateVersion = observed;
+        }
+        const boundary = await claimFailureDisposition?.();
+        try {
+          if (boundary !== undefined) stateVersion = boundary.stateVersion;
+          const command = failure.category === "trust"
+            ? this.core.gateInitialPlanningTrustFailure(request.runId, stateVersion, `${request.runId}:initial-planning-trust-failure`)
+            : this.core.failInitialPlanning(request.runId, stateVersion, `${request.runId}:initial-planning-failed`, failure.category);
+          return { command, decision: null };
+        } finally {
+          boundary?.release();
+        }
+      }
+      result = parsePlanningMasterResult(result);
       const decision = result.decision;
       this.assertPlanningIdentity(decision, request);
       this.assertRoutingForPlanningDecision(decision, result.routingDecision);
@@ -585,6 +636,44 @@ export class Phase2Loop {
     }
     throw lastError;
   }
+}
+
+type InitialPlanningFailureCategory = "control" | "integrity" | "trust" | "invocation" | "internal" | "unknown";
+
+function classifyInitialPlanningFailure(error: unknown): InitialPlanningFailureCategory {
+  if (error instanceof Phase2DriveControlStop) return "control";
+  if (error instanceof DatabaseIntegrityError || error instanceof StateVersionConflictError || error instanceof IdempotencyConflictError) return "integrity";
+  if (error instanceof KerbsFlowError) {
+    if (/^(CONTROL_|PAUSE_|CANCEL_|RUN_DRIVE_)/u.test(error.code)) return "control";
+    if (/^(DATABASE_|PERSISTED_|SQLITE_)|(?:^|_)(STATE|CONFLICT|IDEMPOTENCY)(?:_|$)/u.test(error.code)) return "integrity";
+    if (/(?:^|_)(CANONICAL|SECURITY|PRIVILEGE|PERMISSION|SCOPE|INVARIANT|POLICY|TRUST|SECRET|AUTHORITY|IDENTITY|CAPABILITY|CAPABILITIES)(?:_|$)/u.test(error.code)
+      || error.code === "ROUTE_PROHIBITED" || error.code === "ROUTE_NOT_ALLOWED") return "trust";
+    return "unknown";
+  }
+  if (error instanceof TypeError || error instanceof ReferenceError || error instanceof RangeError || error instanceof SyntaxError
+    || error instanceof ContractValidationError || (error instanceof Error && "code" in error && error.code === "ERR_ASSERTION")) return "internal";
+  if (error instanceof Error && Object.getPrototypeOf(error) === Error.prototype && !("code" in error)) return "invocation";
+  return "unknown";
+}
+
+function classifyPreIntentWorktreeFailure(error: unknown): string | undefined {
+  if (error instanceof KerbsFlowError) {
+    switch (error.code) {
+      case "WORKTREE_COLLISION":
+      case "WORKTREE_BRANCH_COLLISION":
+      case "OWNED_DIRECTORY_LINKED":
+      case "OWNED_DIRECTORY_INVALID":
+      case "OWNED_DIRECTORY_PERMISSIONS":
+      case "OWNED_FILE_WRITE_FAILED":
+        return error.code.toLowerCase();
+      default:
+        return undefined;
+    }
+  }
+  if (error instanceof Error && "code" in error && typeof error.code === "string" && /^E[A-Z0-9]+$/u.test(error.code)
+    && "errno" in error && typeof error.errno === "number" && "syscall" in error && typeof error.syscall === "string"
+    && /^(mkdir|lstat|stat|realpath|chmod|open|write|link|unlink|rename|rmdir)$/u.test(error.syscall)) return "worktree_setup_failed";
+  return undefined;
 }
 
 function parseFailureAction(value: string): FailureAction {
