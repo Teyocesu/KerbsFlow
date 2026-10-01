@@ -20,7 +20,7 @@ import {
 } from "./contracts.js";
 import { KerbsFlowCore } from "./core.js";
 import { KerbsFlowError, StateVersionConflictError } from "./errors.js";
-import { Phase2Loop, type FailureDispositionBoundary, type Phase2LoopRequest, type Phase2LoopResult } from "./phase2.js";
+import { Phase2Loop, type ExecutionDispatchBoundary, type FailureDispositionBoundary, type Phase2LoopRequest, type Phase2LoopResult } from "./phase2.js";
 import type { PlanningMaster } from "./planning.js";
 import { StateStore, type RunLaunchBinding, type StoredGate } from "./persistence.js";
 import { RandomIdSource, type IdSource } from "./runtime.js";
@@ -120,6 +120,10 @@ interface FailureDispositionClaim {
   stateVersion: number;
 }
 
+interface ExecutionDispatchClaim {
+  stateVersion: number;
+}
+
 type GateOptionPreflight =
   | { kind: "immediate"; held?: HeldGateBoundary }
   | { kind: "await-held"; boundary: GateBoundaryIdentity };
@@ -141,6 +145,7 @@ interface RunReservation {
   gateResolutionClaim?: GateResolutionClaim;
   heldGate?: HeldGateBoundary;
   failureDispositionClaim?: FailureDispositionClaim;
+  executionDispatchClaim?: ExecutionDispatchClaim;
   signalledAttempts: Set<string>;
 }
 
@@ -247,6 +252,7 @@ export class RunCoordinator {
         planningMaster: this.profile.planningMaster,
         checkpoint: () => this.checkpoint(reservation),
         claimFailureDisposition: () => this.claimFailureDisposition(reservation),
+        claimExecutionDispatch: () => this.claimExecutionDispatch(reservation),
         waitForGateResolution: (boundary) => this.waitForGateResolution(reservation, boundary),
       })).then(
         (result) => { reservation.driveResult = result; },
@@ -286,8 +292,8 @@ export class RunCoordinator {
     if (replay !== undefined) return Promise.resolve(replay);
 
     const reservation = this.requireReservation(request.runId);
-    if (reservation.failureDispositionClaim !== undefined) {
-      throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "failure disposition already owns this run's control boundary");
+    if (reservation.failureDispositionClaim !== undefined || reservation.executionDispatchClaim !== undefined) {
+      throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "failure disposition or execution dispatch already owns this run's control boundary");
     }
     if (reservation.startupBlocked) throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "startup found an unfinished run without an owned Phase2 drive; pause cannot claim it");
     if (reservation.driveSettled) throw new KerbsFlowError("RUN_DRIVE_NOT_PAUSABLE", "Pause requires a live owned Phase2 drive that can be held at a control checkpoint");
@@ -387,7 +393,7 @@ export class RunCoordinator {
     }
 
     const reservation = this.requireReservation(request.runId);
-    if (reservation.gateResolutionClaim !== undefined || reservation.failureDispositionClaim !== undefined) {
+    if (reservation.gateResolutionClaim !== undefined || reservation.failureDispositionClaim !== undefined || reservation.executionDispatchClaim !== undefined) {
       throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another control command already owns this run's control boundary");
     }
     const existing = reservation.cancelClaim;
@@ -497,7 +503,7 @@ export class RunCoordinator {
     claimOwner?: GateResolutionClaim,
   ): GateOptionPreflight {
     if (reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
-      || reservation.failureDispositionClaim !== undefined
+      || reservation.failureDispositionClaim !== undefined || reservation.executionDispatchClaim !== undefined
       || (reservation.gateResolutionClaim !== undefined && reservation.gateResolutionClaim !== claimOwner)) {
       throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "Pause, Cancel, or another gate resolution already owns this run's control boundary");
     }
@@ -846,7 +852,7 @@ export class RunCoordinator {
         throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "failure disposition requires the live owned Phase2 drive");
       }
       if (reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested) continue;
-      if (reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined) {
+      if (reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined || reservation.executionDispatchClaim !== undefined) {
         throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another control command already owns this run's control boundary");
       }
       const run = this.store.getRun(reservation.runId);
@@ -873,10 +879,37 @@ export class RunCoordinator {
     return reservation;
   }
 
+  private async claimExecutionDispatch(reservation: RunReservation): Promise<ExecutionDispatchBoundary> {
+    while (true) {
+      await this.checkpoint(reservation);
+      if (this.reservation !== reservation || reservation.startupBlocked || reservation.driveSettled) {
+        throw new KerbsFlowError("RUN_CONTINUATION_UNAVAILABLE", "execution dispatch requires the live owned Phase2 drive");
+      }
+      if (reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested) continue;
+      if (reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined || reservation.executionDispatchClaim !== undefined) {
+        throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "another control command already owns this run's control boundary");
+      }
+      const run = this.store.getRun(reservation.runId);
+      if (run === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${reservation.runId} disappeared before execution dispatch`);
+      const claim: ExecutionDispatchClaim = { stateVersion: run.stateVersion };
+      reservation.executionDispatchClaim = claim;
+      return {
+        stateVersion: claim.stateVersion,
+        release: () => {
+          if (reservation.executionDispatchClaim === claim) {
+            delete reservation.executionDispatchClaim;
+            this.reconcileTerminalReservation(reservation);
+          }
+        },
+      };
+    }
+  }
+
   private reconcileTerminalReservation(reservation = this.reservation): void {
     if (reservation === undefined || this.reservation !== reservation || (!reservation.startupBlocked && !reservation.driveSettled)
       || reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
-      || reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined) return;
+      || reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined
+      || reservation.executionDispatchClaim !== undefined) return;
 
     const run = this.store.getRun(reservation.runId);
     if (this.reservation === reservation && run?.runId === reservation.runId && isTerminalState(run.state)) {

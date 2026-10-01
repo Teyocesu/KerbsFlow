@@ -1080,6 +1080,13 @@ export class StateStore {
     return row === undefined ? undefined : parseCancellationIntentRow(row);
   }
 
+  getCancellationIntentByCommandId(commandId: CommandId): StoredCancellationIntent | undefined {
+    this.assertOpen();
+    const rows = this.db.prepare("SELECT * FROM cancellation_intents WHERE request_command_id = ?").all(asCommandId(commandId)) as Row[];
+    if (rows.length > 1) throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "one command ID cannot own multiple cancellation intents");
+    return rows[0] === undefined ? undefined : parseCancellationIntentRow(rows[0]);
+  }
+
   prepareSemanticReview(requestValue: unknown): StoredSemanticReviewAttempt {
     this.assertOpen();
     const request = parseSemanticReviewRequest(requestValue);

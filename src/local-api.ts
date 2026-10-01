@@ -11,6 +11,7 @@ import {
   asRunId,
   ContractValidationError,
   parseCancelReason,
+  requestHash,
   type ArtifactId,
   type CommandId,
   type CommandResult,
@@ -51,6 +52,13 @@ interface LocalApiErrorShape {
   message: string;
 }
 
+type MutationKind = "start" | "steer" | "pause" | "resume" | "cancel" | "gate_resolution";
+
+interface PendingMutationOwner {
+  fingerprint: string;
+  inFlight: number;
+}
+
 const MAX_TRANSITIONS = 50;
 const MAX_ARTIFACTS = 50;
 const MAX_GATE_OPTIONS = 10;
@@ -75,6 +83,7 @@ export class LocalApiServer {
   private readonly token = randomBytes(32).toString("base64url");
   private readonly server: Server;
   private readonly activeSseClosers = new Set<() => void>();
+  private readonly pendingMutationCommandIds = new Map<CommandId, PendingMutationOwner>();
   private readonly pollIntervalMs: number;
   private lifecycle: "new" | "starting" | "listening" | "closing" | "closed" = "new";
   private startPromise: Promise<void> | undefined;
@@ -233,18 +242,17 @@ export class LocalApiServer {
     if (segments.length === 2 && segments[1] === "runs") {
       if (method !== "POST") return this.methodNotAllowed(response, "POST");
       const envelope = parseMutationEnvelope(await readMutationBody(request));
-      this.assertCommandIdAvailable(envelope);
       assertExactKeys(envelope.payload, ["runId", "objective"]);
       const runId = asRunId(requiredMutationString(envelope.payload.runId, 120));
       const objective = requiredMutationString(envelope.payload.objective, 10_000);
       if (envelope.expectedStateVersion !== 0) throw invalidRequest("run creation requires expectedStateVersion zero");
-      this.sendCommandResult(response, this.dependencies.coordinator.start({
+      this.sendCommandResult(response, await this.executeMutation(envelope, "start", runId, { runId, objective }, () => this.dependencies.coordinator.start({
         runId,
         objective,
         commandId: envelope.commandId,
         idempotencyKey: envelope.idempotencyKey,
         expectedStateVersion: envelope.expectedStateVersion,
-      }));
+      })));
       return;
     }
     if (segments.length >= 3 && segments[1] === "runs") {
@@ -267,52 +275,47 @@ export class LocalApiServer {
       if (segments.length === 4 && segments[3] === "steer") {
         if (method !== "POST") return this.methodNotAllowed(response, "POST");
         const envelope = parseMutationEnvelope(await readMutationBody(request));
-        this.assertCommandIdAvailable(envelope);
         assertExactKeys(envelope.payload, ["text"]);
         const text = requiredMutationValue(envelope.payload.text);
-        this.sendCommandResult(response, this.dependencies.core.steer(
+        this.sendCommandResult(response, await this.executeMutation(envelope, "steer", runId, { text }, () => this.dependencies.core.steer(
           runId,
           envelope.expectedStateVersion,
           envelope.idempotencyKey,
           text,
           envelope.commandId,
-        ));
+        )));
         return;
       }
       if (segments.length === 4 && ["pause", "resume", "cancel"].includes(segments[3]!)) {
         if (method !== "POST") return this.methodNotAllowed(response, "POST");
         const envelope = parseMutationEnvelope(await readMutationBody(request));
-        this.assertCommandIdAvailable(envelope);
-        assertExactKeys(envelope.payload, segments[3] === "cancel" ? ["reason"] : []);
+        const kind = segments[3] === "pause" ? "pause" : segments[3] === "resume" ? "resume" : "cancel";
+        assertExactKeys(envelope.payload, kind === "cancel" ? ["reason"] : []);
+        const payload = kind === "cancel" ? { reason: parseCancelReason(envelope.payload.reason, "cancel.reason") } : {};
         const control = {
           runId,
           commandId: envelope.commandId,
           idempotencyKey: envelope.idempotencyKey,
           expectedStateVersion: envelope.expectedStateVersion,
         };
-        if (segments[3] === "pause") {
-          this.sendCommandResult(response, await this.dependencies.coordinator.pause(control));
-        } else if (segments[3] === "resume") {
-          this.sendCommandResult(response, await this.dependencies.coordinator.resume(control));
-        } else {
-          const result = await this.dependencies.coordinator.cancel({
-            ...control,
-            reason: parseCancelReason(envelope.payload.reason, "cancel.reason"),
-          });
-          this.sendCancelResult(response, result);
-        }
+        const result = await this.executeMutation(envelope, kind, runId, payload, () => {
+          if (kind === "pause") return this.dependencies.coordinator.pause(control);
+          if (kind === "resume") return this.dependencies.coordinator.resume(control);
+          return this.dependencies.coordinator.cancel({ ...control, reason: payload.reason! });
+        });
+        if (kind === "cancel") this.sendCancelResult(response, result);
+        else this.sendCommandResult(response, result);
         return;
       }
       if (segments.length === 6 && segments[3] === "gates" && segments[5] === "resolve") {
         if (method !== "POST") return this.methodNotAllowed(response, "POST");
         const gateId = parseGateId(segments[4]);
         const envelope = parseMutationEnvelope(await readMutationBody(request));
-        this.assertCommandIdAvailable(envelope);
         assertExactKeys(envelope.payload, ["optionId", "note"]);
         const optionId = requiredMutationString(envelope.payload.optionId, 100);
         const note = optionalMutationText(envelope.payload.note, 4_096);
         if (this.dependencies.store.getGate(gateId) === undefined) throw new NotFoundError("gate", gateId);
-        const result = await this.dependencies.coordinator.resolveGate({
+        const result = await this.executeMutation(envelope, "gate_resolution", runId, { gateId, optionId, ...(note === undefined ? {} : { note }) }, () => this.dependencies.coordinator.resolveGate({
           runId,
           commandId: envelope.commandId,
           idempotencyKey: envelope.idempotencyKey,
@@ -320,7 +323,7 @@ export class LocalApiServer {
           gateId,
           optionId,
           ...(note === undefined ? {} : { note }),
-        });
+        }));
         this.sendCommandResult(response, result);
         return;
       }
@@ -406,14 +409,42 @@ export class LocalApiServer {
     response.end(JSON.stringify({ schemaVersion, commandId, idempotencyKey, runId, accepted, replayed, from, to, stateVersion }));
   }
 
-  private assertCommandIdAvailable(envelope: MutationEnvelope): void {
+  private assertCommandIdAvailable(envelope: MutationEnvelope, kind: MutationKind, runId: RunId, payload: Record<string, unknown>, fingerprint: string): void {
     const existingKey = this.dependencies.store.getCommandIdempotencyKey(envelope.commandId);
-    if (existingKey !== undefined && existingKey !== envelope.idempotencyKey) {
+    const cancellation = this.dependencies.store.getCancellationIntentByCommandId(envelope.commandId);
+    const pending = this.pendingMutationCommandIds.get(envelope.commandId);
+    if ((existingKey !== undefined && existingKey !== envelope.idempotencyKey)
+      || (existingKey === undefined && cancellation !== undefined && (kind !== "cancel" || cancellation.runId !== runId
+        || cancellation.requestIdempotencyKey !== envelope.idempotencyKey
+        || cancellation.requestExpectedStateVersion !== envelope.expectedStateVersion || cancellation.reason !== payload.reason))
+      || (pending !== undefined && pending.fingerprint !== fingerprint)) {
       throw new LocalApiRequestError({
         status: 409,
         code: "COMMAND_ID_CONFLICT",
         message: "command identifier conflicts with an earlier command",
       });
+    }
+  }
+
+  private async executeMutation(
+    envelope: MutationEnvelope,
+    kind: MutationKind,
+    runId: RunId,
+    payload: Record<string, unknown>,
+    operation: () => CommandResult | Promise<CommandResult>,
+  ): Promise<CommandResult> {
+    const fingerprint = requestHash({ kind, runId, expectedStateVersion: envelope.expectedStateVersion, idempotencyKey: envelope.idempotencyKey, payload });
+    this.assertCommandIdAvailable(envelope, kind, runId, payload, fingerprint);
+    const owner = this.pendingMutationCommandIds.get(envelope.commandId) ?? { fingerprint, inFlight: 0 };
+    owner.inFlight += 1;
+    this.pendingMutationCommandIds.set(envelope.commandId, owner);
+    try {
+      return await operation();
+    } finally {
+      owner.inFlight -= 1;
+      if (owner.inFlight === 0 && this.pendingMutationCommandIds.get(envelope.commandId) === owner) {
+        this.pendingMutationCommandIds.delete(envelope.commandId);
+      }
     }
   }
 

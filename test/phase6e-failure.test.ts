@@ -7,6 +7,7 @@ import { asCommandId, asRunId, type RunId } from "../src/contracts.js";
 import { DatabaseIntegrityError, KerbsFlowError, StateVersionConflictError } from "../src/errors.js";
 import type { GitWorktreeManager } from "../src/git.js";
 import type { PlanningMasterResult } from "../src/planning.js";
+import { LocalApiServer } from "../src/local-api.js";
 import { Phase2DriveControlStop } from "../src/run-coordinator.js";
 import { PHASE4_ROUTING_POLICY } from "../src/routing.js";
 import { createPhase6CStack, deferred, waitFor, type Phase6CStack } from "./phase6c-harness.js";
@@ -19,20 +20,20 @@ async function client(stack: Phase6CStack) {
   assert.ok(token);
   let sequence = 0;
   return {
-    async post(path: string, expectedStateVersion: number, payload: Record<string, unknown>) {
+    async post(path: string, expectedStateVersion: number, payload: Record<string, unknown>, identity?: { commandId: string; idempotencyKey: string }) {
       sequence += 1;
       const response = await fetch(origin + path, {
         method: "POST",
         headers: { Origin: origin, "X-KerbsFlow-Token": token, "Content-Type": "application/json" },
         body: JSON.stringify({
           schemaVersion: "kerbsflow.local-command/v1",
-          commandId: `command_failure_${sequence}`,
-          idempotencyKey: `failure:${sequence}`,
+          commandId: identity?.commandId ?? `command_failure_${sequence}`,
+          idempotencyKey: identity?.idempotencyKey ?? `failure:${sequence}`,
           expectedStateVersion,
           payload,
         }),
       });
-      return { status: response.status, body: await response.json() as { to?: string; error?: { code: string } } };
+      return { status: response.status, body: await response.json() as { to?: string; replayed?: boolean; error?: { code: string } } };
     },
     async snapshot(runId: string) {
       const response = await fetch(`${origin}/v1/runs/${runId}/snapshot`, { headers: { "X-KerbsFlow-Token": token } });
@@ -55,6 +56,272 @@ function startDrive(stack: Phase6CStack, runId: RunId) {
   stack.coordinator.start({ runId, objective: "exercise a classified failure boundary", commandId: asCommandId(`command_${runId}`), idempotencyKey: `start:${runId}`, expectedStateVersion: 0 });
   return (stack.coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown; driveSettled: boolean; pauseClaim?: unknown; cancelClaim?: unknown; failureDispositionClaim?: unknown } }).reservation;
 }
+
+for (const control of ["pause", "cancel"] as const) {
+  test(`READY dispatch yields to late ${control} from the production free checkpoint`, { timeout: 15_000 }, async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId(`run_ready_late_${control}`);
+    const claimed = deferred<void>();
+    const getRun = stack.store.getRun.bind(stack.store);
+    let readyReads = 0;
+    let operation: Promise<unknown> | undefined;
+    stack.store.getRun = (id) => {
+      const run = getRun(id);
+      if (id === runId && run?.state === "READY" && ++readyReads === 2) {
+        queueMicrotask(() => {
+          const request = { runId, commandId: asCommandId(`command_ready_${control}`), idempotencyKey: `ready:${control}`, expectedStateVersion: run.stateVersion };
+          operation = control === "pause" ? stack.coordinator.pause(request) : stack.coordinator.cancel({ ...request, reason: "claim before a new executor dispatch" });
+          void operation.catch(() => undefined);
+          claimed.resolve();
+        });
+      }
+      return run;
+    };
+    const reservation = startDrive(stack, runId);
+    try {
+      await claimed.promise;
+      const first = await Promise.race([
+        operation!.then(() => "control"),
+        stack.adapter.started.promise.then(() => "executor"),
+      ]);
+      assert.equal(first, "control", "the earlier control must prevent the new external operation");
+      assert.equal(stack.adapter.requests.length, 0);
+      const taskId = stack.store.getRunLaunchBinding(runId)!.taskId;
+      assert.equal(stack.store.countTaskAttempts(runId, taskId), 0, "even PREPARED must wait for control ownership");
+      assert.equal(stack.store.getRun(runId)?.activeAttemptId, null);
+      assert.equal(stack.adapter.cancelCalls, 0);
+      if (control === "pause") {
+        const paused = stack.store.getRun(runId)!;
+        assert.equal(paused.state, "PAUSED");
+        assert.equal(paused.pauseContract?.resumeTarget, "READY");
+        assert.equal(stack.coordinator.activeRunId, runId);
+        assert.throws(() => stack.coordinator.start({ runId: asRunId("run_ready_competing"), objective: "Pause owns READY", commandId: asCommandId("command_ready_competing"), idempotencyKey: "ready:competing", expectedStateVersion: 0 }),
+          (error: unknown) => error instanceof KerbsFlowError && error.code === "ACTIVE_RUN_CONFLICT");
+        await stack.coordinator.resume({ runId, commandId: asCommandId("command_ready_resume"), idempotencyKey: "ready:resume", expectedStateVersion: paused.stateVersion });
+        const handle = await stack.adapter.started.promise;
+        assert.equal(stack.adapter.requests.length, 1);
+        assert.equal(stack.planningInputs.initial.length, 1, "Resume must continue the existing plan");
+        stack.adapter.finish(handle, "succeeded");
+        await reservation.drivePromise;
+        assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
+      } else {
+        await reservation.drivePromise;
+        assert.equal(stack.store.getRun(runId)?.state, "CANCELLED");
+        assert.equal(stack.coordinator.activeRunId, undefined);
+        const api = await client(stack);
+        await nextRunStarts(stack, api, "run_after_ready_cancel");
+      }
+    } finally {
+      if (stack.store.getRun(runId)?.state === "PAUSED") {
+        await stack.coordinator.cancel({ runId, commandId: asCommandId(`command_ready_cleanup_${control}`), idempotencyKey: `ready:cleanup:${control}`, expectedStateVersion: stack.store.getRun(runId)!.stateVersion, reason: "settle the regression fixture" });
+      } else if (stack.adapter.requests.length !== 0 && !reservation.driveSettled) {
+        stack.adapter.finishNext("cancelled");
+      }
+      await operation?.catch(() => undefined);
+      if (stack.store.getRun(runId)?.state === "PAUSED") {
+        await stack.coordinator.cancel({ runId, commandId: asCommandId(`command_ready_final_cleanup_${control}`), idempotencyKey: `ready:final-cleanup:${control}`, expectedStateVersion: stack.store.getRun(runId)!.stateVersion, reason: "release a hold reached during fixture cleanup" });
+      }
+      await reservation.drivePromise;
+      await stack.close();
+    }
+  });
+}
+
+
+for (const control of ["pause", "cancel"] as const) {
+  test(`execution dispatch owns preparation and handle persistence before later ${control}`, { timeout: 15_000 }, async () => {
+    const stack = createPhase6CStack({ phaseCheck: true });
+    const runId = asRunId(`run_dispatch_first_${control}`);
+    const begun = deferred<void>();
+    const release = deferred<void>();
+    const beginAttempt = stack.core.beginAttempt.bind(stack.core);
+    stack.core.beginAttempt = async (...args) => {
+      const result = await beginAttempt(...args);
+      begun.resolve();
+      await release.promise;
+      return result;
+    };
+    const start = stack.adapter.start.bind(stack.adapter);
+    stack.adapter.start = request => {
+      const reservation = (stack.coordinator as unknown as { reservation: { executionDispatchClaim?: unknown } }).reservation;
+      assert.ok(reservation.executionDispatchClaim, "the external start must belong to the exact dispatch boundary");
+      assert.equal(stack.store.getAttempt(request.attemptId)?.lifecycle, "PREPARED");
+      return start(request);
+    };
+    const signal = stack.adapter.cancel.bind(stack.adapter);
+    const cancellationOrder: string[] = [];
+    const requestCancellation = stack.core.requestRealCancellation.bind(stack.core);
+    stack.core.requestRealCancellation = (...args) => {
+      const result = requestCancellation(...args);
+      cancellationOrder.push(stack.store.getCancellationIntent(stack.store.getRun(runId)!.activeAttemptId!)!.status);
+      return result;
+    };
+    stack.adapter.cancel = (handle, reason) => {
+      cancellationOrder.push(stack.store.getCancellationIntent(handle.attemptId)!.status);
+      return signal(handle, reason);
+    };
+    const reservation = startDrive(stack, runId);
+    let unexpected: Promise<unknown> | undefined;
+    try {
+      await begun.promise;
+      const active = stack.store.getRun(runId)!;
+      assert.equal(active.state, "EXECUTE");
+      assert.equal(stack.store.getAttempt(active.activeAttemptId!)?.lifecycle, "RUNNING", "dispatch owns persisted provider identity too");
+      assert.equal(stack.adapter.requests.length, 1);
+      const request = { runId, commandId: asCommandId(`command_dispatch_late_${control}`), idempotencyKey: `dispatch:late:${control}`, expectedStateVersion: active.stateVersion };
+      assert.throws(() => {
+        unexpected = control === "pause" ? stack.coordinator.pause(request) : stack.coordinator.cancel({ ...request, reason: "cannot overtake dispatch" });
+      }, (error: unknown) => error instanceof KerbsFlowError && error.code === "CONTROL_COMMAND_IN_PROGRESS");
+      assert.equal(stack.store.getCancellationIntent(active.activeAttemptId!), undefined);
+      assert.equal(stack.adapter.cancelCalls, 0);
+      release.resolve();
+      const handle = await stack.adapter.started.promise;
+      const owners = reservation as typeof reservation & { executionDispatchClaim?: unknown };
+      assert.equal(owners.executionDispatchClaim, undefined);
+      const fresh = { ...request, commandId: asCommandId(`command_dispatch_fresh_${control}`), idempotencyKey: `dispatch:fresh:${control}` };
+      if (control === "pause") {
+        const paused = stack.coordinator.pause(fresh);
+        assert.equal(stack.store.getRun(runId)?.state, "EXECUTE");
+        stack.adapter.finish(handle, "succeeded");
+        const result = await paused;
+        assert.equal(result.to, "PAUSED");
+        assert.equal(stack.store.getRun(runId)?.pauseContract?.resumeTarget, "VERIFY_FOCUSED");
+        await stack.coordinator.resume({ runId, commandId: asCommandId("command_dispatch_fresh_resume"), idempotencyKey: "dispatch:fresh:resume", expectedStateVersion: result.stateVersion });
+        await reservation.drivePromise;
+        assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
+      } else {
+        const result = await stack.coordinator.cancel({ ...fresh, reason: "Cancel now sees the active executor" });
+        await reservation.drivePromise;
+        assert.equal(result.to, "CANCELLED");
+        assert.deepEqual(cancellationOrder, ["REQUESTED", "SIGNAL_PENDING"]);
+        assert.equal(stack.adapter.cancelCalls, 1);
+        assert.equal(stack.store.getCancellationIntent(handle.attemptId)?.status, "CANCELLED");
+        assert.equal(stack.coordinator.activeRunId, undefined);
+      }
+      assert.equal(stack.adapter.requests.length, 1);
+      assert.equal(owners.executionDispatchClaim, undefined);
+    } finally {
+      release.resolve();
+      if (stack.adapter.requests.length !== 0 && !reservation.driveSettled && stack.store.getRun(runId)?.state === "EXECUTE") stack.adapter.finishNext("cancelled");
+      await unexpected?.catch(() => undefined);
+      if (stack.store.getRun(runId)?.state === "PAUSED") {
+        await stack.coordinator.cancel({ runId, commandId: asCommandId(`command_dispatch_cleanup_${control}`), idempotencyKey: `dispatch:cleanup:${control}`, expectedStateVersion: stack.store.getRun(runId)!.stateVersion, reason: "settle the dispatch fixture" });
+      }
+      await reservation.drivePromise;
+      await stack.close();
+    }
+  });
+}
+
+for (const key of ["different", "same"] as const) {
+  test(`pending cancellation owns its command ID against ${key}-key Steer`, { timeout: 15_000 }, async () => {
+    const stack = createPhase6CStack();
+    const runId = asRunId(`run_pending_cancel_id_${key}`);
+    const reconciling = deferred<void>();
+    const release = deferred<void>();
+    const duplicateEntered = deferred<void>();
+    const reconcile = stack.adapter.reconcile.bind(stack.adapter);
+    stack.adapter.reconcile = async (identity) => { reconciling.resolve(); await release.promise; return reconcile(identity); };
+    const cancel = stack.coordinator.cancel.bind(stack.coordinator);
+    let cancelCalls = 0;
+    stack.coordinator.cancel = (request) => {
+      const operation = cancel(request);
+      if (++cancelCalls === 2) duplicateEntered.resolve();
+      return operation;
+    };
+    let pending: Promise<unknown> | undefined;
+    let duplicate: Promise<unknown> | undefined;
+    let freshApi: LocalApiServer | undefined;
+    const reservation = startDrive(stack, runId);
+    try {
+      const api = await client(stack);
+      const handle = await stack.adapter.started.promise;
+      const version = stack.store.getRun(runId)!.stateVersion;
+      const identity = { commandId: `command_cancel_owned_${key}`, idempotencyKey: `cancel:owned:${key}` };
+      const reason = "cancel with the exact owned identity";
+      pending = api.post(`/v1/runs/${runId}/cancel`, version, { reason }, identity);
+      await reconciling.promise;
+      assert.equal(stack.adapter.cancelCalls, 1);
+      assert.equal(stack.store.getCancellationIntent(handle.attemptId)?.status, "SIGNALLED");
+      const before = { run: stack.store.getRun(runId), attempt: stack.store.getAttempt(handle.attemptId), intent: stack.store.getCancellationIntent(handle.attemptId), transitions: stack.store.listTransitions(runId) };
+      const stolenIdentity = { ...identity, idempotencyKey: key === "same" ? identity.idempotencyKey : "steer:stolen" };
+      const rejected = await api.post(`/v1/runs/${runId}/steer`, version, { text: "bounded instruction must not steal Cancel" }, stolenIdentity);
+      assert.equal(rejected.status, 409);
+      assert.equal(rejected.body.error?.code, "COMMAND_ID_CONFLICT");
+      assert.equal(stack.store.getPendingSteerInstruction(runId), undefined);
+      assert.equal(stack.store.getCommandIdempotencyKey(asCommandId(identity.commandId)), undefined);
+      assert.deepEqual({ run: stack.store.getRun(runId), attempt: stack.store.getAttempt(handle.attemptId), intent: stack.store.getCancellationIntent(handle.attemptId), transitions: stack.store.listTransitions(runId) }, before);
+
+      if (key === "different") {
+        freshApi = new LocalApiServer({ core: stack.core, coordinator: stack.coordinator, store: stack.store, artifacts: stack.artifacts });
+        const fresh = await client({ ...stack, api: freshApi });
+        const durableConflict = await fresh.post(`/v1/runs/${runId}/steer`, version, { text: "a fresh API has no local pending owner" }, stolenIdentity);
+        assert.equal(durableConflict.status, 409);
+        assert.equal(durableConflict.body.error?.code, "COMMAND_ID_CONFLICT");
+        duplicate = api.post(`/v1/runs/${runId}/cancel`, version, { reason }, identity);
+        await duplicateEntered.promise;
+      }
+      release.resolve();
+      const result = await pending as Awaited<ReturnType<typeof api.post>>;
+      assert.equal(result.status, 200);
+      assert.equal(result.body.to, "CANCELLED");
+      if (duplicate !== undefined) assert.deepEqual(await duplicate, result);
+      await reservation.drivePromise;
+      assert.equal(stack.store.getRun(runId)?.state, "CANCELLED");
+      assert.equal(stack.store.getCancellationIntent(handle.attemptId)?.status, "CANCELLED");
+      assert.equal(stack.store.getAttempt(handle.attemptId)?.lifecycle, "CANCELLED");
+      assert.equal(stack.adapter.cancelCalls, 1);
+      assert.equal(stack.coordinator.activeRunId, undefined);
+      const replay = await api.post(`/v1/runs/${runId}/cancel`, version, { reason }, identity);
+      assert.equal(replay.status, 200);
+      assert.equal(replay.body.to, "CANCELLED");
+      assert.equal(replay.body.replayed, true);
+      assert.equal(stack.adapter.cancelCalls, 1);
+    } finally {
+      release.resolve();
+      await pending;
+      await duplicate;
+      await reservation.drivePromise;
+      await freshApi?.close();
+      await stack.close();
+    }
+  });
+}
+
+test("pending Pause command ID excludes Steer before any durable Pause receipt", { timeout: 15_000 }, async () => {
+  const stack = createPhase6CStack();
+  const runId = asRunId("run_pending_pause_id");
+  const entered = deferred<void>();
+  const pause = stack.coordinator.pause.bind(stack.coordinator);
+  stack.coordinator.pause = request => { const result = pause(request); entered.resolve(); return result; };
+  const reservation = startDrive(stack, runId);
+  let pending: ReturnType<Awaited<ReturnType<typeof client>>["post"]> | undefined;
+  try {
+    const api = await client(stack);
+    const handle = await stack.adapter.started.promise;
+    const version = stack.store.getRun(runId)!.stateVersion;
+    const identity = { commandId: "command_pending_pause", idempotencyKey: "pending:pause" };
+    pending = api.post(`/v1/runs/${runId}/pause`, version, {}, identity);
+    await entered.promise;
+    assert.equal(stack.store.getCommandIdempotencyKey(asCommandId(identity.commandId)), undefined);
+    const rejected = await api.post(`/v1/runs/${runId}/steer`, version, { text: "cannot steal a pending Pause" }, { ...identity, idempotencyKey: "pending:pause:steer" });
+    assert.equal(rejected.status, 409);
+    assert.equal(rejected.body.error?.code, "COMMAND_ID_CONFLICT");
+    assert.equal(stack.store.getPendingSteerInstruction(runId), undefined);
+    assert.equal(stack.store.getRun(runId)?.state, "EXECUTE");
+    stack.adapter.finish(handle, "succeeded");
+    assert.equal((await pending).body.to, "PAUSED");
+    await stack.coordinator.cancel({ runId, commandId: asCommandId("command_pending_pause_cleanup"), idempotencyKey: "pending:pause:cleanup", expectedStateVersion: stack.store.getRun(runId)!.stateVersion, reason: "settle the paused fixture" });
+    await reservation.drivePromise;
+    assert.equal(stack.coordinator.activeRunId, undefined);
+  } finally {
+    if (stack.store.getRun(runId)?.state === "EXECUTE") stack.adapter.finishNext("cancelled");
+    await pending?.catch(() => undefined);
+    await reservation.drivePromise;
+    await stack.close();
+  }
+});
+
 
 test("pre-intent filesystem denial durably fails setup and releases the next Start", async () => {
   const stack = createPhase6CStack({ phaseCheck: true });

@@ -75,9 +75,15 @@ export interface FailureDispositionBoundary {
   release(): void;
 }
 
+export interface ExecutionDispatchBoundary {
+  stateVersion: number;
+  release(): void;
+}
+
 export interface Phase2DriveControls {
   checkpoint?: () => Promise<number | void>;
   claimFailureDisposition?: () => Promise<FailureDispositionBoundary>;
+  claimExecutionDispatch?: () => Promise<ExecutionDispatchBoundary>;
   waitForGateResolution?: (boundary: { gateId: GateId; taskId: TaskId; attemptId: AttemptId }) => Promise<number>;
   planningMaster?: PlanningMaster;
 }
@@ -184,22 +190,28 @@ export class Phase2Loop {
     let nextEscalationReason: string | undefined;
 
     while (true) {
-      await checkpoint();
-      this.assertRoutingForPlanningDecision(decision, currentRoutingDecision);
-      attempts += 1;
-      command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
-      if (currentRoutingDecision !== undefined) {
-        const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
-        if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing provenance requires the prepared attempt");
-        this.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
-          routingDecision: currentRoutingDecision,
-          planningDecision: decision,
-          attemptId,
-          selectionReason: nextSelectionReason,
-          ...(nextEscalationReason === undefined ? {} : { escalationReason: nextEscalationReason }),
-        }));
+      if (controls.claimExecutionDispatch === undefined) await checkpoint();
+      const dispatch = await controls.claimExecutionDispatch?.();
+      try {
+        if (dispatch !== undefined) command = { ...command, stateVersion: dispatch.stateVersion };
+        this.assertRoutingForPlanningDecision(decision, currentRoutingDecision);
+        attempts += 1;
+        command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
+        if (currentRoutingDecision !== undefined) {
+          const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
+          if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing provenance requires the prepared attempt");
+          this.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+            routingDecision: currentRoutingDecision,
+            planningDecision: decision,
+            attemptId,
+            selectionReason: nextSelectionReason,
+            ...(nextEscalationReason === undefined ? {} : { escalationReason: nextEscalationReason }),
+          }));
+        }
+        command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
+      } finally {
+        dispatch?.release();
       }
-      command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
       command = await this.core.completeAttempt(request.runId, command.stateVersion, `${request.runId}:complete:${attempts}`);
       await checkpoint();
       const afterExecution = this.store.readModel(request.runId);
