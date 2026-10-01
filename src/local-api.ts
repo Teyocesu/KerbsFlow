@@ -36,7 +36,7 @@ export interface LocalApiServerOptions {
 
 export interface LocalApiServerDependencies {
   core: Pick<KerbsFlowCore, "readModel" | "steer" | "configuration">;
-  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate" | "getActionableGateOptionIds">;
+  coordinator: Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate" | "getActionableGateOptionIds" | "getControlAvailability">;
   store: StateStore;
   artifacts: ArtifactReader;
 }
@@ -358,6 +358,7 @@ export class LocalApiServer {
         pauseContract: model.run.pauseContract,
       },
       project: snapshotProject(this.dependencies.store.getRunLaunchBinding(runId)?.canonicalRepositoryPath),
+      controls: this.dependencies.coordinator.getControlAvailability(runId),
       currentTask: snapshotTask(model.currentTask),
       activeAttempt: snapshotAttempt(model),
       currentGate: snapshotGate(model, actionableGateOptionIds),

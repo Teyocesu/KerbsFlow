@@ -180,6 +180,19 @@ export class RunCoordinator {
     return this.reservation?.runId;
   }
 
+  getControlAvailability(runId: RunId): { pause: boolean; resume: boolean } {
+    const reservation = this.reservation;
+    const run = this.store.getRun(runId);
+    if (run === undefined || reservation === undefined || reservation.runId !== runId
+      || reservation.startupBlocked || reservation.driveSettled) {
+      return { pause: false, resume: false };
+    }
+    return {
+      pause: isLegalTransition(run.state, "PAUSED"),
+      resume: run.state === "PAUSED" && reservation.pauseClaim?.status === "paused",
+    };
+  }
+
   getActionableGateOptionIds(runId: RunId, gateId: GateId): readonly string[] {
     const reservation = this.reservation;
     if (reservation === undefined || reservation.runId !== runId) return [];

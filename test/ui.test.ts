@@ -58,6 +58,7 @@ test("LocalApiServer serves fixed dashboard assets with the bootstrap and securi
       cancel: async () => { throw new Error("unexpected UI asset test Cancel call"); },
       resolveGate: async () => { throw new Error("unexpected UI asset test gate call"); },
       getActionableGateOptionIds: () => [],
+      getControlAvailability: () => ({ pause: false, resume: false }),
     },
     store: fixture.store,
     artifacts: {
@@ -171,7 +172,7 @@ test("dashboard keeps stale-session, repair-ordering, and notice-survival guards
   );
 });
 
-function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw new Error("unexpected request"); }) {
+function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw new Error("unexpected request"); }, initialHash = "") {
   class Element {
     constructor(readonly id = "", readonly tagName = "element") {}
     private ownText = "";
@@ -214,13 +215,64 @@ function dashboardContext(fetch: (...args: unknown[]) => unknown = () => { throw
     createElement(tagName: string) { createdTags.push(tagName); return new Element("", tagName); },
     createTextNode(value: string) { const node = new Element("", "#text"); node.textContent = value; return node; },
   };
+  const location = { hash: initialHash, pathname: "/", search: "" };
   const context = createContext({
     document, HTMLMetaElement: MetaElement, fetch, AbortController, TextEncoder, TextDecoder,
-    window: { setTimeout: (callback: () => void) => setTimeout(callback, 0), clearTimeout },
+    URLSearchParams,
+    window: { location, history: { replaceState(_state: unknown, _title: string, url: string) { location.hash = url.startsWith("#") ? url : ""; } }, setTimeout: (callback: () => void) => setTimeout(callback, 0), clearTimeout },
   });
   runInContext(readFileSync(new URL("../../src/ui/app.js", import.meta.url), "utf8"), context);
-  return { context, node: (id: string) => document.getElementById(id)!, createdTags };
+  return { context, node: (id: string) => document.getElementById(id)!, createdTags, location };
 }
+
+test("dashboard reload restores only the selected run through a snapshot read, never a mutation", async () => {
+  const requests: string[] = [];
+  const { node } = dashboardContext(async (path) => {
+    requests.push(String(path));
+    return { status: 401 };
+  }, "#run=run_reload");
+  await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(requests, ["/v1/runs/run_reload/snapshot"]);
+  assert.equal(node("run-id").value, "run_reload");
+  assert.equal(node("connection-status").textContent, "Session invalid");
+
+  const selection = dashboardContext(() => new Promise(() => {}));
+  void runInContext('loadRun("run_selected")', selection.context);
+  assert.equal(selection.location.hash, "#run=run_selected");
+  await runInContext('loadRun("")', selection.context);
+  assert.equal(selection.location.hash, "");
+});
+
+test("pending Pause and Cancel explain the wait without projecting a terminal state or sending twice", () => {
+  for (const kind of ["pause", "cancel"]) {
+    let requests = 0;
+    const { context, node } = dashboardContext(() => { requests++; return new Promise(() => {}); });
+    context.crypto = { getRandomValues: (bytes: Uint8Array) => bytes.fill(1) };
+    runInContext(`currentSession = {
+      runId: "run_pending", controller: new AbortController(), artifactControllers: new Set(),
+      hasSnapshot: true, currentState: "EXECUTE", stateVersion: 5, snapshot: {},
+    };`, context);
+    void runInContext(`submitRunMutation(currentSession, "${kind}", {}, "${kind}")`, context);
+    void runInContext(`submitRunMutation(currentSession, "${kind}", {}, "${kind}")`, context);
+    assert.match(node("page-status").textContent, /not yet confirmed/u);
+    assert.equal(runInContext("currentSession.currentState", context), "EXECUTE");
+    assert.equal(requests, 1);
+    assert.equal(node("pause-control").disabled, true);
+  }
+});
+
+test("Pause and Resume require projected live coordinator authority, including after restart", () => {
+  const { context, node } = dashboardContext();
+  for (const state of ["EXECUTE", "HUMAN_GATE", "NEXT_PHASE", "PAUSED"]) {
+    runInContext(`updateMutationControls({ currentState: "${state}", snapshot: { controls: { pause: false, resume: false } } })`, context);
+    assert.equal(node("pause-control").disabled, true);
+    assert.equal(node("resume-control").disabled, true);
+  }
+  runInContext('updateMutationControls({ currentState: "EXECUTE", snapshot: { controls: { pause: true, resume: false } } })', context);
+  assert.equal(node("pause-control").disabled, false);
+  runInContext('updateMutationControls({ currentState: "PAUSED", snapshot: { controls: { pause: false, resume: true } } })', context);
+  assert.equal(node("resume-control").disabled, false);
+});
 
 test("dashboard renders added supervision facts as inert text in the existing Overview regions", () => {
   const { context, node, createdTags } = dashboardContext();

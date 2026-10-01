@@ -375,7 +375,9 @@ function renderHumanGate(snapshot, session) {
 
   const options = asArray(item.options);
   if (options.length === 0) {
-    addEmpty(elements.humanGate, "No options are recorded.", "p");
+    addEmpty(elements.humanGate, asObject(snapshot.run).state === "PAUSED" && asObject(snapshot.controls).resume === true
+      ? "Resume the paused run to make its human gate actions available."
+      : "No human gate actions are currently available.", "p");
     return;
   }
   const noteLabel = makeText("label", "Optional note", "gate-note-label");
@@ -630,8 +632,9 @@ function updateMutationControls(session) {
   const busy = invalid || session.mutationInFlight === true;
   const steerBytes = updateSteerByteCount();
   const cancelBytes = new TextEncoder().encode(elements.cancelReason.value).length;
-  elements.pauseControl.disabled = busy || terminal || state === "PAUSED";
-  elements.resumeControl.disabled = busy || state !== "PAUSED";
+  const availability = asObject(asObject(session.snapshot).controls);
+  elements.pauseControl.disabled = busy || terminal || state === "PAUSED" || availability.pause !== true;
+  elements.resumeControl.disabled = busy || state !== "PAUSED" || availability.resume !== true;
   elements.steerText.disabled = busy || terminal;
   elements.steerSubmit.disabled = busy || terminal || elements.steerText.value.length === 0 || steerBytes > 4096;
   elements.cancelReason.disabled = busy || terminal;
@@ -748,6 +751,14 @@ async function submitRunMutation(session, command, payload, kind, gateId) {
   clearSessionNotice(session);
   session.mutationInFlight = true;
   updateMutationControls(session);
+  const pendingMessages = {
+    pause: "Requesting Pause; waiting for a safe boundary. The run is not yet confirmed paused.",
+    resume: "Requesting Resume; continuation is not yet confirmed.",
+    cancel: "Requesting cancellation; terminal cancellation is not yet confirmed.",
+    steer: "Queuing Steer; acceptance is not yet confirmed.",
+    gate: "Submitting the human gate choice; resolution is not yet confirmed.",
+  };
+  setSessionNotice(session, pendingMessages[kind], "warning");
   try {
     let sent;
     try {
@@ -861,9 +872,11 @@ async function startRun(event) {
     return;
   }
   elements.startRunInput.value = runId;
+  rememberRunSelection(runId);
   startInFlight = true;
   elements.startButton.disabled = true;
   clearPageStatus();
+  setPageStatus("Requesting Start; coordinator acceptance is not yet confirmed.", "warning");
   try {
     let sent;
     try {
@@ -1177,8 +1190,13 @@ function resetDashboard() {
   elements.activity.replaceChildren();
 }
 
+function rememberRunSelection(runId) {
+  window.history.replaceState(null, "", runId === "" ? window.location.pathname + window.location.search : "#run=" + encodeURIComponent(runId));
+}
+
 async function loadRun(runId, notice) {
   if (pageSessionInvalid) return currentSession;
+  rememberRunSelection(runId);
   stopSession();
   resetDashboard();
   elements.runInput.value = runId;
@@ -1331,4 +1349,6 @@ if (apiToken === "") {
 } else {
   setConnection("Not connected", "idle");
   clearPageStatus();
+  const selectedRun = new URLSearchParams(window.location.hash.slice(1)).get("run");
+  if (selectedRun !== null && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/u.test(selectedRun)) void loadRun(selectedRun);
 }

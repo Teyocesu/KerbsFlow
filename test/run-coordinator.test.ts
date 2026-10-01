@@ -134,6 +134,7 @@ test("Pause waits for owned work, concurrent Resume commits once, and later Canc
     coordinator.start(started);
     await driver.started.promise;
     const pauseRequest = controlRequest(started.runId, 1, "command_coord_pause", "coord:pause");
+    assert.deepEqual(coordinator.getControlAvailability(started.runId), { pause: true, resume: false });
     let pauseFinished = false;
     const pause = coordinator.pause(pauseRequest).then((result) => {
       pauseFinished = true;
@@ -148,6 +149,7 @@ test("Pause waits for owned work, concurrent Resume commits once, and later Canc
     assert.equal(paused.to, "PAUSED");
     assert.equal(fixture.store.getRun(started.runId)?.state, "PAUSED");
     assert.equal(driver.continued.settled, false, "the drive must remain blocked until Resume commits");
+    assert.deepEqual(coordinator.getControlAvailability(started.runId), { pause: false, resume: true });
 
     const resumeRequest = controlRequest(started.runId, paused.stateVersion, "command_coord_resume", "coord:resume");
     const resume = coordinator.resume(resumeRequest);
@@ -165,6 +167,7 @@ test("Pause waits for owned work, concurrent Resume commits once, and later Canc
     await driver.continued.promise;
     await driver.done.promise;
     assert.equal(driver.calls, 1, "Resume must continue the owned drive rather than create another one");
+    assert.deepEqual(coordinator.getControlAvailability(started.runId), { pause: false, resume: false }, "settled drives cannot advertise live controls");
     const cancelled = await coordinator.cancel(cancelRequest(started.runId, resumed.stateVersion, "command_coord_later_cancel", "coord:later-cancel"));
     assert.equal(cancelled.to, "CANCELLED");
     const replay = await coordinator.resume(resumeRequest);
@@ -360,6 +363,7 @@ test("startup refuses to report an unfinished historical Start as a live drive",
     const historicalStart = fixture.core.startRun(runId, original.objective, original.idempotencyKey, original.commandId);
     const coordinator = fixture.coordinator(driver);
     assert.equal(coordinator.activeRunId, runId);
+    assert.deepEqual(coordinator.getControlAvailability(runId), { pause: false, resume: false }, "startup persistence supplies no live continuation");
 
     assert.throws(
       () => coordinator.start(original),

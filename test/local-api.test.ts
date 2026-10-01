@@ -60,7 +60,7 @@ interface RequestOptions {
 }
 
 type LocalApiCore = Pick<KerbsFlowCore, "readModel" | "steer" | "configuration">;
-type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate" | "getActionableGateOptionIds">;
+type LocalApiCoordinator = Pick<RunCoordinator, "start" | "pause" | "resume" | "cancel" | "resolveGate" | "getActionableGateOptionIds" | "getControlAvailability">;
 
 interface RunningApi {
   fixture: ApiFixture;
@@ -178,6 +178,7 @@ function localApiCore(fixture: ApiFixture, overrides: Partial<LocalApiCore> = {}
 
 function localApiCoordinator(fixture: ApiFixture, overrides: Partial<LocalApiCoordinator> = {}): LocalApiCoordinator {
   return {
+    getControlAvailability: (runId) => overrides.getControlAvailability?.(runId) ?? { pause: false, resume: false },
     start: (request) => (overrides.start ?? ((value: CoordinatorStartRequest) => fixture.core.startRun(
       value.runId,
       value.objective,
@@ -1103,7 +1104,8 @@ test("snapshot returns a bounded persisted projection and omits artifact paths",
       artifacts: Array<Record<string, unknown>>;
       transitionCursor: number;
     };
-    assert.deepEqual(Object.keys(snapshot).sort(), ["activeAttempt", "artifacts", "currentGate", "currentTask", "latestReview", "latestValidation", "pendingSteer", "project", "recentTransitions", "run", "schemaVersion", "supervision", "transitionCursor"].sort());
+    assert.deepEqual(Object.keys(snapshot).sort(), ["activeAttempt", "artifacts", "controls", "currentGate", "currentTask", "latestReview", "latestValidation", "pendingSteer", "project", "recentTransitions", "run", "schemaVersion", "supervision", "transitionCursor"].sort());
+    assert.deepEqual(snapshot.controls, { pause: false, resume: false });
     assert.equal(snapshot.schemaVersion, "kerbsflow.local-snapshot/v1");
     assert.equal(snapshot.run.runId, runId);
     assert.equal(snapshot.run.phase, "verification");
