@@ -279,6 +279,7 @@ export class RunCoordinator {
   }
 
   pause(request: CoordinatorControlRequest): Promise<CommandResult> {
+    request = { ...request };
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
       commandId: request.commandId,
@@ -376,6 +377,7 @@ export class RunCoordinator {
   }
 
   cancel(request: CoordinatorCancelRequest): Promise<CommandResult> {
+    request = { ...request };
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
       commandId: request.commandId,
@@ -440,6 +442,7 @@ export class RunCoordinator {
   }
 
   resolveGate(request: CoordinatorGateResolutionRequest): Promise<CommandResult> {
+    request = { ...request };
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
       commandId: request.commandId,

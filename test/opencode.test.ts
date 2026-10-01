@@ -466,6 +466,72 @@ test("late acquired host closes without waiting for inspection after shutdown ti
   }
 });
 
+test("the execution deadline also bounds preparation and the event stream before wait", async () => {
+  for (const boundary of ["preparation", "events"] as const) {
+    const gate = deferred<void>();
+    const fixture = adapterFixture(boundary === "preparation" ? { modelListGate: gate } : {});
+    const entered = deferred<void>();
+    if (boundary === "events") {
+      fixture.host.sessions.log = (_input, options) => (async function* () {
+        entered.resolve();
+        await waitForGate(gate, options?.signal);
+      })();
+    }
+    const request = { ...executionRequest(fixture.root, `attempt_timeout_${boundary}`), timeoutMs: 25 };
+    const handle = fixture.adapter.start(request);
+    const observation = (async () => {
+      for await (const _event of fixture.adapter.events(handle)) { /* Core drains events before wait. */ }
+      return fixture.adapter.wait(handle);
+    })();
+    let guard: NodeJS.Timeout | undefined;
+    try {
+      await (boundary === "preparation" ? fixture.host.modelListEntered.promise : entered.promise);
+      const outcome = await Promise.race([
+        observation.then(value => ({ kind: "settled" as const, value })),
+        new Promise<{ kind: "hung" }>(resolve => { guard = setTimeout(() => resolve({ kind: "hung" }), 250); }),
+      ]);
+      assert.equal(outcome.kind, "settled", "the timeout must apply before Core reaches adapter.wait");
+      if (outcome.kind === "settled") assert.throws(() => parseExecutorResult(outcome.value));
+      if (boundary === "preparation") assert.equal(fixture.host.createCalls, 0);
+      else {
+        assert.equal(fixture.host.interrupts, 1);
+        assert.equal((await fixture.adapter.reconcile(request)).outcome, "terminal");
+      }
+    } finally {
+      if (guard !== undefined) clearTimeout(guard);
+      gate.resolve();
+      await observation;
+      await fixture.adapter.close().catch(() => undefined);
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }
+});
+
+test("shutdown during acquired-host inspection closes that exact host only once", async () => {
+  const fixture = adapterFixture();
+  const inspection = deferred<void>();
+  const entered = deferred<void>();
+  fixture.host.server.info = async () => {
+    entered.resolve();
+    await inspection.promise;
+    return { version: OPENCODE_SDK_VERSION, pid: process.pid, urls: [], paths: { tmp: "/synthetic/opencode" } };
+  };
+  const readiness = assert.rejects(fixture.adapter.readiness(fixture.root), /cannot open after close begins/);
+  try {
+    await entered.promise;
+    await fixture.adapter.close();
+    assert.equal(fixture.host.closed, 1);
+    inspection.resolve();
+    await readiness;
+    assert.equal(fixture.host.closed, 1, "late inspection cannot close an already retired host again");
+  } finally {
+    inspection.resolve();
+    await readiness;
+    await fixture.adapter.close().catch(() => undefined);
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("close before session creation aborts preparation and proves that no session exists", async () => {
   const modelGate = deferred<void>();
   const fixture = adapterFixture({ modelListGate: modelGate });
@@ -532,6 +598,86 @@ test("possible provider dispatch with unknown terminal state makes close uncerta
     assert.equal(fixture.host.closed, 1);
   } finally {
     promptGate.resolve();
+    fixture.cleanup();
+  }
+});
+
+test("reconciliation bounds stalled provider inspection without claiming a terminal state", async () => {
+  const fixture = adapterFixture();
+  const inspection = deferred<void>();
+  const originalGet = fixture.host.sessions.get;
+  let guard: NodeJS.Timeout | undefined;
+  try {
+    const request = { ...executionRequest(fixture.root, "attempt_stalled_reconcile"), timeoutMs: 25 };
+    const handle = fixture.adapter.start(request);
+    for await (const _event of fixture.adapter.events(handle)) { /* acquire the durable session */ }
+    fixture.host.sessions.get = async (input) => { await inspection.promise; return originalGet(input); };
+    const outcome = await Promise.race([
+      fixture.adapter.reconcile(request),
+      new Promise<"hung">((resolve) => { guard = setTimeout(() => resolve("hung"), 250); }),
+    ]);
+    assert.notEqual(outcome, "hung");
+    if (outcome !== "hung") {
+      assert.equal(outcome.outcome, "unknown");
+      assert.match(outcome.summary, /timed out/i);
+    }
+  } finally {
+    if (guard !== undefined) clearTimeout(guard);
+    inspection.resolve();
+    await fixture.adapter.close().catch(() => undefined);
+    fixture.cleanup();
+  }
+});
+
+test("shutdown bounds stalled session inspection and still retires its owned host", async () => {
+  const fixture = adapterFixture();
+  const inspection = deferred<void>();
+  const originalGet = fixture.host.sessions.get;
+  let guard: NodeJS.Timeout | undefined;
+  try {
+    const handle = fixture.adapter.start(executionRequest(fixture.root, "attempt_stalled_shutdown"));
+    for await (const _event of fixture.adapter.events(handle)) { /* acquire the durable session */ }
+    fixture.host.sessions.get = async (input) => { await inspection.promise; return originalGet(input); };
+    const closing = fixture.adapter.close();
+    const outcome = await Promise.race([
+      closing.then(() => "clean", (error: unknown) => error),
+      new Promise<string>((resolve) => { guard = setTimeout(() => resolve("hung"), 250); }),
+    ]);
+    assert.notEqual(outcome, "hung", "shutdown must bound provider inspection before host retirement");
+    assert.match(String(outcome), /unproven active sessions/i);
+    assert.equal(fixture.host.closed, 1);
+  } finally {
+    if (guard !== undefined) clearTimeout(guard);
+    inspection.resolve();
+    await fixture.adapter.close().catch(() => undefined);
+    fixture.cleanup();
+  }
+});
+
+test("stalled host retirement remains uncertain and late completion cannot rewrite close", async () => {
+  const fixture = adapterFixture();
+  const retirement = deferred<void>();
+  const originalClose = fixture.host.close.bind(fixture.host);
+  let guard: NodeJS.Timeout | undefined;
+  fixture.host.close = async () => { await retirement.promise; await originalClose(); };
+  try {
+    await fixture.adapter.readiness(fixture.root);
+    const closing = fixture.adapter.close();
+    const outcome = await Promise.race([
+      closing.then(() => "clean", (error: unknown) => error),
+      new Promise<string>((resolve) => { guard = setTimeout(() => resolve("hung"), 250); }),
+    ]);
+    assert.notEqual(outcome, "hung");
+    assert.match(String(outcome), /close coordination deadline/i);
+    retirement.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(fixture.host.closed, 1);
+    await assert.rejects(fixture.adapter.close(), /close coordination deadline/i);
+    assert.equal(fixture.host.closed, 1);
+  } finally {
+    if (guard !== undefined) clearTimeout(guard);
+    retirement.resolve();
+    await fixture.adapter.close().catch(() => undefined);
     fixture.cleanup();
   }
 });

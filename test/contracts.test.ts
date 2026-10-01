@@ -86,6 +86,24 @@ test("configuration precedence rejects lower-layer hard-invariant relaxation", (
   }), ContractValidationError);
 });
 
+test("validated configuration retains its policy when caller-owned layers mutate", () => {
+  const layers = {
+    hardInvariants: { ...DEFAULT_HARD_INVARIANTS },
+    projectPolicy: { ...DEFAULT_PROJECT_POLICY, allowedAdapters: ["fake"] },
+    userPreferences: { ...DEFAULT_USER_PREFERENCES },
+    runOverride: { ...DEFAULT_RUN_OVERRIDE },
+  };
+  const configuration = mergeConfiguration(layers);
+  layers.projectPolicy.allowedAdapters.push("codex");
+  layers.projectPolicy.validationLevel = "full";
+  layers.projectPolicy.maxImplementationAttempts = 1;
+  assert.deepEqual(configuration.projectPolicy.allowedAdapters, ["fake"]);
+  assert.equal(configuration.projectPolicy.validationLevel, "focused");
+  assert.equal(configuration.projectPolicy.maxImplementationAttempts, 2);
+  assert.throws(() => configuration.projectPolicy.allowedAdapters.push("codex"), TypeError);
+  assert.throws(() => { configuration.effectiveMaxImplementationAttempts = 1; }, TypeError);
+});
+
 test("configuration precedence permits only a policy-approved narrowing", () => {
   const configuration = mergeConfiguration({
     hardInvariants: DEFAULT_HARD_INVARIANTS,

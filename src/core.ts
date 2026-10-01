@@ -8,6 +8,7 @@ import {
   CommandId,
   CommandResult,
   CONTRACT_VERSIONS,
+  ContractValidationError,
   ExecutorResult,
   FailureClassification,
   HumanGate,
@@ -583,10 +584,11 @@ export class KerbsFlowCore {
     let parsed: ExecutorResult | undefined;
     let malformedReason: string | undefined;
     try {
-      parsed = parseExecutorResult(rawJson);
-      if (parsed.runId !== runId || parsed.taskId !== attempt.taskId || parsed.attemptId !== attempt.attemptId) {
-        throw new KerbsFlowError("RESULT_SCOPE_MISMATCH", "executor result IDs do not match the active fake attempt");
+      const candidate = parseExecutorResult(rawJson);
+      if (candidate.runId !== runId || candidate.taskId !== attempt.taskId || candidate.attemptId !== attempt.attemptId) {
+        throw new KerbsFlowError("RESULT_SCOPE_MISMATCH", "executor result IDs do not match the active attempt");
       }
+      parsed = candidate;
     } catch (error) {
       malformedReason = error instanceof Error ? error.message : "malformed executor result";
     }
@@ -1516,7 +1518,18 @@ export class KerbsFlowCore {
     if (intent === undefined) {
       throw new KerbsFlowError("CANCELLATION_INTENT_REQUIRED", "cannot reconcile cancellation without a durable intent");
     }
-    const reconciliation = await this.adapter.reconcile({ runId, taskId: attempt.taskId, attemptId: attempt.attemptId });
+    let reconciliation = await this.adapter.reconcile({ runId, taskId: attempt.taskId, attemptId: attempt.attemptId });
+    if (reconciliation.outcome === "terminal") {
+      try {
+        const result = parseExecutorResult(reconciliation.result);
+        reconciliation = result.runId === runId && result.taskId === attempt.taskId && result.attemptId === attempt.attemptId
+          ? { ...reconciliation, result }
+          : { outcome: "unknown", summary: "cancellation terminal proof does not match the owned run, task, and attempt" };
+      } catch (error) {
+        if (!(error instanceof ContractValidationError)) throw error;
+        reconciliation = { outcome: "unknown", summary: "cancellation terminal proof is malformed or incompatible" };
+      }
+    }
     const certainCancellation = reconciliation.outcome === "terminal" && reconciliation.result?.outcome === "cancelled";
     const command = commandFor(reconciliation, attempt.attemptId);
     if (command.runId !== runId) throw new KerbsFlowError("COMMAND_SCOPE_MISMATCH", "cancellation finalization command does not match its run");

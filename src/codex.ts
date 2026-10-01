@@ -19,6 +19,7 @@ import {
   type SemanticReviewRequest,
   type SemanticReviewResult,
   asValidationId,
+  parseAdapterDescriptor,
   parseExecutorResult,
   parseExecutionRequest,
   parseSemanticReviewRequest,
@@ -127,6 +128,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   private reviewDescriptor: AdapterDescriptor | undefined;
 
   constructor(private readonly options: CodexAdapterOptions) {
+    this.options = { ...options };
     this.supervisor = options.supervisor ?? new ProcessSupervisor();
     this.environment = codexEnvironment(options.environment ?? process.env);
     const runtimeRoot = ensurePrivateDirectory(options.runtimeRoot);
@@ -136,12 +138,12 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
 
   probeReview(): AdapterDescriptor {
     if (this.reviewDescriptor !== undefined) {
-      return this.reviewDescriptor;
+      return parseAdapterDescriptor(this.reviewDescriptor);
     }
     const descriptor = this.descriptor ?? this.probe();
     this.probeReviewerIsolationBoundary();
     this.reviewDescriptor = descriptor;
-    return this.reviewDescriptor;
+    return parseAdapterDescriptor(this.reviewDescriptor);
   }
 
   startReview(request: SemanticReviewRequest): SemanticReviewHandle {
@@ -301,7 +303,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
         healthProbe: true,
       },
     };
-    return this.descriptor;
+    return parseAdapterDescriptor(this.descriptor);
   }
 
   start(request: ExecutionRequest): AttemptHandle {

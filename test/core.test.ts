@@ -557,6 +557,29 @@ test("executor gate evidence is persisted as an untrusted claim", async () => {
   }
 });
 
+test("executor results for a different run, task, or attempt enter durable recovery", async () => {
+  for (const identity of [
+    { runId: asRunId("run_foreign") },
+    { taskId: "task_foreign" as ExecutorResult["taskId"] },
+    { attemptId: asAttemptId("attempt_foreign") },
+  ]) {
+    const fixture = createFixture();
+    try {
+      primeExecute(fixture);
+      const result = await fixture.core.completeFakeAttempt(fixture.runId, 4, "foreign-result", executorResultFor(fixture, identity));
+      assert.equal(result.to, "RECOVERY");
+      reopen(fixture);
+      const model = fixture.core.readModel(fixture.runId)!;
+      assert.equal(model.run.state, "RECOVERY");
+      assert.equal(model.run.recoveryRequired, true);
+      assert.equal(model.activeAttempt?.lifecycle, "UNKNOWN");
+      assert.equal(JSON.parse(model.activeAttempt!.outcomeJson!).schemaVersion, "kerbsflow.executor-result/invalid");
+    } finally {
+      fixture.close();
+    }
+  }
+});
+
 test("malformed fake output enters recovery instead of being accepted", async () => {
   const fixture = createFixture();
   try {

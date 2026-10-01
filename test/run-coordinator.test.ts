@@ -72,6 +72,37 @@ test("RunCoordinator binds Start atomically and owns only one drive across retri
   }
 });
 
+for (const kind of ["pause", "cancel"] as const) {
+  test(`pending ${kind} preserves the validated command identity when its caller reuses the request object`, async () => {
+    const fixture = makeCoordinatorFixture();
+    const driver = new BlockingDriver(fixture.store);
+    const coordinator = fixture.coordinator(driver);
+    const started = startRequest(`run_coord_alias_${kind}`);
+    try {
+      coordinator.start(started);
+      await driver.started.promise;
+      const request = cancelRequest(started.runId, 1, `command_alias_${kind}`, `alias:${kind}`);
+      const accepted = { ...request };
+      const operation = kind === "pause" ? coordinator.pause(request) : coordinator.cancel(request);
+      request.commandId = asCommandId("command_reused_request");
+      request.idempotencyKey = "reused-request";
+      request.reason = "changed after validation";
+      driver.release.resolve();
+      const result = await operation;
+      assert.equal(result.commandId, accepted.commandId);
+      assert.equal(result.idempotencyKey, accepted.idempotencyKey);
+      assert.equal(fixture.store.getCommandIdempotencyKey(request.commandId), undefined);
+      if (kind === "pause") await coordinator.cancel(cancelRequest(started.runId, result.stateVersion, "command_alias_cleanup", "alias:cleanup"));
+      await settleDriver(driver.done.promise);
+      assert.equal(coordinator.activeRunId, undefined);
+    } finally {
+      driver.release.resolve();
+      await settleDriver(driver.done.promise);
+      fixture.close();
+    }
+  });
+}
+
 test("trusted launch binding keeps its escalation route when caller configuration changes", async () => {
   const fixture = makeCoordinatorFixture();
   const higherRoute = { model: "approved-model", reasoning: "high" };

@@ -713,12 +713,17 @@ export function mergeConfiguration(layers: ConfigLayers): EffectiveConfiguration
     throw new ContractValidationError("configuration.validationLevel", "lower configuration layer cannot weaken project validation");
   }
 
-  return {
-    ...layers,
+  const allowedAdapters = [...layers.projectPolicy.allowedAdapters];
+  Object.freeze(allowedAdapters);
+  return Object.freeze({
+    hardInvariants: Object.freeze({ ...layers.hardInvariants }),
+    projectPolicy: Object.freeze({ ...layers.projectPolicy, allowedAdapters }),
+    userPreferences: Object.freeze({ ...layers.userPreferences }),
+    runOverride: Object.freeze({ ...layers.runOverride }),
     effectiveAdapter: requestedAdapter ?? layers.projectPolicy.allowedAdapters[0]!,
     effectiveMaxImplementationAttempts: maxAttempts,
     effectiveValidationLevel: validationLevel,
-  };
+  });
 }
 
 function validationRank(level: ValidationLevel): number {

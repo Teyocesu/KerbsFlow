@@ -153,6 +153,7 @@ interface OpenCodeAttempt {
   terminalEventObserved: boolean;
   streamEndedPrematurely: boolean;
   cancelPromise?: Promise<boolean>;
+  deadline?: NodeJS.Timeout;
 }
 
 const OPENCODE_SDK_PACKAGE: string = "@opencode/sdk";
@@ -205,6 +206,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   private readonly attempts = new Map<string, OpenCodeAttempt>();
   private hostPromise: Promise<OpenCodeHostBoundary> | undefined;
   private ownedHost: OpenCodeHostBoundary | undefined;
+  private readonly hostClosures = new WeakMap<OpenCodeHostBoundary, Promise<void>>();
   private closePromise: Promise<void> | undefined;
   private lifecycle: "open" | "closing" | "closed" = "open";
   private generation = 0;
@@ -296,6 +298,14 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       terminalEventObserved: false,
       streamEndedPrematurely: false,
     };
+    attempt.deadline = setTimeout(() => {
+      attempt.abort.abort(new Error("OpenCode execution timed out and requires cancellation reconciliation"));
+      const host = this.ownedHost;
+      const sessionID = attempt.session?.id;
+      if (host !== undefined && sessionID !== undefined && attempt.cancelPromise === undefined) {
+        attempt.cancelPromise = host.sessions.interrupt({ sessionID }).then(value => value.interrupted).catch(() => false);
+      }
+    }, request.timeoutMs);
     attempt.preparation = this.prepare(attempt);
     attempt.preparation.catch(() => undefined);
     this.attempts.set(request.attemptId, attempt);
@@ -306,7 +316,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     const attempt = this.requiredAttempt(handle);
     let sequence = 0;
     try {
-      await attempt.preparation;
+      await withAbort(attempt.preparation, attempt.abort.signal);
     } catch (error) {
       yield normalized(attempt, ++sequence, "failed", `OpenCode session preparation failed: ${message(error)}`, this.now());
       return;
@@ -320,7 +330,8 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     const seen = new Set<string>();
     let providerSequence: number | undefined;
     try {
-      for await (const raw of (await this.host()).sessions.log({ sessionID, after: 0, follow: true }, { signal: streamAbort.signal })) {
+      const signal = AbortSignal.any([streamAbort.signal, attempt.abort.signal]);
+      for await (const raw of (await withAbort(this.host(), signal)).sessions.log({ sessionID, after: 0, follow: true }, { signal })) {
         const event = eventRecord(raw);
         if (event === undefined) {
           yield normalized(attempt, ++sequence, "warning", "OpenCode emitted a malformed event", this.now());
@@ -366,31 +377,22 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   async wait(handle: AttemptHandle): Promise<unknown> {
     const attempt = this.requiredAttempt(handle);
     try {
-      await attempt.preparation;
+      await withAbort(attempt.preparation, attempt.abort.signal);
       const sessionID = attempt.session?.id;
       if (sessionID === undefined) throw new Error("session identity is unavailable");
-      const host = await this.host();
-      let timedOut = false;
-      const timer = setTimeout(() => {
-        timedOut = true;
-        attempt.abort.abort();
-        attempt.cancelPromise = host.sessions.interrupt({ sessionID }).then((value) => value.interrupted).catch(() => false);
-      }, attempt.request.timeoutMs);
-      try {
-        await host.sessions.wait({ sessionID }, { signal: attempt.abort.signal });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (timedOut) throw new Error("OpenCode execution timed out and requires cancellation reconciliation");
-      const session = await host.sessions.get({ sessionID });
+      const host = await withAbort(this.host(), attempt.abort.signal);
+      await host.sessions.wait({ sessionID }, { signal: attempt.abort.signal });
+      const session = await host.sessions.get({ sessionID }, { signal: attempt.abort.signal });
       attempt.session = session;
       if (session.outcome === "interrupted") return this.cancelledResult(attempt, "OpenCode session interruption is terminal");
       if (session.outcome === "failed") return this.failureResult(attempt, "OpenCode session terminated with provider failure");
       if (session.outcome !== "succeeded") throw new Error("OpenCode session has no proven terminal outcome");
-      const context = await host.sessions.context({ sessionID });
+      const context = await host.sessions.context({ sessionID }, { signal: attempt.abort.signal });
       return this.extractResult(attempt, context);
     } catch (error) {
       return invalidResult(message(error));
+    } finally {
+      if (attempt.deadline !== undefined) clearTimeout(attempt.deadline);
     }
   }
 
@@ -408,19 +410,23 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   }
 
   async reconcile(identity: { runId: RunId; taskId: TaskId; attemptId: AttemptId }): Promise<ReconcileOutcome> {
+    const local = this.attempts.get(identity.attemptId);
+    const abort = new AbortController();
+    const signal = abort.signal;
+    const deadline = setTimeout(() => abort.abort(new Error("OpenCode reconciliation timed out")), local?.request.timeoutMs ?? 1000);
     try {
-      const host = await this.host();
-      const local = this.attempts.get(identity.attemptId);
+      const host = await withAbort(this.host(), signal);
       if (local !== undefined) {
-        try { await local.preparation; } catch { /* Session lookup below is authoritative. */ }
-        if (local.cancelPromise !== undefined) await local.cancelPromise;
+        try { await withAbort(local.preparation, signal); } catch { /* Session lookup below is authoritative. */ }
+        signal.throwIfAborted();
+        if (local.cancelPromise !== undefined) await withAbort(local.cancelPromise, signal);
       }
       const known = local?.session;
-      const session = known ?? await this.findSession(host, identity);
+      const session = known ?? await withAbort(this.findSession(host, identity, signal), signal);
       if (session === undefined) {
         return { outcome: "not_found", summary: "persistent OpenCode state contains no session for this exact attempt identity" };
       }
-      const current = await host.sessions.get({ sessionID: session.id });
+      const current = await withAbort(host.sessions.get({ sessionID: session.id }, { signal }), signal);
       if (current.outcome === undefined) return { outcome: "running", summary: `OpenCode session ${session.id} remains nonterminal` };
       const attempt = local ?? this.recoveredAttempt(identity, current);
       if (current.outcome === "interrupted") {
@@ -429,11 +435,14 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       if (current.outcome === "failed") {
         return { outcome: "terminal", result: this.failureResult(attempt, "persistent OpenCode session proves provider failure"), summary: "OpenCode session is terminally failed" };
       }
-      const context = await host.sessions.context({ sessionID: current.id });
+      const context = await withAbort(host.sessions.context({ sessionID: current.id }, { signal }), signal);
       const result = this.extractResult(attempt, context);
       return { outcome: "terminal", result, summary: "OpenCode session and exact structured result are terminal" };
     } catch (error) {
       return { outcome: "unknown", summary: `OpenCode reconciliation could not prove state: ${message(error)}` };
+    } finally {
+      clearTimeout(deadline);
+      abort.abort();
     }
   }
 
@@ -446,7 +455,10 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   }
 
   private async closeOwnedHost(): Promise<void> {
-    for (const attempt of this.attempts.values()) attempt.abort.abort();
+    for (const attempt of this.attempts.values()) {
+      if (attempt.deadline !== undefined) clearTimeout(attempt.deadline);
+      attempt.abort.abort();
+    }
     const hostPromise = this.hostPromise ?? (this.ownedHost === undefined ? undefined : Promise.resolve(this.ownedHost));
     if (hostPromise === undefined) {
       this.lifecycle = "closed";
@@ -465,40 +477,39 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     const uncertain: string[] = [];
     for (const attempt of this.attempts.values()) {
       const preparation = await boundedSettlement(attempt.preparation, this.closePreparationTimeoutMs);
-      let session = attempt.session;
-      try {
-        session ??= await this.findSession(host, attempt.request);
-      } catch {
-        uncertain.push(attempt.request.attemptId);
-        continue;
-      }
-      if (session === undefined) {
-        if (preparation.status === "pending") uncertain.push(attempt.request.attemptId);
-        continue;
-      }
-      attempt.session = session;
-      try {
-        let current = await host.sessions.get({ sessionID: session.id });
+      const inspectionAbort = new AbortController();
+      const inspection = (async () => {
+        const signal = inspectionAbort.signal;
+        const session = attempt.session ?? await withAbort(this.findSession(host, attempt.request, signal), signal);
+        if (session === undefined) return preparation.status !== "pending";
+        attempt.session = session;
+        let current = await withAbort(host.sessions.get({ sessionID: session.id }, { signal }), signal);
         if (current.outcome === undefined) {
-          const outcome = await host.sessions.interrupt({ sessionID: session.id });
-          current = outcome.interrupted ? await host.sessions.get({ sessionID: session.id }) : current;
+          const outcome = await withAbort(host.sessions.interrupt({ sessionID: session.id }, { signal }), signal);
+          current = outcome.interrupted ? await withAbort(host.sessions.get({ sessionID: session.id }, { signal }), signal) : current;
         }
-        if (current.outcome === undefined) uncertain.push(attempt.request.attemptId);
-        else attempt.session = current;
-      } catch {
-        uncertain.push(attempt.request.attemptId);
-      }
+        if (current.outcome === undefined) return false;
+        attempt.session = current;
+        return true;
+      })();
+      const inspected = await boundedSettlement(inspection, this.closePreparationTimeoutMs);
+      inspectionAbort.abort();
+      if (inspected.status !== "fulfilled" || !inspected.value) uncertain.push(attempt.request.attemptId);
     }
-    try {
-      await host.close();
-    } catch (error) {
+    const closure = this.closeHost(host).then(() => {
+      this.hostPromise = undefined;
+      this.ownedHost = undefined;
+      this.lifecycle = "closed";
+    });
+    const closed = await boundedSettlement(closure, this.closePreparationTimeoutMs);
+    if (closed.status === "pending") {
+      throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", "OpenCode embedded host close did not settle before the close coordination deadline");
+    }
+    if (closed.status === "rejected") {
       this.hostPromise = undefined;
       this.lifecycle = "closed";
-      throw new KerbsFlowError("OPENCODE_CLOSE_FAILED", `OpenCode embedded host close failed: ${message(error)}`);
+      throw new KerbsFlowError("OPENCODE_CLOSE_FAILED", `OpenCode embedded host close failed: ${message(closed.reason)}`);
     }
-    this.hostPromise = undefined;
-    this.ownedHost = undefined;
-    this.lifecycle = "closed";
     if (uncertain.length > 0) {
       throw new KerbsFlowError("OPENCODE_CLOSE_UNCERTAIN", `OpenCode host closed with unproven active sessions: ${uncertain.join(", ")}`);
     }
@@ -517,10 +528,11 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       };
       this.hostPromise = this.createHost(options).then(async (host) => {
         this.ownedHost = host;
-        const rejected = this.lifecycle !== "open" ? "closing" : (await host.server.info()).urls.length !== 0 ? "listener" : undefined;
+        const info = this.lifecycle === "open" ? await host.server.info() : undefined;
+        const rejected = this.lifecycle !== "open" ? "closing" : info!.urls.length !== 0 ? "listener" : undefined;
         if (rejected !== undefined) {
           try {
-            await host.close();
+            await this.closeHost(host);
             this.ownedHost = undefined;
           } catch (error) {
             throw new KerbsFlowError("OPENCODE_CLOSE_FAILED", `OpenCode unusable host close failed: ${message(error)}`);
@@ -535,6 +547,14 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       });
     }
     return this.hostPromise;
+  }
+
+  private closeHost(host: OpenCodeHostBoundary): Promise<void> {
+    const existing = this.hostClosures.get(host);
+    if (existing !== undefined) return existing;
+    const operation = Promise.resolve().then(() => host.close());
+    this.hostClosures.set(host, operation);
+    return operation;
   }
 
   private async prepare(attempt: OpenCodeAttempt): Promise<void> {
@@ -650,12 +670,14 @@ export class OpenCodeAdapter implements ExecutorAdapter {
     return resultBase(attempt, "cancelled", "cancelled", summary, "fail", { kind: "signal", detail: summary });
   }
 
-  private async findSession(host: OpenCodeHostBoundary, identity: { runId: RunId; taskId: TaskId; attemptId: AttemptId }): Promise<OpenCodeSessionInfo | undefined> {
+  private async findSession(host: OpenCodeHostBoundary, identity: { runId: RunId; taskId: TaskId; attemptId: AttemptId }, signal?: AbortSignal): Promise<OpenCodeSessionInfo | undefined> {
     const matches: OpenCodeSessionInfo[] = [];
     const seenCursors = new Set<string>();
     let cursor: string | undefined;
     do {
-      const sessions = await host.sessions.list({ limit: 100, order: "desc", ...(cursor === undefined ? {} : { cursor }) });
+      signal?.throwIfAborted();
+      const sessions = await host.sessions.list({ limit: 100, order: "desc", ...(cursor === undefined ? {} : { cursor }) }, { ...(signal === undefined ? {} : { signal }) });
+      signal?.throwIfAborted();
       matches.push(...sessions.data.filter((session) =>
         session.metadata?.kerbsflowRunId === identity.runId
         && session.metadata?.kerbsflowTaskId === identity.taskId
@@ -726,6 +748,22 @@ export function openCodePrompt(request: ExecutionRequest): string {
     `- End with exactly ${OPENCODE_RESULT_START}, then one ExecutorResult v1 JSON object, then ${OPENCODE_RESULT_END}.`,
     "- Do not put prose or Markdown outside those terminal markers.",
   ].join("\n");
+}
+
+async function withAbort<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([
+      new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(signal.reason);
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort, { once: true });
+      }),
+      operation,
+    ]);
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort);
+  }
 }
 
 function resultBase(

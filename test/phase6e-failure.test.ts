@@ -53,6 +53,41 @@ async function nextRunStarts(stack: Phase6CStack, api: Awaited<ReturnType<typeof
   await waitFor(() => stack.store.getRun(asRunId(runId))?.state === "NEXT_PHASE" ? true : undefined, "next run completes through its own drive");
 }
 
+test("foreign or malformed cancellation proof cannot terminate or release the owned run", async () => {
+  for (const proof of ["foreign", "malformed"] as const) {
+    const stack = createPhase6CStack();
+    const runId = asRunId(`run_cancel_proof_${proof}`);
+    try {
+      const reservation = startDrive(stack, runId);
+      const handle = await stack.adapter.started.promise;
+      stack.adapter.reconcile = async () => ({
+        outcome: "terminal",
+        result: proof === "foreign"
+          ? { ...stack.adapter.finish(handle, "cancelled"), runId: asRunId("run_foreign") }
+          : { outcome: "cancelled" } as never,
+        summary: "synthetic untrusted cancellation proof",
+      });
+      const result = await stack.coordinator.cancel({
+        runId, commandId: asCommandId(`command_cancel_proof_${proof}`),
+        idempotencyKey: `cancel-proof:${proof}`,
+        expectedStateVersion: stack.store.getRun(runId)!.stateVersion,
+        reason: "test independent cancellation proof validation",
+      });
+      await reservation.drivePromise;
+      assert.equal(result.to, "RECOVERY");
+      assert.equal(stack.store.getRun(runId)?.state, "RECOVERY");
+      assert.equal(stack.store.getAttempt(handle.attemptId)?.lifecycle, "UNKNOWN");
+      assert.equal(stack.store.getCancellationIntent(handle.attemptId)?.status, "UNCERTAIN");
+      assert.equal(stack.coordinator.activeRunId, runId);
+      await stack.restartControlPlane();
+      assert.equal(stack.store.getRun(runId)?.state, "RECOVERY");
+      assert.equal(stack.coordinator.activeRunId, runId);
+    } finally {
+      await stack.close();
+    }
+  }
+});
+
 function startDrive(stack: Phase6CStack, runId: RunId) {
   stack.coordinator.start({ runId, objective: "exercise a classified failure boundary", commandId: asCommandId(`command_${runId}`), idempotencyKey: `start:${runId}`, expectedStateVersion: 0 });
   return (stack.coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown; driveSettled: boolean; pauseClaim?: unknown; cancelClaim?: unknown; failureDispositionClaim?: unknown } }).reservation;

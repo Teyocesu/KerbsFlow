@@ -33,6 +33,26 @@ test("Codex probe reports the fixture's required real-execution capabilities", (
   }
 });
 
+test("Codex binds its probed executable and protects cached capability truth from caller mutation", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-codex-binding-"));
+  try {
+    const options = { cliPath: createFakeCodex(root), runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } };
+    const adapter = new CodexAdapter(options);
+    const descriptor = adapter.probe();
+    descriptor.adapterVersion = "forged-version";
+    descriptor.capabilities.reasoningEffort.length = 0;
+    const current = adapter.probeReview();
+    assert.notEqual(current.adapterVersion, "forged-version");
+    assert.ok(current.capabilities.reasoningEffort.includes("high"));
+    options.cliPath = join(root, "unapproved-missing-executable");
+    const handle = adapter.start(executionRequest(root, "success", "attempt_bound_cli"));
+    for await (const _event of adapter.events(handle)) { /* drain owned process */ }
+    assert.equal(parseExecutorResult(await adapter.wait(handle)).outcome, "succeeded");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex executor permission configuration is workspace-only and disables external tools", () => {
   const args = codexPermissionArguments();
   const values = args.filter((_, index) => index % 2 === 1);
