@@ -187,7 +187,7 @@ for (const boundary of ["rework", "focused", "phase", "start", "events", "artifa
       }
       await reservation.drivePromise;
       const ambiguous = ["start", "events", "artifact"].includes(boundary);
-      assert.equal(stack.store.getRun(runId)?.state, ambiguous || boundary === "focused" ? "RECOVERY" : "FAILED");
+      assert.equal(stack.store.getRun(runId)?.state, ambiguous ? "RECOVERY" : boundary === "focused" ? "HUMAN_GATE" : "FAILED");
       assert.equal(reservation.failureDispositionClaim, undefined);
       assert.equal(JSON.stringify(stack.store.listTransitions(runId)).includes(error.message), false);
       assert.equal(JSON.stringify(await api.snapshot(runId)).includes("synthetic-sensitive-value"), false);
@@ -201,7 +201,9 @@ for (const boundary of ["rework", "focused", "phase", "start", "events", "artifa
       } else {
         if (boundary === "focused") {
           const run = stack.store.getRun(runId)!;
-          assert.equal(run.recoveryRequired, true);
+          assert.equal(run.recoveryRequired, false);
+          assert.equal(stack.store.readModel(runId)?.activeAttempt?.lifecycle, "SUCCEEDED");
+          assert.deepEqual(stack.store.readModel(runId)?.currentGate?.gate.options.map(option => option.target), ["FAILED", "CANCELLED"]);
           assert.equal((await api.post(`/v1/runs/${runId}/cancel`, run.stateVersion, { reason: "cancel after the executor is proven terminal" })).status, 200);
         }
         assert.equal(stack.coordinator.activeRunId, undefined);
@@ -243,7 +245,7 @@ for (const boundary of ["intake", "focused"] as const) {
           await stack.coordinator.resume({ runId, commandId: asCommandId(`command_resume_${boundary}`), idempotencyKey: `failure-control:resume:${boundary}`, expectedStateVersion: paused.stateVersion });
         }
         await reservation.drivePromise;
-        assert.equal(stack.store.getRun(runId)?.state, control === "cancel" ? "CANCELLED" : boundary === "intake" ? "FAILED" : "RECOVERY");
+        assert.equal(stack.store.getRun(runId)?.state, control === "cancel" ? "CANCELLED" : boundary === "intake" ? "FAILED" : "HUMAN_GATE");
         assert.equal(reservation.failureDispositionClaim, undefined);
         assert.equal(stack.adapter.requests.length, boundary === "intake" ? 0 : 1);
       } finally {

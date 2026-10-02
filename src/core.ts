@@ -325,8 +325,10 @@ export class KerbsFlowCore {
         return { details: { reasonCode, existingDisposition: run.state } } satisfies CommandMutation;
       }
       const attempt = run.activeAttemptId === null ? undefined : this.attemptInTransaction(tx, run.activeAttemptId);
+      const succeeded = run.state === "VERIFY_FOCUSED" && attempt?.lifecycle === "SUCCEEDED"
+        && this.validatePersistedExecutorResultForRecovery(runId, run.currentTaskId, run.activeAttemptId, attempt).outcome === "succeeded";
       const uncertain = attempt !== undefined && !isTerminalAttempt(attempt.lifecycle);
-      if (uncertain || run.state === "EXECUTE" || run.state === "VERIFY_FOCUSED") {
+      if (uncertain || run.state === "EXECUTE" || (run.state === "VERIFY_FOCUSED" && !succeeded)) {
         if (!isLegalTransition(run.state, "RECOVERY")) {
           throw new KerbsFlowError("DRIVE_DISPOSITION_UNSAFE", "an uncertain attempt has no legal recovery transition at this boundary");
         }
@@ -341,12 +343,13 @@ export class KerbsFlowCore {
       assertLegalTransition(run.state, target);
       let gate: HumanGate | undefined;
       if (target === "HUMAN_GATE") {
+        const artifact = succeeded ? tx.get("SELECT artifact_id FROM artifacts WHERE run_id = ? AND attempt_id = ? AND kind = ?", runId, run.activeAttemptId!, "executor-result") : undefined;
         gate = parseHumanGate({
           schemaVersion: CONTRACT_VERSIONS.humanGate,
           gateId: asGateId(nextId("gate")), runId,
           ...(run.currentTaskId === null ? {} : { taskId: run.currentTaskId }),
           ...(run.activeAttemptId === null ? {} : { attemptId: run.activeAttemptId }),
-          reasonCode, summary, evidenceRefs: [],
+          reasonCode, summary, evidenceRefs: artifact === undefined ? [] : [String(artifact.artifact_id)],
           options: [
             { id: "fail", label: "Fail and preserve evidence", consequence: "Stop this run and retain its worktree and artifacts for manual review.", target: "FAILED" },
             { id: "cancel", label: "Cancel and preserve evidence", consequence: "Cancel this run and retain its worktree and artifacts for manual review.", target: "CANCELLED" },

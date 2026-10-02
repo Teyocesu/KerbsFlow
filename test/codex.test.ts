@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -516,6 +516,54 @@ test("Codex reviewer terminal failure sanitizes its exact staging before returni
     assert.deepEqual(await adapter.waitReview(handle), returned);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+for (const staging of ["unproven", "sanitized", "absent"] as const) {
+  test(`live and restarted cancellation honor terminal staging safety: ${staging}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "kerbsflow-cancel-staging-"));
+    const marker = "sk-syntheticcancelcredential";
+    const cliPath = createFakeCodex(root);
+    const injected = staging === "unproven"
+      ? `mkdirSync(resultPath); writeFileSync(resultPath + '/private-diagnostic', ${JSON.stringify(marker)});`
+      : staging === "sanitized" ? `writeFileSync(resultPath, ${JSON.stringify(marker)});` : "";
+    writeFileSync(cliPath, readFileSync(cliPath, "utf8")
+      .replace('import { writeFileSync }', 'import { writeFileSync, mkdirSync }')
+      .replace('if (scenario === "cancel-output") writeFileSync("partial.txt", "retain me\\n");',
+        `if (scenario === "cancel-output") { ${injected} writeFileSync("partial.txt", "retain me\\n"); }`));
+    const adapter = new CodexAdapter({ cliPath, runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    const request = executionRequest(root, "cancel-output", `attempt_cancel_${staging}`);
+    const handle = adapter.start(request);
+    try {
+      const deadline = Date.now() + 5000;
+      while (!existsSync(join(root, "partial.txt"))) {
+        assert.ok(Date.now() < deadline, "provider must construct staging before cancellation");
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      adapter.cancel(handle, "cancel the exact synthetic process");
+      const live = await adapter.reconcile(request);
+      const restarted = new CodexAdapter({ cliPath, runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+      const recovered = await restarted.reconcile(request);
+      for (const result of [live, recovered, await adapter.reconcile(request), await restarted.reconcile(request)]) {
+        assert.equal(result.outcome, staging === "unproven" ? "unknown" : "terminal");
+        assert.equal(result.result?.outcome, staging === "unproven" ? undefined : "cancelled");
+        assert.doesNotMatch(JSON.stringify(result), new RegExp(marker));
+      }
+      const waited = await adapter.wait(handle);
+      assert.throws(() => parseExecutorResult(waited));
+      assert.doesNotMatch(JSON.stringify(waited), new RegExp(marker));
+      const resultPath = join(root, "codex-attempts", request.attemptId, "executor-result.json");
+      if (staging === "unproven") {
+        assert.equal(readFileSync(join(resultPath, "private-diagnostic"), "utf8"), marker, "unproven staging is retained privately, never promoted");
+      } else if (staging === "sanitized") {
+        assert.doesNotMatch(readFileSync(resultPath, "utf8"), new RegExp(marker));
+        assert.ok(readFileSync(resultPath).byteLength < 1024);
+      } else assert.equal(existsSync(resultPath), false, "cancellation needs process proof, not executor JSON");
+    } finally {
+      adapter.cancel(handle, "settle fixture before cleanup");
+      await adapter.processEvidence(handle.attemptId);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("public Codex smoke rejects absent opt-in before CLI invocation and proves its bounded phase with a synthetic CLI", () => {
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-public-smoke-"));

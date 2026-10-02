@@ -62,6 +62,11 @@ interface CodexReviewSession {
   processResult?: ProcessResult;
 }
 
+type TerminalStagingOutcome =
+  | { safety: "safe"; raw?: unknown }
+  | { safety: "sanitized"; error: string }
+  | { safety: "unproven"; error: string };
+
 export const CODEX_PERMISSION_PROFILE = "kerbsflow-worktree";
 export const CODEX_REVIEW_PERMISSION_PROFILE = "kerbsflow-review";
 
@@ -213,7 +218,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       }
       yield normalizeReviewEvent(session.request, event);
     }
-    const result = await this.awaitReviewProcess(session);
+    const { processResult: result } = await this.awaitTerminalProcess(session);
     if (result.eventsTruncated) {
       yield normalizedReview(session.request, sequence + 1, "warning", "Codex reviewer JSONL capture was truncated");
     }
@@ -221,9 +226,8 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
 
   async waitReview(handle: SemanticReviewHandle): Promise<unknown> {
     const session = this.requiredReviewSession(handle.reviewAttemptId);
-    const processResult = await this.awaitReviewProcess(session);
-    const staged = terminalStaging(this.reviewsRoot, session.directory, session.resultPath, processResult.identity);
-    if (staged.error !== undefined) return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: staged.error };
+    const { processResult, staged } = await this.awaitTerminalProcess(session);
+    if (staged.safety !== "safe") return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: staged.error };
     if (processResult.events.some((event) => event.malformed) || processResult.exitKind !== "normal" || processResult.exitCode !== 0 || !existsSync(session.resultPath)) {
       return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: "reviewer did not produce a trustworthy terminal result" };
     }
@@ -369,7 +373,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       }
       yield normalizeCodexEvent(session.request, event);
     }
-    const result = await this.awaitProcess(session);
+    const { processResult: result } = await this.awaitTerminalProcess(session);
     if (result.eventsTruncated) {
       yield normalized(session.request, sequence + 1, "warning", "Codex JSONL capture was truncated by the configured bound");
     }
@@ -377,9 +381,12 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
 
   async wait(handle: AttemptHandle): Promise<unknown> {
     const session = this.requiredSession(handle.attemptId);
-    const processResult = await this.awaitProcess(session);
-    const staged = terminalStaging(this.attemptsRoot, session.directory, session.resultPath, processResult.identity);
-    if (staged.error !== undefined) return invalidResult(staged.error, processResult);
+    const { processResult, staged } = await this.awaitTerminalProcess(session);
+    return this.terminalResult(session, processResult, staged);
+  }
+
+  private terminalResult(session: CodexSession, processResult: ProcessResult, staged: TerminalStagingOutcome): unknown {
+    if (staged.safety !== "safe") return invalidResult(staged.error, processResult);
     const malformed = processResult.events.some((event) => event.malformed);
     if (malformed) {
       return invalidResult("Codex emitted malformed JSONL; terminal output is not trusted", processResult);
@@ -418,7 +425,8 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   async reconcile(identity: { runId: ExecutionRequest["runId"]; taskId: ExecutionRequest["taskId"]; attemptId: AttemptId }): Promise<ReconcileOutcome> {
     const live = this.sessions.get(identity.attemptId);
     if (live !== undefined) {
-      const settled = await this.awaitProcess(live);
+      const { processResult: settled, staged } = await this.awaitTerminalProcess(live);
+      if (staged.safety === "unproven") return { outcome: "unknown", summary: staged.error };
       if (
         settled.cancellationRequested
         && (settled.gracefulSignalSent || settled.forcedSignalSent)
@@ -435,7 +443,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
           summary: "owned supervisor observed the cancellation-requested process terminate",
         };
       }
-      const result = await this.wait(live.handle);
+      const result = this.terminalResult(live, settled, staged);
       try {
         return { outcome: "terminal", result: parseExecutorResult(result), summary: "owned supervisor observed a valid terminal result" };
       } catch {
@@ -457,7 +465,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       return { outcome: "unknown", summary: "the durable Codex process group may still exist; terminal output cannot be trusted after restart" };
     }
     const staged = terminalStaging(this.attemptsRoot, directory, join(directory, "executor-result.json"), metadata.process);
-    if (staged.error !== undefined) return { outcome: "unknown", summary: staged.error };
+    if (staged.safety === "unproven") return { outcome: "unknown", summary: staged.error };
     const processResultPath = join(directory, "process-result.json");
     if (!existsSync(processResultPath)) {
       return { outcome: "unknown", summary: "durable process-result evidence is missing after restart" };
@@ -482,6 +490,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
         summary: "durable process evidence proves the cancellation-requested process terminated",
       };
     }
+    if (staged.safety === "sanitized") return { outcome: "unknown", summary: staged.error };
     if (processEvidence.exitKind !== "normal" || processEvidence.exitCode !== 0 || processEvidence.signal !== null) {
       return { outcome: "unknown", summary: `durable process evidence does not prove normal exit 0 (${processEvidence.exitKind}, ${String(processEvidence.exitCode)})` };
     }
@@ -517,27 +526,17 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
 
   async processEvidence(attemptId: AttemptId): Promise<ProcessResult | undefined> {
     const session = this.sessions.get(attemptId);
-    return session === undefined ? undefined : this.awaitProcess(session);
+    return session === undefined ? undefined : (await this.awaitTerminalProcess(session)).processResult;
   }
 
-  private async awaitProcess(session: CodexSession): Promise<ProcessResult> {
+  private async awaitTerminalProcess(session: CodexSession | CodexReviewSession): Promise<{ processResult: ProcessResult; staged: TerminalStagingOutcome }> {
     const completed = await session.process.completion;
-    terminalStaging(dirname(session.directory), session.directory, session.resultPath, completed.identity);
+    const staged = terminalStaging(dirname(session.directory), session.directory, session.resultPath, completed.identity);
     if (session.processResult === undefined) {
       writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
       session.processResult = completed;
     }
-    return session.processResult;
-  }
-
-  private async awaitReviewProcess(session: CodexReviewSession): Promise<ProcessResult> {
-    const completed = await session.process.completion;
-    terminalStaging(dirname(session.directory), session.directory, session.resultPath, completed.identity);
-    if (session.processResult === undefined) {
-      writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-      session.processResult = completed;
-    }
-    return session.processResult;
+    return { processResult: session.processResult, staged };
   }
 
   private requiredSession(attemptId: AttemptId): CodexSession {
@@ -665,13 +664,13 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   }
 }
 
-function terminalStaging(root: string, directory: string, resultPath: string, identity: ProcessIdentity): { raw?: unknown; error?: string } {
-  if (!processGroupIsAbsent(identity.pid, identity.processGroup)) return { error: "terminal staging still has possible live process ownership; retained privately" };
+function terminalStaging(root: string, directory: string, resultPath: string, identity: ProcessIdentity): TerminalStagingOutcome {
+  if (!processGroupIsAbsent(identity.pid, identity.processGroup)) return { safety: "unproven", error: "terminal staging still has possible live process ownership; retained privately" };
   try {
     const canonicalRoot = realpathSync(root);
     if (lstatSync(directory).isSymbolicLink() || realpathSync(directory) !== directory || !pathIsWithin(canonicalRoot, directory) || dirname(directory) !== canonicalRoot || dirname(resultPath) !== directory) throw new Error("staging ownership cannot be proven");
     const name = basename(resultPath);
-    if (!existsSync(resultPath)) return {};
+    if (!existsSync(resultPath)) return { safety: "safe" };
     let raw: unknown;
     let rejected = false;
     try {
@@ -682,13 +681,18 @@ function terminalStaging(root: string, directory: string, resultPath: string, id
         rejected = containsLikelySecret(raw);
       }
     } catch { rejected = true; }
+    const alreadySanitized = typeof raw === "object" && raw !== null
+      && "redacted" in raw && raw.redacted === true
+      && "reason" in raw && raw.reason === "untrusted terminal staging rejected";
     if (rejected) {
       atomicWritePrivateFile(directory, name, JSON.stringify({ redacted: true, reason: "untrusted terminal staging rejected" }), true);
-      return { error: "terminal staging was oversized, malformed or sensitive; sanitized and rejected" };
     }
-    return { raw };
+    if (rejected || alreadySanitized) {
+      return { safety: "sanitized", error: "terminal staging was oversized, malformed or sensitive; sanitized and rejected" };
+    }
+    return { safety: "safe", raw };
   } catch {
-    return { error: "terminal staging sanitation could not be proven; no result promoted" };
+    return { safety: "unproven", error: "terminal staging sanitation could not be proven; no result promoted" };
   }
 }
 

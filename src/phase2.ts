@@ -123,20 +123,7 @@ export class Phase2Loop {
     try {
       return await this.drive(request, controls);
     } catch (error) {
-      const category = classifyInitialPlanningFailure(error);
-      if (category === "control" || category === "integrity") throw error;
-      if (controls.claimFailureDisposition === undefined) await controls.checkpoint?.();
-      const boundary = await controls.claimFailureDisposition?.();
-      try {
-        const current = this.store.getRun(request.runId);
-        if (current === undefined) throw error;
-        const disposition = this.core.disposeDriveFailure(request.runId, boundary?.stateVersion ?? current.stateVersion,
-          `${request.runId}:drive-failure:${current.stateVersion}`, category === "trust" ? "trust" : category === "unknown" ? "unknown" : "failure");
-        const state = this.store.getRun(request.runId)!.state;
-        return { verdict: state === "FAILED" ? "FAILED" : state === "CANCELLED" ? "CANCELLED" : state === "RECOVERY" ? "RECOVERY" : state === "NEXT_PHASE" ? "PASS" : "HUMAN_GATE", stateVersion: disposition.stateVersion };
-      } finally {
-        boundary?.release();
-      }
+      return await this.disposeFailure(request, controls, error);
     }
   }
 
@@ -145,16 +132,37 @@ export class Phase2Loop {
     if (model?.run.state !== "VERIFY_FOCUSED" || model.currentTask?.taskId !== request.taskId || model.activeAttempt?.lifecycle !== "SUCCEEDED" || model.activeAttempt.outcomeJson === null) throw new KerbsFlowError("RECOVERED_CONTINUATION_INVALID", "validation continuation requires the exact persisted succeeded attempt");
     const stored = this.store.getWorktree(request.runId);
     if (stored === undefined) throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "recovered continuation requires persisted ownership");
-    for (const [level, check] of [["focused", request.focusedCheck], ["phase", request.phaseCheck], ["full", request.fullCheck]] as const) {
-      if (check === undefined) continue;
-      const intent = this.store.getValidationIntent(request.runId, level);
-      if (intent === undefined || checkIntentHash(intent) !== checkIntentHash(checkIntent(level, check))) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "restart cannot substitute launch checks or promote legacy intent");
-      this.verifier.declare(request.runId, level, intent);
+    try {
+      for (const [level, check] of [["focused", request.focusedCheck], ["phase", request.phaseCheck], ["full", request.fullCheck]] as const) {
+        if (check === undefined) continue;
+        const intent = this.store.getValidationIntent(request.runId, level);
+        if (intent === undefined || checkIntentHash(intent) !== checkIntentHash(checkIntent(level, check))) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "restart cannot substitute launch checks or promote legacy intent");
+        this.verifier.declare(request.runId, level, intent);
+      }
+      const intake = this.git.intake(stored.repositoryPath, { expectedBaseOid: stored.baseOid });
+      const worktree: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: request.runId, repositoryPath: stored.repositoryPath, gitCommonDirectory: stored.gitCommonDirectory, worktreeGitDirectory: stored.worktreeGitDirectory, baseOid: stored.baseOid, branch: stored.branch, path: stored.worktreePath, markerPath: stored.markerPath, createdAt: stored.createdAt };
+      this.git.inspect(worktree);
+      return await this.drive(request, controls, { intake, worktree, decision: model.currentTask.decision });
+    } catch (error) {
+      return await this.disposeFailure(request, controls, error);
     }
-    const intake = this.git.intake(stored.repositoryPath, { expectedBaseOid: stored.baseOid });
-    const worktree: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: request.runId, repositoryPath: stored.repositoryPath, gitCommonDirectory: stored.gitCommonDirectory, worktreeGitDirectory: stored.worktreeGitDirectory, baseOid: stored.baseOid, branch: stored.branch, path: stored.worktreePath, markerPath: stored.markerPath, createdAt: stored.createdAt };
-    this.git.inspect(worktree);
-    return this.drive(request, controls, { intake, worktree, decision: model.currentTask.decision });
+  }
+
+  private async disposeFailure(request: Phase2LoopRequest, controls: Phase2DriveControls, error: unknown): Promise<Phase2LoopResult> {
+    const category = classifyInitialPlanningFailure(error);
+    if (category === "control" || category === "integrity") throw error;
+    if (controls.claimFailureDisposition === undefined) await controls.checkpoint?.();
+    const boundary = await controls.claimFailureDisposition?.();
+    try {
+      const current = this.store.getRun(request.runId);
+      if (current === undefined) throw error;
+      const disposition = this.core.disposeDriveFailure(request.runId, boundary?.stateVersion ?? current.stateVersion,
+        `${request.runId}:drive-failure:${current.stateVersion}`, category === "trust" ? "trust" : category === "unknown" ? "unknown" : "failure");
+      const state = this.store.getRun(request.runId)!.state;
+      return { verdict: state === "FAILED" ? "FAILED" : state === "CANCELLED" ? "CANCELLED" : state === "RECOVERY" ? "RECOVERY" : state === "NEXT_PHASE" ? "PASS" : "HUMAN_GATE", stateVersion: disposition.stateVersion };
+    } finally {
+      boundary?.release();
+    }
   }
 
   private async drive(request: Phase2LoopRequest, controls: Phase2DriveControls, recovered?: { intake: RepositoryIntake; worktree: WorktreeRecord; decision: PlanningDecision }): Promise<Phase2LoopResult> {
@@ -771,7 +779,8 @@ function classifyInitialPlanningFailure(error: unknown): InitialPlanningFailureC
   if (error instanceof KerbsFlowError) {
     if (/^(CONTROL_|PAUSE_|CANCEL_|RUN_DRIVE_)/u.test(error.code)) return "control";
     if (/^(DATABASE_|PERSISTED_|SQLITE_)|(?:^|_)(STATE|CONFLICT|IDEMPOTENCY)(?:_|$)/u.test(error.code)) return "integrity";
-    if (/(?:^|_)(CANONICAL|SECURITY|PRIVILEGE|PERMISSION|SCOPE|INVARIANT|POLICY|TRUST|SECRET|AUTHORITY|IDENTITY|CAPABILITY|CAPABILITIES)(?:_|$)/u.test(error.code)
+    if (error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH"
+      || /(?:^|_)(CANONICAL|SECURITY|PRIVILEGE|PERMISSION|SCOPE|INVARIANT|POLICY|TRUST|SECRET|AUTHORITY|IDENTITY|CAPABILITY|CAPABILITIES)(?:_|$)/u.test(error.code)
       || error.code === "ROUTE_PROHIBITED" || error.code === "ROUTE_NOT_ALLOWED") return "trust";
     return "unknown";
   }

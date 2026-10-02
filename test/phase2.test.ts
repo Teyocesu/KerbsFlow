@@ -1,7 +1,8 @@
 import { VerificationSandbox } from "../src/verification-sandbox.js";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -17,11 +18,13 @@ import {
   type SemanticReviewHandle,
   type SemanticReviewRequest,
   asInstructionId,
+  asCommandId,
   asAttemptId,
   asRunId,
   asTaskId,
   asValidationId,
   parsePlanningDecision,
+  parseExecutorResult,
 } from "../src/contracts.js";
 import type { ExecutorAdapter, SemanticReviewAdapter } from "../src/adapter.js";
 import { KerbsFlowCore } from "../src/core.js";
@@ -34,6 +37,8 @@ import { ProcessSupervisor } from "../src/process.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { FocusedVerifier } from "../src/verifier.js";
 import { IndependentSemanticReviewer } from "../src/reviewer.js";
+import { RunCoordinator } from "../src/run-coordinator.js";
+import { CanonicalIntentGuard } from "../src/canonical.js";
 import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery, type TrustedRoutingDecision } from "../src/routing.js";
 import { createFakeCodex, createGitRepository, git } from "./phase2-helpers.js";
 import { createFixture, primeExecute } from "./helpers.js";
@@ -1069,6 +1074,90 @@ test("restart preserves real process identity, prevents duplicate dispatch, and 
     rmSync(repository.root, { recursive: true, force: true });
   }
 });
+
+for (const dirtyOriginal of [true, false]) {
+  test(`recovered successful attempt has a durable owned continuation disposition: dirty original=${dirtyOriginal}`, async () => {
+    const repository = createGitRepository();
+    const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-recovered-drive-"));
+    const ids = new SequenceIdSource("recovered_drive");
+    const dbPath = join(runtime, "state.sqlite");
+    let store = StateStore.open(dbPath, { ids });
+    const cliPath = createFakeCodex(runtime);
+    let adapter = new CodexAdapter({ cliPath, runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+    const gitManager = new GitWorktreeManager(join(runtime, "owned"));
+    const runId = asRunId("run_recovered_drive");
+    const taskId = asTaskId("task_recovered_drive");
+    const focusedCheck = { name: "content assertion", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } };
+    const profile = {
+      launchProfileId: "recovered-drive-profile", launchProfileHash: createHash("sha256").update(JSON.stringify({ focusedCheck, base: repository.head })).digest("hex"), canonicalRepositoryPath: realpathSync(repository.root), expectedBaseOid: repository.head,
+      focusedCheck, phaseCheck: { ...focusedCheck, level: "phase" as const, commandId: "recovered-phase" }, executionTimeoutMs: 5000,
+      planningMaster: { async planInitial() { throw new Error("recovery must not replan"); }, async planRework() { throw new Error("recovery must not redispatch"); } },
+    };
+    let core = codexCore(store, adapter, ids);
+    try {
+      core.startRunWithLaunchBinding(runId, "recover exactly one attempt", "recovered:start", { runId, taskId, canonicalRepositoryPath: profile.canonicalRepositoryPath, launchProfileId: profile.launchProfileId, launchProfileHash: profile.launchProfileHash });
+      for (const [level, check] of [["focused", profile.focusedCheck], ["phase", profile.phaseCheck]] as const) store.recordValidationIntent(runId, level, check);
+      const intake = gitManager.intake(repository.root);
+      new CanonicalIntentGuard(store).capture(runId, intake.repositoryPath, intake.baseOid);
+      core.completeIntake(runId, 1, "recovered:intake");
+      const worktree = gitManager.create(intake, runId);
+      store.recordWorktree({ runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
+      const decision = createPhase2PlanningDecision({ decisionId: "decision_recovered_drive", runId, taskId, objective: "SCENARIO=success", acceptance: ["result.txt contains done"], positiveScope: ["result.txt"], negativeScope: ["README.md"], model: "fixture-model", reasoning: "medium", canonicalContext: "synthetic recovery contract" });
+      core.plan(runId, 2, "recovered:plan", decision);
+      core.prepareExecution(runId, 3, "recovered:prepare");
+      await core.beginAttempt(runId, 4, "recovered:begin", worktree.path, { prompt: "SCENARIO=success", timeoutMs: 5000 });
+      const attemptId = store.getRun(runId)!.activeAttemptId!;
+      const handle = { schemaVersion: CONTRACT_VERSIONS.attemptHandle, runId, taskId, attemptId };
+      assert.equal(parseExecutorResult(await adapter.wait(handle)).outcome, "succeeded");
+      store.close();
+      store = StateStore.open(dbPath, { ids });
+      assert.equal(store.getRun(runId)?.state, "RECOVERY");
+      adapter = new CodexAdapter({ cliPath, runtimeRoot: runtime, environment: { PATH: process.env.PATH, HOME: runtime } });
+      core = codexCore(store, adapter, ids);
+      const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
+      const coordinator = new RunCoordinator(core, store, loop, profile, ids);
+      if (dirtyOriginal) writeFileSync(join(repository.root, "README.md"), "synthetic human edit after restart\n");
+      const settled = await coordinator.reconcileRecovery({ runId, expectedStateVersion: store.getRun(runId)!.stateVersion, commandId: asCommandId("command_recovered_settle"), idempotencyKey: "recovered:settle" });
+      assert.ok("to" in settled);
+      assert.equal(settled.to, "VERIFY_FOCUSED");
+      const drive = (coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown } }).reservation;
+      await drive.drivePromise;
+      assert.equal(drive.driveError, undefined);
+      assert.equal(store.getRun(runId)?.state, dirtyOriginal ? "HUMAN_GATE" : "NEXT_PHASE");
+      assert.equal(store.countTaskAttempts(runId, taskId), 1);
+      assert.equal(store.getAttempt(attemptId)?.lifecycle, "SUCCEEDED");
+      assert.equal(readFileSync(join(worktree.path, "result.txt"), "utf8"), "done\n");
+      assert.ok(existsSync(worktree.markerPath));
+      const gate = store.readModel(runId)?.currentGate;
+      if (dirtyOriginal) {
+        assert.ok(gate);
+        assert.equal(gate.gate.reasonCode, "drive_trust_violation");
+        assert.equal(gate.gate.evidenceRefs.length, 1);
+        assert.equal(store.getArtifactRecord(gate.gate.evidenceRefs[0]!)?.attemptId, attemptId);
+        assert.deepEqual(gate.gate.options.map(option => option.target), ["FAILED", "CANCELLED"]);
+        assert.deepEqual(coordinator.getActionableGateOptionIds(runId, gate.gateId), ["fail", "cancel"]);
+        assert.deepEqual(coordinator.getControlAvailability(runId), { pause: false, resume: false });
+      } else assert.equal(store.readModel(runId)?.latestValidation?.bundle.outcome, "passed");
+      store.close();
+      store = StateStore.open(dbPath, { ids });
+      assert.equal(store.getRun(runId)?.state, dirtyOriginal ? "HUMAN_GATE" : "NEXT_PHASE");
+      assert.deepEqual(store.readModel(runId)?.currentGate, gate);
+      const reopenedCore = codexCore(store, adapter, ids);
+      const reopenedLoop = new Phase2Loop(reopenedCore, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
+      const reopenedCoordinator = new RunCoordinator(reopenedCore, store, reopenedLoop, profile, ids);
+      if (gate !== undefined) {
+        assert.deepEqual(reopenedCoordinator.getActionableGateOptionIds(runId, gate.gateId), ["fail", "cancel"]);
+        const resolved = await reopenedCoordinator.resolveGate({ runId, expectedStateVersion: store.getRun(runId)!.stateVersion, commandId: asCommandId("command_recovered_gate_fail"), idempotencyKey: "recovered:gate-fail", gateId: gate.gateId, optionId: "fail" });
+        assert.equal(resolved.to, "FAILED");
+        assert.ok(existsSync(worktree.path));
+      }
+    } finally {
+      store.close();
+      rmSync(runtime, { recursive: true, force: true });
+      rmSync(repository.root, { recursive: true, force: true });
+    }
+  });
+}
 
 function codexCore(store: StateStore, adapter: ExecutorAdapter, ids: SequenceIdSource): KerbsFlowCore {
   return new KerbsFlowCore(store, adapter, new FileArtifactStore(join(adapterRuntimeRoot(store), "artifacts"), ids), {
