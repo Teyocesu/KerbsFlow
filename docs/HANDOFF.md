@@ -1,4 +1,5 @@
 # KerbsFlow handoff
 
-- Final independent mechanical closure reviewed `971daef5189afdc932e5b394756c225c885c9ab0`: final PQA-B1 literal-input blocker FIX VERIFIED; PQA-B1–PQA-B4 FIX VERIFIED. Run 1 + Run 2 and original physical QA accepted with corrected PQA-B1 supplemental 10/10 and final 8/8. Fresh UI 12/12, typecheck/build/diff-check PASS. AC1–AC5 PASS; zero known Phase 6 blockers. Phase 6E CLOSED / PASS; Phase 6 CLOSED / PASS; Phase 7 NOT started.
-- Exact next action: Phase 7 planning / full v0.1 gate and release preparation.
+- Phase 6 / 6E CLOSED / PASS; zero known Phase 6 blockers. Source baseline `a9f910b94b771e22d65ebdeab7afa6d2ef396437`.
+- Phase 7 PLANNED / NOT YET EXECUTED on `phase7/v0.1-release-gate`, single existing checkout. Canonical PLAN freezes 7A–7D, all 15 ACs and human release authority; macOS only; Apache-2.0 / Teyocesu / 2026. No full gate or release action executed; no material planning blocker.
+- Exact next action: Phase 7A execution against the frozen PLAN. Resolve approved Node 24 PATH and inventory evidence/versions/scenario gaps first; optional paid-provider smoke requires opt-in. No automatic merge/tag/release/publish/deploy/production.
