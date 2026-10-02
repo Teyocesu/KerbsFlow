@@ -1,4 +1,4 @@
 # KerbsFlow handoff
 
-- Repeated closure at `6b2384948453db225dcc96a7f1270c5c84eff962` found the remaining PQA-B1 normalization edge. Final remediation validates raw run-ID fields literally; padded/whitespace-only input is rejected, only exactly empty Start generates. UI 12/12, typecheck/build/diff-check and actual macOS Chrome focused 8/8 PASS; affected AC5 evidence restored. Run 1 + Run 2 and unaffected physical evidence remain valid. Phase 6 OPEN; Phase 6E validation complete subject to repeated independent closure; Phase 7 NOT started. No closure approval claimed.
-- Exact next action: final focused independent Phase 6/6E closure review against the published `phase6/thin-local-ui` checkpoint (`fix: reject normalized run selection`).
+- Final independent mechanical closure reviewed `971daef5189afdc932e5b394756c225c885c9ab0`: final PQA-B1 literal-input blocker FIX VERIFIED; PQA-B1–PQA-B4 FIX VERIFIED. Run 1 + Run 2 and original physical QA accepted with corrected PQA-B1 supplemental 10/10 and final 8/8. Fresh UI 12/12, typecheck/build/diff-check PASS. AC1–AC5 PASS; zero known Phase 6 blockers. Phase 6E CLOSED / PASS; Phase 6 CLOSED / PASS; Phase 7 NOT started.
+- Exact next action: Phase 7 planning / full v0.1 gate and release preparation.
