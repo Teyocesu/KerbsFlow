@@ -123,8 +123,8 @@ for (const failure of ["missing", "permission", "escape"] as const) {
       stack.coordinator = new RunCoordinator(stack.core, stack.store, stack.phase2, {
         launchProfileId: "canonical-failure-fixture", launchProfileHash: "c".repeat(64),
         canonicalRepositoryPath: stack.repository.root,
-        focusedCheck: { name: "synthetic", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
-        phaseCheck: { level: "phase", commandId: "synthetic-phase", name: "synthetic", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
+        focusedCheck: { name: "synthetic", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+        phaseCheck: { level: "phase", commandId: "synthetic-phase", name: "synthetic", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
         executionTimeoutMs: 5_000, planningMaster: stack.planningMaster,
       });
       stack.api = new LocalApiServer({ core: stack.core, store: stack.store, artifacts: stack.artifacts, coordinator: stack.coordinator });

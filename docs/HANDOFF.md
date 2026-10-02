@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- Phase 6 / 6E CLOSED / PASS; Phase 7 OPEN; 7A COMPLETE / PASS; 7B COMPLETE against `66c8ebbfe7d8b0b1bdf87e999ac2ac0c08f2953f`: 26 cells, 14 PASS / 12 GAP, seven roots in canonical PLAN. Source/test/package unchanged; no full gate/live inference/release action.
-- 7C inputs: G1 full authority, G2 release gate, G3 original DB owner recovery, G4 trusted terminal ingestion, G5 declared phase-profile binding, G6 gate evidence references, G7 safe API/UI evidence projection; also 7A README/license/ignore hygiene. Fresh evidence: `$HOME/.codex/evidence/kerbsflow-phase7b-66c8ebb-nsxnwmeb`; earlier /tmp bundles unavailable, never reconstructed.
-- Next: Phase 7C release hygiene + independent critical review + consolidated safe remediation batch, existing checkout/branch. Refresh only invalidated evidence; 7D full gate waits for zero known blockers.
+- Phase 6 / 6E CLOSED / PASS; Phase 7 OPEN. Consolidated 7C.2 candidate (commit containing this entry) remediates G1–G7/R1–R4, hygiene and adjacent 7C-I1 against `bd0105b9343b7069fa3a8ab7b4978fea43828385`; ledger/evidence in canonical PLAN. 369 affected tests + final persistence 19/19 PASS; 23 selected E2E cells + required physical Chrome gates/controls PASS.
+- No known implementation-session blocker or human decision remains; independent post-fix approval pending. 7D NOT run; live provider NOT TESTED — not opted in; no release action/final AC1–AC15 PASS. Private evidence/publication SHA: `$HOME/.codex/evidence/kerbsflow-phase7c-bd0105b-20261002`.
+- Next: fresh independent Phase 7C post-fix review of the published candidate on `phase7/v0.1-release-gate`, existing checkout. Do not begin 7D or declare release readiness before that review.

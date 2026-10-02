@@ -933,8 +933,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
         repositoryPath: stack.repository.root,
         expectedBaseOid: stack.repository.head,
         planningDecision: decision,
-        focusedCheck: { name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
-        phaseCheck: { level: "phase", commandId: "phase6c-headless-check", name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
+        focusedCheck: { name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+        phaseCheck: { level: "phase", commandId: "phase6c-headless-check", name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
         executionTimeoutMs: 5_000,
       });
       const handle = await stack.adapter.started.promise;

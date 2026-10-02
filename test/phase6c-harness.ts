@@ -304,8 +304,8 @@ export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; ph
     launchProfileHash: "6".repeat(64),
     canonicalRepositoryPath: realpathSync(repository.root),
     expectedBaseOid: repository.head,
-    focusedCheck: { name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 },
-    ...(options.phaseCheck === true ? { phaseCheck: { level: "phase" as const, commandId: "phase6c-synthetic-phase-check", name: "synthetic phase result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000 } } : {}),
+    focusedCheck: { name: "synthetic result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } },
+    ...(options.phaseCheck === true ? { phaseCheck: { level: "phase" as const, commandId: "phase6c-synthetic-phase-check", name: "synthetic phase result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5_000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } } } : {}),
     executionTimeoutMs: 120_000,
     planningMaster,
   };

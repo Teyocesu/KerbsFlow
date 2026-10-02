@@ -7,3 +7,22 @@ coverage/
 kerbsflow.sqlite
 kerbsflow.sqlite-wal
 kerbsflow.sqlite-shm
+
+# KerbsFlow-generated state/owner and runtime roots (not global secret patterns)
+kerbsflow.sqlite-journal
+kerbsflow.sqlite.owner
+kerbsflow.sqlite.owner-operation/
+state.sqlite
+state.sqlite-journal
+state.sqlite-wal
+state.sqlite-shm
+state.sqlite.owner
+state.sqlite.owner-operation/
+/codex-attempts/
+/codex-reviews/
+/opencode/
+/worktree-records/
+/worktrees/
+/backups/*.sqlite
+/backups/*.sqlite.json
+/.kerbsflow-*/

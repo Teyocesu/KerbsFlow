@@ -104,7 +104,7 @@ export class IndependentSemanticReviewer {
         throw new KerbsFlowError("REVIEW_EVIDENCE_REQUIRED", "semantic reviewer must identify inspected evidence supporting its result");
       }
       const after = this.git.inspect(input.worktree);
-      if (before.headOid !== after.headOid || before.diff !== after.diff || JSON.stringify(before.status) !== JSON.stringify(after.status)) {
+      if (before.candidateFingerprint !== after.candidateFingerprint || before.headOid !== after.headOid || before.diff !== after.diff || JSON.stringify(before.status) !== JSON.stringify(after.status)) {
         throw new KerbsFlowError("REVIEWER_MUTATED_WORKTREE", "semantic reviewer mutated worktree evidence despite read-only authority");
       }
       return this.store.completeSemanticReview(input.reviewAttemptId, result).result!;

@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, lstatSync, realpathSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { constants, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 import type { ExecutorAdapter, SemanticReviewAdapter } from "./adapter.js";
 import {
@@ -27,7 +27,7 @@ import {
 } from "./contracts.js";
 import { KerbsFlowError } from "./errors.js";
 import { containsLikelySecret, redactDiagnostic } from "./secrets.js";
-import { ensurePrivateDirectory } from "./paths.js";
+import { ensurePrivateDirectory, readPrivateFileWithin, atomicWritePrivateFile, pathIsWithin } from "./paths.js";
 import {
   ProcessSupervisor,
   type ProcessIdentity,
@@ -222,19 +222,13 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   async waitReview(handle: SemanticReviewHandle): Promise<unknown> {
     const session = this.requiredReviewSession(handle.reviewAttemptId);
     const processResult = await this.awaitReviewProcess(session);
+    const staged = terminalStaging(this.reviewsRoot, session.directory, session.resultPath, processResult.identity);
+    if (staged.error !== undefined) return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: staged.error };
     if (processResult.events.some((event) => event.malformed) || processResult.exitKind !== "normal" || processResult.exitCode !== 0 || !existsSync(session.resultPath)) {
       return { schemaVersion: "kerbsflow.semantic-review-result/invalid", summary: "reviewer did not produce a trustworthy terminal result" };
     }
     try {
-      const bytes = readFileSync(session.resultPath);
-      if (bytes.byteLength > 1024 * 1024) {
-        throw new Error("review result exceeded the 1 MiB bound");
-      }
-      const raw: unknown = JSON.parse(bytes.toString("utf8"));
-      if (containsLikelySecret(raw)) {
-        writeFileSync(session.resultPath, `${JSON.stringify({ redacted: true, reason: "likely credential material rejected" })}\n`, { encoding: "utf8", mode: 0o600 });
-        throw new Error("review result contained likely credential material");
-      }
+      const raw = staged.raw;
       const result = parseSemanticReviewResult(raw);
       assertReviewResultScope(result, session.request);
       if (result.evidence.some((evidence) => evidence.classification !== "inspected")) {
@@ -384,6 +378,8 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   async wait(handle: AttemptHandle): Promise<unknown> {
     const session = this.requiredSession(handle.attemptId);
     const processResult = await this.awaitProcess(session);
+    const staged = terminalStaging(this.attemptsRoot, session.directory, session.resultPath, processResult.identity);
+    if (staged.error !== undefined) return invalidResult(staged.error, processResult);
     const malformed = processResult.events.some((event) => event.malformed);
     if (malformed) {
       return invalidResult("Codex emitted malformed JSONL; terminal output is not trusted", processResult);
@@ -394,20 +390,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
     if (!existsSync(session.resultPath)) {
       return invalidResult("Codex exited without the required structured terminal result", processResult);
     }
-    let raw: unknown;
-    try {
-      const bytes = readFileSync(session.resultPath);
-      if (bytes.byteLength > 1024 * 1024) {
-        return invalidResult("Codex structured result exceeded the 1 MiB bound", processResult);
-      }
-      raw = JSON.parse(bytes.toString("utf8"));
-    } catch (error) {
-      return invalidResult(`Codex structured result is unreadable: ${error instanceof Error ? redactDiagnostic(error.message) : "parse failed"}`, processResult);
-    }
-    if (containsLikelySecret(raw)) {
-      writeFileSync(session.resultPath, `${JSON.stringify({ redacted: true, reason: "likely credential material rejected" })}\n`, { encoding: "utf8", mode: 0o600 });
-      return invalidResult("Codex structured result contained likely credential material and was redacted", processResult);
-    }
+    const raw = staged.raw;
     try {
       const parsed = parseExecutorResult(raw);
       assertResultScope(parsed, session.request);
@@ -473,6 +456,8 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
     if (!processGroupIsAbsent(metadata.process.pid, metadata.process.processGroup)) {
       return { outcome: "unknown", summary: "the durable Codex process group may still exist; terminal output cannot be trusted after restart" };
     }
+    const staged = terminalStaging(this.attemptsRoot, directory, join(directory, "executor-result.json"), metadata.process);
+    if (staged.error !== undefined) return { outcome: "unknown", summary: staged.error };
     const processResultPath = join(directory, "process-result.json");
     if (!existsSync(processResultPath)) {
       return { outcome: "unknown", summary: "durable process-result evidence is missing after restart" };
@@ -505,15 +490,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
       return { outcome: "unknown", summary: "process identity exists but no terminal result can be proven after restart" };
     }
     try {
-      const bytes = readFileSync(resultPath);
-      if (bytes.byteLength > 1024 * 1024) {
-        return { outcome: "unknown", summary: "durable result exceeds the recovery size bound" };
-      }
-      const raw: unknown = JSON.parse(bytes.toString("utf8"));
-      if (containsLikelySecret(raw)) {
-        writeFileSync(resultPath, `${JSON.stringify({ redacted: true, reason: "likely credential material rejected" })}\n`, { encoding: "utf8", mode: 0o600 });
-        return { outcome: "unknown", summary: "durable result contained likely credential material and was redacted" };
-      }
+      const raw = staged.raw;
       const parsed = parseExecutorResult(raw);
       if (parsed.runId !== identity.runId || parsed.taskId !== identity.taskId || parsed.attemptId !== identity.attemptId) {
         return { outcome: "unknown", summary: "durable terminal result identity does not match the recovery request" };
@@ -545,6 +522,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
 
   private async awaitProcess(session: CodexSession): Promise<ProcessResult> {
     const completed = await session.process.completion;
+    terminalStaging(dirname(session.directory), session.directory, session.resultPath, completed.identity);
     if (session.processResult === undefined) {
       writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
       session.processResult = completed;
@@ -554,6 +532,7 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
 
   private async awaitReviewProcess(session: CodexReviewSession): Promise<ProcessResult> {
     const completed = await session.process.completion;
+    terminalStaging(dirname(session.directory), session.directory, session.resultPath, completed.identity);
     if (session.processResult === undefined) {
       writeFileSync(join(session.directory, "process-result.json"), `${JSON.stringify(durableProcessEvidence(completed))}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
       session.processResult = completed;
@@ -686,6 +665,33 @@ export class CodexAdapter implements ExecutorAdapter, SemanticReviewAdapter {
   }
 }
 
+function terminalStaging(root: string, directory: string, resultPath: string, identity: ProcessIdentity): { raw?: unknown; error?: string } {
+  if (!processGroupIsAbsent(identity.pid, identity.processGroup)) return { error: "terminal staging still has possible live process ownership; retained privately" };
+  try {
+    const canonicalRoot = realpathSync(root);
+    if (lstatSync(directory).isSymbolicLink() || realpathSync(directory) !== directory || !pathIsWithin(canonicalRoot, directory) || dirname(directory) !== canonicalRoot || dirname(resultPath) !== directory) throw new Error("staging ownership cannot be proven");
+    const name = basename(resultPath);
+    if (!existsSync(resultPath)) return {};
+    let raw: unknown;
+    let rejected = false;
+    try {
+      const bytes = readPrivateFileWithin(directory, name, 1024 * 1024);
+      if (containsLikelySecret(bytes.toString("utf8"))) rejected = true;
+      else {
+        raw = JSON.parse(bytes.toString("utf8"));
+        rejected = containsLikelySecret(raw);
+      }
+    } catch { rejected = true; }
+    if (rejected) {
+      atomicWritePrivateFile(directory, name, JSON.stringify({ redacted: true, reason: "untrusted terminal staging rejected" }), true);
+      return { error: "terminal staging was oversized, malformed or sensitive; sanitized and rejected" };
+    }
+    return { raw };
+  } catch {
+    return { error: "terminal staging sanitation could not be proven; no result promoted" };
+  }
+}
+
 function removeSyntheticProbeFile(path: string, token: string): void {
   try {
     if (readFileSync(path, "utf8") === token) {
@@ -708,7 +714,7 @@ function readRecoveryMetadata(
   identity: { runId: ExecutionRequest["runId"]; taskId: ExecutionRequest["taskId"]; attemptId: AttemptId },
 ): RecoveryProcessMetadata {
   try {
-    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    const raw = JSON.parse(readPrivateFileWithin(resolve(path, ".."), "process.json", 64 * 1024).toString("utf8")) as Record<string, unknown>;
     const processIdentity = raw.process as Record<string, unknown> | undefined;
     if (
       raw.schemaVersion !== "kerbsflow.codex-process/v1"
@@ -767,7 +773,7 @@ interface DurableProcessResultEvidence {
 
 function readDurableProcessResult(path: string): DurableProcessResultEvidence {
   try {
-    const bytes = readFileSync(path);
+    const bytes = readPrivateFileWithin(resolve(path, ".."), "process-result.json", 2 * 1024 * 1024);
     if (bytes.byteLength > 2 * 1024 * 1024) {
       throw new Error("process-result evidence exceeds the 2 MiB bound");
     }

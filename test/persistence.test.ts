@@ -4,7 +4,9 @@ import { DatabaseSync } from "node:sqlite";
 import { lstatSync, mkdtempSync, readFileSync, readdirSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 
 import { applyMigrations, MIGRATIONS, StateStore } from "../src/persistence.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
@@ -290,4 +292,124 @@ test("the forward migration removes legacy semantic-review prompt content", () =
     store.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("schema 12 upgrade preserves old checksums and new migration failure rolls back", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-schema12-"));
+  const path = join(root, "state.sqlite");
+  try {
+    const db = new DatabaseSync(path);
+    applyMigrations(db, MIGRATIONS.slice(0, 12));
+    const old = db.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version").all();
+    assert.throws(() => applyMigrations(db, [...MIGRATIONS.slice(0, 12), { version: 13, name: "synthetic-failure", sql: "CREATE TABLE rollback_13 (id INTEGER); INSERT INTO no_such_table VALUES (1);" }]));
+    assert.equal(db.prepare("SELECT name FROM sqlite_master WHERE name = 'rollback_13'").get(), undefined);
+    assert.deepEqual(db.prepare("SELECT version, checksum FROM schema_migrations ORDER BY version").all(), old);
+    db.close();
+    const upgraded = StateStore.open(path);
+    upgraded.close();
+    const inspect = new DatabaseSync(path);
+    assert.deepEqual(inspect.prepare("SELECT version, checksum FROM schema_migrations WHERE version <= 12 ORDER BY version").all(), old);
+    assert.equal(inspect.prepare("SELECT MAX(version) AS version FROM schema_migrations").get()!.version, 14);
+    inspect.close();
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("explicit original database owner recovery proves dead macOS owner after SIGKILL", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-owner-crash-"));
+  const path = join(root, "state.sqlite");
+  const moduleUrl = new URL("../src/persistence.js", import.meta.url).href;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", `import { StateStore } from ${JSON.stringify(moduleUrl)}; StateStore.open(${JSON.stringify(path)}); console.log('READY'); setInterval(() => {}, 1000);`], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    await new Promise<void>((resolve, reject) => { child.stdout!.once("data", () => resolve()); child.once("error", reject); child.once("exit", () => reject(new Error("owner exited before readiness"))); });
+    assert.throws(() => StateStore.open(path, { recoverOwner: true }), /owner is still live/);
+    const exited = new Promise<void>(resolve => child.once("exit", () => resolve()));
+    child.kill("SIGKILL");
+    await exited;
+    const original = readFileSync(path);
+    assert.throws(() => StateStore.open(path), /explicit recovery/);
+    const owner = JSON.parse(readFileSync(`${path}.owner`, "utf8"));
+    assert.equal(owner.schemaVersion, "kerbsflow.database-owner/v2");
+    const reopened = StateStore.open(path, { recoverOwner: true });
+    assert.deepEqual(readFileSync(path), original, "owner recovery must preserve the original database bytes");
+    reopened.close();
+  } finally { child.kill("SIGKILL"); rmSync(root, { recursive: true, force: true }); }
+});
+
+for (const variant of ["host", "boot", "legacy", "pid-reuse"] as const) {
+  test(`explicit owner recovery fails closed on ambiguity or proves PID reuse: ${variant}`, () => {
+    const root = mkdtempSync(join(tmpdir(), "kerbsflow-owner-identity-"));
+    const path = join(root, "state.sqlite");
+    try {
+      const store = StateStore.open(path);
+      const owner = JSON.parse(readFileSync(`${path}.owner`, "utf8"));
+      store.close();
+      if (variant === "host") owner.host = "different-host";
+      if (variant === "boot") owner.boot = "different-boot";
+      if (variant === "legacy") owner.schemaVersion = "kerbsflow.database-owner/v1";
+      if (variant === "pid-reuse") owner.birth = "Fri Jan  1 00:00:00 1999";
+      writeFileSync(`${path}.owner`, JSON.stringify(owner), { mode: 0o600 });
+      const before = readFileSync(path);
+      if (variant === "pid-reuse") {
+        const recovered = StateStore.open(path, { recoverOwner: true });
+        recovered.close();
+      } else {
+        assert.throws(() => StateStore.open(path, { recoverOwner: true }), /ambiguous|legacy|foreign/i);
+        assert.deepEqual(JSON.parse(readFileSync(`${path}.owner`, "utf8")), owner);
+      }
+      assert.deepEqual(readFileSync(path), before);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test("concurrent explicit recoverers cannot both acquire the original database and an ordinary opener cannot steal it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-owner-race-"));
+  const path = join(root, "state.sqlite");
+  const store = StateStore.open(path);
+  const owner = JSON.parse(readFileSync(`${path}.owner`, "utf8"));
+  store.close();
+  owner.birth = "Fri Jan  1 00:00:00 1999";
+  writeFileSync(`${path}.owner`, JSON.stringify(owner), { mode: 0o600 });
+  const moduleUrl = new URL("../src/persistence.js", import.meta.url).href;
+  const children = Array.from({ length: 2 }, () => spawn(process.execPath, ["--input-type=module", "-e", `import { StateStore } from ${JSON.stringify(moduleUrl)}; console.log('READY'); process.stdin.once('data', () => { try { const store = StateStore.open(${JSON.stringify(path)}, {recoverOwner:true}); console.log('ACQUIRED'); process.stdin.once('data', () => { store.close(); process.exit(0); }); } catch(error) { console.log('REJECTED:' + error.code); process.exit(0); } });`], { stdio: ["pipe", "pipe", "pipe"] }));
+  try {
+    await Promise.all(children.map(child => new Promise<void>((resolve, reject) => { child.stdout!.once("data", () => resolve()); child.once("error", reject); })));
+    const responses = children.map(child => new Promise<string>((resolve, reject) => { child.stdout!.once("data", chunk => resolve(chunk.toString().trim())); child.once("error", reject); }));
+    children.forEach(child => child.stdin!.write("GO\n"));
+    const values = await Promise.all(responses);
+    assert.equal(values.filter(value => value === "ACQUIRED").length, 1, values.join(","));
+    assert.equal(values.filter(value => value.startsWith("REJECTED:")).length, 1);
+    assert.throws(() => StateStore.open(path), /owner record already exists|already in progress/);
+    assert.throws(() => StateStore.open(path, { recoverOwner: true }), /owner is still live|already in progress/);
+    const winner = children[values.indexOf("ACQUIRED")]!;
+    const exit = new Promise<void>(resolve => winner.once("exit", () => resolve()));
+    winner.stdin!.write("CLOSE\n");
+    await exit;
+    StateStore.open(path).close();
+  } finally { children.forEach(child => child.kill("SIGKILL")); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("explicit owner recovery retains an owner changed after actual OS observation", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-owner-changed-"));
+  const path = join(root, "state.sqlite");
+  const originalExec = childProcess.execFileSync;
+  try {
+    const store = StateStore.open(path);
+    const owner = JSON.parse(readFileSync(`${path}.owner`, "utf8"));
+    store.close();
+    owner.birth = "Fri Jan  1 00:00:00 1999";
+    writeFileSync(`${path}.owner`, JSON.stringify(owner), { mode: 0o600 });
+    const changed = { ...owner, nonce: "00000000-0000-0000-0000-000000000000" };
+    const before = readFileSync(path);
+    const observation = test.mock.method(childProcess, "execFileSync", (...args: Parameters<typeof originalExec>) => {
+      const result = originalExec(...args);
+      if (args[0] === "/bin/ps") writeFileSync(`${path}.owner`, JSON.stringify(changed), { mode: 0o600 });
+      return result;
+    });
+    syncBuiltinESMExports();
+    try {
+      assert.throws(() => StateStore.open(path, { recoverOwner: true }), (error: unknown) => error instanceof KerbsFlowError && error.code === "DATABASE_OWNER_CHANGED");
+      assert.deepEqual(JSON.parse(readFileSync(`${path}.owner`, "utf8")), changed);
+      assert.deepEqual(readFileSync(path), before);
+    } finally { observation.mock.restore(); syncBuiltinESMExports(); }
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

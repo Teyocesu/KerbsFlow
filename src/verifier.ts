@@ -14,6 +14,12 @@ export interface FocusedCheckCommand {
   executable: string;
   args: string[];
   timeoutMs: number;
+  proof: { kind: "stdout_line"; expected: string };
+}
+
+export interface FullCheckCommand extends FocusedCheckCommand {
+  level: "full";
+  commandId: string;
 }
 
 export interface PhaseCheckCommand extends FocusedCheckCommand {
@@ -42,7 +48,37 @@ export interface PhaseValidationBinding {
   changedPaths: string[];
   commandId: string;
   commandHash: string;
+  declaration: CheckIntent;
+  candidateFingerprint: string;
+  headOid: string;
 }
+
+export interface CheckIntent {
+  schemaVersion: "kerbsflow.check-intent/v1";
+  level: "focused" | "phase" | "full";
+  commandId: string;
+  name: string;
+  executable: string;
+  args: string[];
+  timeoutMs: number;
+  proof: { kind: "stdout_line"; expected: string };
+}
+
+export function checkIntent(level: CheckIntent["level"], command: FocusedCheckCommand): CheckIntent {
+  const commandId = "commandId" in command ? command.commandId : command.name;
+  if (typeof commandId !== "string" || commandId.length === 0 || commandId.length > 256 || !command.executable || !Array.isArray(command.args)
+    || command.args.some(arg => typeof arg !== "string") || !Number.isSafeInteger(command.timeoutMs) || command.timeoutMs <= 0
+    || command.proof?.kind !== "stdout_line" || typeof command.proof.expected !== "string" || command.proof.expected.trim().length === 0
+    || Buffer.byteLength(command.proof.expected) > 1024 || /[\r\n\x00-\x1f]/u.test(command.proof.expected)) {
+    throw new KerbsFlowError("CHECK_INTENT_INVALID", "trusted check needs an explicit bounded positive stdout-line proof");
+  }
+  if (typeof command.name !== "string" || command.name.length > 256 || typeof command.executable !== "string" || command.executable.length > 4096) throw new KerbsFlowError("CHECK_INTENT_INVALID", "trusted check identity is malformed");
+  const intent: CheckIntent = { schemaVersion: "kerbsflow.check-intent/v1", level, commandId, name: command.name, executable: command.executable, args: [...command.args], timeoutMs: command.timeoutMs, proof: { kind: "stdout_line", expected: command.proof.expected } };
+  if (Buffer.byteLength(JSON.stringify(intent)) > 32 * 1024) throw new KerbsFlowError("CHECK_INTENT_INVALID", "trusted check intent exceeds 32 KiB");
+  return deepFreeze(intent);
+}
+
+export function checkIntentHash(intent: CheckIntent): string { return createHash("sha256").update(JSON.stringify(checkIntent(intent.level, intent))).digest("hex"); }
 
 const PHASE_AUTHORITY = Symbol("kerbsflow.phase-verifier-authority");
 const AUTHORITATIVE_PHASE_RECORDS = new WeakSet<object>();
@@ -60,6 +96,16 @@ export function assertAuthoritativePhaseValidation(value: unknown): asserts valu
 }
 
 export class FocusedVerifier {
+  private readonly intents = new Map<string, CheckIntent>();
+
+  declare(runId: string, level: CheckIntent["level"], command: FocusedCheckCommand): CheckIntent {
+    const intent = checkIntent(level, command);
+    const key = `${runId}:${level}`;
+    const prior = this.intents.get(key);
+    if (prior !== undefined && checkIntentHash(prior) !== checkIntentHash(intent)) throw new KerbsFlowError("CHECK_INTENT_CONFLICT", "declared check intent is immutable");
+    this.intents.set(key, intent);
+    return intent;
+  }
   constructor(
     private readonly git: GitWorktreeManager,
     private readonly sandbox: VerificationCommandSandbox,
@@ -72,8 +118,12 @@ export class FocusedVerifier {
     decision: PlanningDecision,
     executorResult: ExecutorResult,
     command: FocusedCheckCommand,
-  ): Promise<FocusedVerificationResult> {
-    return this.verifyAtLevel("focused", intake, worktree, decision, executorResult, command);
+  ): Promise<FocusedVerificationResult & { authoritative: AuthoritativePhaseValidation }> {
+    const declaration = checkIntent("focused", command);
+    const verification = await this.verifyAtLevel("focused", intake, worktree, decision, executorResult, declaration);
+    const authoritative = deepFreeze({ bundle: verification.bundle, binding: phaseBindingFor(worktree, verification.inspection, declaration), [PHASE_AUTHORITY]: true }) as AuthoritativePhaseValidation;
+    AUTHORITATIVE_PHASE_RECORDS.add(authoritative);
+    return { ...verification, authoritative };
   }
 
   async verifyPhase(
@@ -86,6 +136,7 @@ export class FocusedVerifier {
     if (command.level !== "phase" || typeof command.commandId !== "string" || command.commandId.trim().length === 0) {
       throw new KerbsFlowError("PHASE_CHECK_AUTHORITY_REQUIRED", "phase verification requires an explicit phase command identity; focused check configuration cannot be promoted");
     }
+    command = checkIntent("phase", command) as PhaseCheckCommand;
     const verification = await this.verifyAtLevel("phase", intake, worktree, decision, executorResult, command);
     const authoritative = deepFreeze({
       bundle: verification.bundle,
@@ -96,14 +147,38 @@ export class FocusedVerifier {
     return { verification, authoritative };
   }
 
+  async verifyFull(
+    intake: RepositoryIntake,
+    worktree: WorktreeRecord,
+    decision: PlanningDecision,
+    executorResult: ExecutorResult,
+    command: FullCheckCommand,
+  ): Promise<{ verification: FocusedVerificationResult; authoritative: AuthoritativePhaseValidation }> {
+    if (command.level !== "full" || typeof command.commandId !== "string" || command.commandId.trim().length === 0) {
+      throw new KerbsFlowError("FULL_CHECK_AUTHORITY_REQUIRED", "phase verification requires an explicit phase command identity; focused check configuration cannot be promoted");
+    }
+    command = checkIntent("full", command) as FullCheckCommand;
+    const verification = await this.verifyAtLevel("full", intake, worktree, decision, executorResult, command);
+    const authoritative = deepFreeze({
+      bundle: verification.bundle,
+      binding: phaseBindingFor(worktree, verification.inspection, command),
+      [PHASE_AUTHORITY]: true,
+    }) as AuthoritativePhaseValidation;
+    AUTHORITATIVE_PHASE_RECORDS.add(authoritative);
+    return { verification, authoritative };
+  }
+
   private async verifyAtLevel(
-    level: "focused" | "phase",
+    level: "focused" | "phase" | "full",
     intake: RepositoryIntake,
     worktree: WorktreeRecord,
     decision: PlanningDecision,
     executorResult: ExecutorResult,
     command: FocusedCheckCommand,
   ): Promise<FocusedVerificationResult> {
+    const declared = this.intents.get(`${decision.runId}:${level}`);
+    if (declared === undefined || checkIntentHash(declared) !== checkIntentHash(checkIntent(level, command))) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "executed check differs from trusted launch declaration");
+    command = declared;
     const originalBefore = this.git.snapshot(intake.repositoryPath);
     const preCheckInspection = this.git.inspect(worktree);
     const { result: checkResult, capability: sandboxCapability } = await this.sandbox.run(command, worktree.path);
@@ -115,7 +190,8 @@ export class FocusedVerifier {
     const blockingSignals = suspiciousSignals.filter((signal) => signal.blocksPass);
     const executorDisagreements = compareExecutorClaims(executorResult, preCheckInspection.changedPaths, checkResult);
     const verifierMutations = compareVerificationSnapshots(originalBefore, originalAfter, preCheckInspection, inspection);
-    const checkPassed = checkResult.exitKind === "normal" && checkResult.exitCode === 0;
+    const proofPassed = !checkResult.stdoutTruncated && !checkResult.stderrTruncated && checkResult.stdout.split(/\r?\n/u).includes(command.proof.expected);
+    const checkPassed = checkResult.exitKind === "normal" && checkResult.exitCode === 0 && proofPassed;
     const passed = originalUnchanged
       && inspection.baseOid === intake.baseOid
       && checkPassed
@@ -125,7 +201,7 @@ export class FocusedVerifier {
       && verifierMutations.length === 0;
     const evidence: ValidationEvidence[] = [
       this.evidence("diff", "inspected", `Git independently reported ${inspection.changedPaths.length} changed path(s) from base ${intake.baseOid}`),
-      this.evidence("command", "automatically_tested", `${level === "phase" ? `${(command as PhaseCheckCommand).commandId}: ` : ""}${command.name} exited as ${checkResult.exitKind} code ${String(checkResult.exitCode)}`),
+      this.evidence("command", "automatically_tested", `${level === "phase" ? `${(command as PhaseCheckCommand).commandId}: ` : ""}${command.name} exited as ${checkResult.exitKind} code ${String(checkResult.exitCode)}; declared positive proof ${proofPassed ? "matched" : "missing or inconclusive"}`),
       this.evidence("review", "inspected", suspiciousSignals.length === 0 ? "anti-greenwashing scan found no suspicious signal" : `anti-greenwashing signals: ${suspiciousSignals.map((signal) => signal.code).join("; ")}`),
       this.evidence("other", "inspected", originalUnchanged ? "original checkout remains clean at the recorded base" : "original checkout no longer matches the clean recorded base"),
       this.evidence("other", "inspected", verifierMutations.length === 0 ? "focused check did not mutate managed Git evidence" : `focused-check mutations: ${verifierMutations.join("; ")}`),
@@ -174,22 +250,25 @@ export class FocusedVerifier {
   }
 }
 
-export function bindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection): Omit<PhaseValidationBinding, "commandId" | "commandHash"> {
+export function bindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection): Omit<PhaseValidationBinding, "commandId" | "commandHash" | "declaration"> {
   return {
     worktreePath: worktree.path,
     worktreeGitDirectory: worktree.worktreeGitDirectory,
     baseOid: worktree.baseOid,
     diffHash: createHash("sha256").update(inspection.diff).digest("hex"),
     changedPathsHash: createHash("sha256").update(JSON.stringify(inspection.changedPaths)).digest("hex"),
-    changedPaths: inspection.changedPaths,
+    changedPaths: [...inspection.changedPaths],
+    headOid: inspection.headOid,
+    candidateFingerprint: inspection.candidateFingerprint,
   };
 }
 
-function phaseBindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection, command: PhaseCheckCommand): PhaseValidationBinding {
+function phaseBindingFor(worktree: WorktreeRecord, inspection: WorktreeInspection, command: CheckIntent | PhaseCheckCommand | FullCheckCommand): PhaseValidationBinding {
   return {
     ...bindingFor(worktree, inspection),
     commandId: command.commandId,
-    commandHash: createHash("sha256").update(JSON.stringify(command)).digest("hex"),
+    commandHash: checkIntentHash(checkIntent(command.level, command)),
+    declaration: checkIntent(command.level, command),
   };
 }
 
@@ -220,7 +299,8 @@ function compareVerificationSnapshots(
     mutations.push("focused check mutated the original human-owned checkout");
   }
   if (
-    worktreeBefore.headOid !== worktreeAfter.headOid
+    worktreeBefore.candidateFingerprint !== worktreeAfter.candidateFingerprint
+    || worktreeBefore.headOid !== worktreeAfter.headOid
     || JSON.stringify(worktreeBefore.status) !== JSON.stringify(worktreeAfter.status)
     || JSON.stringify(worktreeBefore.changedPaths) !== JSON.stringify(worktreeAfter.changedPaths)
     || worktreeBefore.diff !== worktreeAfter.diff

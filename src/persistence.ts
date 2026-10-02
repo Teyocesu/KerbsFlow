@@ -1,6 +1,8 @@
+import { execFileSync } from "node:child_process";
+import { hostname } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeSync } from "node:fs";
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, rmdirSync, openSync, readSync, realpathSync, rmSync, statSync, unlinkSync, writeSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 
 import {
@@ -57,7 +59,8 @@ import { Clock, IdSource, RandomIdSource, SystemClock } from "./runtime.js";
 import { assertLegalTransition } from "./state-machine.js";
 import { DatabaseIntegrityError, IdempotencyConflictError, KerbsFlowError, NotFoundError, StateVersionConflictError } from "./errors.js";
 import { containsLikelySecret, SENSITIVE_RESULT_REJECTION } from "./secrets.js";
-import { assertAuthoritativePhaseValidation, type AuthoritativePhaseValidation, type PhaseValidationBinding } from "./verifier.js";
+import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
+import { checkIntent, checkIntentHash, type CheckIntent, type FocusedCheckCommand, assertAuthoritativePhaseValidation, type AuthoritativePhaseValidation, type PhaseValidationBinding } from "./verifier.js";
 import { assertReviewDispatchAuthority, type ReviewDispatchAuthority } from "./reviewer.js";
 import {
   assertAttemptRoutingBinding,
@@ -70,7 +73,7 @@ import {
   type TrustedAttemptRoutingProvenance,
   type TrustedRoutingDecision,
 } from "./routing.js";
-import { atomicWritePrivateFile, ensurePrivateDirectory, pathIsWithin } from "./paths.js";
+import { atomicWritePrivateFile, ensurePrivateDirectory, pathIsWithin, readPrivateFileWithin } from "./paths.js";
 
 export type SqlValue = string | number | bigint | Uint8Array | null;
 
@@ -448,6 +451,46 @@ export const MIGRATIONS: readonly Migration[] = [
       );
     `,
   },
+  {
+    version: 13,
+    name: "phase7-validation-intent-and-candidate",
+    sql: `
+      CREATE TABLE validation_intents (
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        level TEXT NOT NULL CHECK (level IN ('focused', 'phase', 'full')),
+        intent_json TEXT NOT NULL,
+        intent_hash TEXT NOT NULL CHECK (length(intent_hash) = 64),
+        PRIMARY KEY (run_id, level)
+      ) STRICT;
+      ALTER TABLE phase_validation_authority ADD COLUMN declaration_json TEXT;
+      ALTER TABLE phase_validation_authority ADD COLUMN candidate_fingerprint TEXT;
+      ALTER TABLE phase_validation_authority ADD COLUMN head_oid TEXT;
+    `,
+  },
+  {
+    version: 14,
+    name: "phase7-release-readiness-bundles",
+    sql: `
+      CREATE TABLE release_bundles (
+        gate_id TEXT PRIMARY KEY REFERENCES human_gates(gate_id),
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        full_validation_id TEXT NOT NULL REFERENCES validations(validation_id),
+        candidate_fingerprint TEXT NOT NULL,
+        head_oid TEXT NOT NULL,
+        bundle_json TEXT NOT NULL CHECK (length(CAST(bundle_json AS BLOB)) <= 131072),
+        bundle_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      ) STRICT;
+      CREATE TABLE release_corrections (
+        gate_id TEXT PRIMARY KEY REFERENCES release_bundles(gate_id),
+        run_id TEXT NOT NULL REFERENCES runs(run_id),
+        command_id TEXT NOT NULL UNIQUE,
+        actor TEXT NOT NULL CHECK (actor = 'human'),
+        note TEXT NOT NULL CHECK (length(CAST(note AS BLOB)) <= 2048),
+        created_at TEXT NOT NULL
+      ) STRICT;
+    `,
+  },
 ];
 
 export type SemanticReviewLifecycle = "PREPARED" | "RUNNING" | "SUCCEEDED" | "FAILED" | "UNKNOWN";
@@ -753,6 +796,7 @@ export interface StateStoreOptions {
   ids?: IdSource;
   migrations?: readonly Migration[];
   busyTimeoutMs?: number;
+  recoverOwner?: boolean;
 }
 
 export class StateStore {
@@ -786,7 +830,7 @@ export class StateStore {
     const targetVersion = migrations.at(-1)?.version ?? 0;
     const file = databasePath === ":memory:" ? undefined : prepareDatabasePath(databasePath);
     if (file !== undefined && StateStore.openFiles.has(file.path)) throw new KerbsFlowError("DATABASE_OWNER_EXISTS", "database already has an active KerbsFlow owner in this process");
-    const ownerLock = file === undefined ? undefined : acquireDatabaseOwner(file.path);
+    const ownerLock = file === undefined ? undefined : acquireDatabaseOwner(file.path, options.recoverOwner === true);
     if (file !== undefined) StateStore.openFiles.add(file.path);
     let db: DatabaseSync;
     try {
@@ -911,6 +955,21 @@ export class StateStore {
     return row === undefined ? undefined : parseValidationRow(row);
   }
 
+  hasReleaseCorrections(gateId: GateId): boolean {
+    this.assertOpen();
+    return this.db.prepare("SELECT gate_id FROM release_corrections WHERE gate_id = ?").get(gateId) !== undefined;
+  }
+
+  getReleaseBundle(gateId: GateId): { headOid: string; candidateFingerprint: string; bundle: JsonValue; bundleHash: string } | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM release_bundles WHERE gate_id = ?").get(gateId) as Row | undefined;
+    if (row === undefined) return undefined;
+    const json = stringValue(row.bundle_json, "release_bundle");
+    const hash = createHash("sha256").update(json).digest("hex");
+    if (hash !== row.bundle_hash) throw new KerbsFlowError("RELEASE_BUNDLE_CORRUPT", "release evidence bundle hash differs");
+    return { headOid: stringValue(row.head_oid, "head_oid"), candidateFingerprint: stringValue(row.candidate_fingerprint, "candidate_fingerprint"), bundle: JSON.parse(json) as JsonValue, bundleHash: hash };
+  }
+
   getPhaseValidationAuthority(validationId: ValidationId): StoredPhaseValidationAuthority | undefined {
     this.assertOpen();
     const row = this.db.prepare("SELECT * FROM phase_validation_authority WHERE validation_id = ?").get(validationId) as Row | undefined;
@@ -1012,16 +1071,44 @@ export class StateStore {
     });
   }
 
+  recordValidationIntent(runId: RunId, level: CheckIntent["level"], command: FocusedCheckCommand): CheckIntent {
+    const intent = checkIntent(level, command);
+    const hash = checkIntentHash(intent);
+    this.withTransaction(tx => {
+      const prior = tx.get("SELECT intent_hash FROM validation_intents WHERE run_id = ? AND level = ?", runId, level);
+      if (prior !== undefined && prior.intent_hash !== hash) throw new KerbsFlowError("CHECK_INTENT_CONFLICT", "persisted launch check declaration is immutable");
+      if (prior === undefined) tx.run("INSERT INTO validation_intents (run_id, level, intent_json, intent_hash) VALUES (?, ?, ?, ?)", runId, level, JSON.stringify(intent), hash);
+    });
+    return intent;
+  }
+
+  getValidationIntent(runId: RunId, level: CheckIntent["level"]): CheckIntent | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM validation_intents WHERE run_id = ? AND level = ?").get(runId, level) as Row | undefined;
+    if (row === undefined) return undefined;
+    const raw = JSON.parse(stringValue(row.intent_json, "validation_intent")) as CheckIntent;
+    const parsed = checkIntent(level, raw);
+    if (checkIntentHash(parsed) !== row.intent_hash) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "persisted check declaration hash differs");
+    return parsed;
+  }
+
   recordAuthoritativePhaseValidation(value: AuthoritativePhaseValidation): StoredValidation {
     this.assertOpen();
     assertAuthoritativePhaseValidation(value);
     const bundle = parseValidationBundle(value.bundle);
-    if (bundle.level !== "phase") {
+    if (bundle.level !== "focused" && bundle.level !== "phase" && bundle.level !== "full") {
       throw new KerbsFlowError("VALIDATION_LEVEL_MISMATCH", "authoritative phase recording requires phase-level evidence");
     }
+    const declaration = this.getValidationIntent(bundle.runId, bundle.level as "focused" | "phase" | "full");
+    if (declaration === undefined || value.binding.declaration.level !== bundle.level || checkIntentHash(declaration) !== value.binding.commandHash || checkIntentHash(value.binding.declaration) !== value.binding.commandHash || declaration.commandId !== value.binding.commandId) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "validation authority differs from persisted trusted declaration");
+    const owned = this.getWorktree(bundle.runId);
+    if (owned === undefined) throw new KerbsFlowError("VALIDATION_WORKTREE_MISMATCH", "validation requires persisted worktree ownership");
+    const candidate: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: bundle.runId, ...owned, path: owned.worktreePath };
+    const inspection = new GitWorktreeManager(dirname(dirname(owned.markerPath))).inspect(candidate);
+    if (inspection.candidateFingerprint !== value.binding.candidateFingerprint || inspection.headOid !== value.binding.headOid) throw new KerbsFlowError("VALIDATION_CANDIDATE_STALE", "candidate changed before authority persistence");
     return this.withTransaction((tx) => {
       const run = tx.get("SELECT state, current_task_id, active_attempt_id FROM runs WHERE run_id = ?", bundle.runId) as Row | undefined;
-      if (run?.state !== "VERIFY_PHASE" || run.current_task_id !== bundle.taskId || run.active_attempt_id !== bundle.attemptId) {
+      if (run?.state !== (bundle.level === "full" ? "FINAL_VERIFY" : bundle.level === "focused" ? "VERIFY_FOCUSED" : "VERIFY_PHASE") || run.current_task_id !== bundle.taskId || run.active_attempt_id !== bundle.attemptId) {
         throw new KerbsFlowError("VALIDATION_SCOPE_MISMATCH", "phase validation does not match the current VERIFY_PHASE run/task/attempt");
       }
       const worktree = tx.get("SELECT worktree_path, worktree_git_directory, base_oid FROM worktrees WHERE run_id = ?", bundle.runId) as Row | undefined;
@@ -1039,7 +1126,7 @@ export class StateStore {
       }
       const now = this.clock.now();
       tx.run("INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, bundle.runId, bundle.taskId, bundle.attemptId ?? null, bundle.level, bundle.outcome, JSON.stringify(bundle), now);
-      tx.run("INSERT INTO phase_validation_authority (validation_id, worktree_path, worktree_git_directory, base_oid, diff_hash, changed_paths_hash, changed_paths_json, created_at, command_id, command_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, value.binding.worktreePath, value.binding.worktreeGitDirectory, value.binding.baseOid, value.binding.diffHash, value.binding.changedPathsHash, JSON.stringify(value.binding.changedPaths), now, value.binding.commandId, value.binding.commandHash);
+      tx.run("INSERT INTO phase_validation_authority (validation_id, worktree_path, worktree_git_directory, base_oid, diff_hash, changed_paths_hash, changed_paths_json, created_at, command_id, command_hash, declaration_json, candidate_fingerprint, head_oid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", bundle.validationId, value.binding.worktreePath, value.binding.worktreeGitDirectory, value.binding.baseOid, value.binding.diffHash, value.binding.changedPathsHash, JSON.stringify(value.binding.changedPaths), now, value.binding.commandId, value.binding.commandHash, JSON.stringify(value.binding.declaration), value.binding.candidateFingerprint, value.binding.headOid);
       return parseValidationRow(tx.get("SELECT * FROM validations WHERE validation_id = ?", bundle.validationId)!);
     });
   }
@@ -1550,6 +1637,23 @@ export class StateStore {
     });
   }
 
+  replayRecoverySettlement(request: { runId: RunId; commandId: CommandId; idempotencyKey: string; expectedStateVersion: number }): CommandResult | undefined {
+    this.assertOpen();
+    const row = this.db.prepare("SELECT * FROM commands WHERE command_id = ? OR (run_id = ? AND idempotency_key = ?)").get(request.commandId, request.runId, request.idempotencyKey) as Row | undefined;
+    if (row === undefined) return undefined;
+    const command = parseCommand(JSON.parse(stringValue(row.request_json, "recovery_command")));
+    if (command.commandId !== request.commandId || command.runId !== request.runId || command.idempotencyKey !== request.idempotencyKey || command.expectedStateVersion !== request.expectedStateVersion || command.kind !== "complete_attempt" || command.payload === null || typeof command.payload !== "object" || !("recoveryBinding" in command.payload)) throw new IdempotencyConflictError(request.idempotencyKey);
+    const payload = command.payload as { attemptId: string; recoveryBinding: { providerIdentityJson: string; adapterDescriptorJson: string; candidateFingerprint: string } };
+    const run = this.getRun(request.runId);
+    const attempt = run?.activeAttemptId === null || run?.activeAttemptId === undefined ? undefined : this.getAttempt(run.activeAttemptId);
+    const owned = this.getWorktree(request.runId);
+    if (attempt?.attemptId !== payload.attemptId || attempt.providerIdentityJson !== payload.recoveryBinding.providerIdentityJson || attempt.adapterDescriptorJson !== payload.recoveryBinding.adapterDescriptorJson || owned === undefined) throw new IdempotencyConflictError(request.idempotencyKey);
+    const candidate: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: request.runId, ...owned, path: owned.worktreePath };
+    if (new GitWorktreeManager(dirname(dirname(owned.markerPath))).inspect(candidate).candidateFingerprint !== payload.recoveryBinding.candidateFingerprint) throw new IdempotencyConflictError(request.idempotencyKey);
+    const result = parseCommandResult(JSON.parse(stringValue(row.result_json, "recovery_result")));
+    return { ...result, replayed: true };
+  }
+
   replayCommand(command: Command): CommandResult | undefined {
     this.assertOpen();
     const validated = parseCommand(command);
@@ -1822,9 +1926,70 @@ interface DatabaseOwnerLock {
   release(): void;
 }
 
-function acquireDatabaseOwner(databasePath: string): DatabaseOwnerLock {
+function acquireDatabaseOwner(databasePath: string, recover = false): DatabaseOwnerLock {
+  const guard = `${databasePath}.owner-operation`;
+  try { mkdirSync(guard, { mode: 0o700 }); }
+  catch { throw new KerbsFlowError("DATABASE_OWNER_BUSY", "database acquisition/recovery is already in progress; ambiguous guard is retained"); }
+  try {
+    const ownerPath = `${databasePath}.owner`;
+    if (recover && !existsSync(ownerPath)) throw new KerbsFlowError("DATABASE_OWNER_NOT_FOUND", "explicit recovery requires an existing exact owner record");
+    if (recover && existsSync(ownerPath)) {
+      const exact = readPrivateFileWithin(dirname(databasePath), basename(ownerPath), 16 * 1024);
+      const old = JSON.parse(exact.toString("utf8")) as DatabaseOwnerIdentity;
+      const context = ownerContext();
+      if (old.schemaVersion !== "kerbsflow.database-owner/v2" || old.host !== context.host || old.boot !== context.boot || !Number.isSafeInteger(old.pid) || old.pid <= 0 || typeof old.birth !== "string" || !/^\w{3} \w{3}\s+\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/u.test(old.birth) || typeof old.nonce !== "string" || !/^[a-f0-9-]{36}$/u.test(old.nonce) || !Number.isFinite(Date.parse(old.acquiredAt))) throw new KerbsFlowError("DATABASE_OWNER_AMBIGUOUS", "legacy or foreign host/boot owner cannot be recovered automatically");
+      const observed = processBirth(old.pid);
+      if (observed === old.birth) throw new KerbsFlowError("DATABASE_OWNER_EXISTS", "the exact database owner is still live");
+      if (observed === null) {
+        try { process.kill(old.pid, 0); throw new KerbsFlowError("DATABASE_OWNER_AMBIGUOUS", "process observation and liveness disagree"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+      }
+      if (!readPrivateFileWithin(dirname(databasePath), basename(ownerPath), 16 * 1024).equals(exact)) throw new KerbsFlowError("DATABASE_OWNER_CHANGED", "owner changed during explicit recovery");
+      unlinkSync(ownerPath);
+    }
+    return acquireDatabaseOwnerRecord(databasePath);
+  } finally { rmdirSync(guard); }
+}
+
+interface DatabaseOwnerIdentity {
+  schemaVersion: "kerbsflow.database-owner/v2";
+  host: string;
+  boot: string;
+  pid: number;
+  birth: string;
+  nonce: string;
+  acquiredAt: string;
+}
+
+function ownerContext(): { host: string; boot: string } {
+  if (process.platform === "darwin") {
+    const boot = execFileSync("/usr/sbin/sysctl", ["-n", "kern.boottime"], { encoding: "utf8", maxBuffer: 4096 }).trim();
+    const machine = execFileSync("/usr/sbin/ioreg", ["-rd1", "-c", "IOPlatformExpertDevice"], { encoding: "utf8", maxBuffer: 64 * 1024 }).match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/u)?.[1];
+    if (!machine || !boot) throw new KerbsFlowError("DATABASE_OWNER_UNPROVEN", "macOS host/boot identity unavailable");
+    return { host: createHash("sha256").update(machine).digest("hex"), boot };
+  }
+  if (process.platform === "linux") return {
+    host: createHash("sha256").update(hostname()).update(execFileSync("/bin/cat", ["/etc/machine-id"], { maxBuffer: 4096 })).digest("hex"),
+    boot: execFileSync("/bin/cat", ["/proc/sys/kernel/random/boot_id"], { encoding: "utf8", maxBuffer: 4096 }).trim(),
+  };
+  throw new KerbsFlowError("DATABASE_OWNER_UNPROVEN", "database owner recovery is unsupported on this platform");
+}
+
+function processBirth(pid: number): string | null {
+  try {
+    const birth = execFileSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", env: { PATH: "/usr/bin:/bin", LC_ALL: "C", TZ: "UTC" }, maxBuffer: 4096 }).trim();
+    if (!birth) throw new Error("empty process identity");
+    return birth;
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return null;
+    throw new KerbsFlowError("DATABASE_OWNER_UNPROVEN", "OS process birth observation unavailable");
+  }
+}
+
+function acquireDatabaseOwnerRecord(databasePath: string): DatabaseOwnerLock {
   const path = `${databasePath}.owner`;
   const nonce = randomUUID();
+  const contents = JSON.stringify({ schemaVersion: "kerbsflow.database-owner/v2", ...ownerContext(), birth: processBirth(process.pid), pid: process.pid, acquiredAt: new Date().toISOString(), nonce });
   let fd: number;
   try {
     fd = openSync(path, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | constants.O_NOFOLLOW, 0o600);
@@ -1835,7 +2000,6 @@ function acquireDatabaseOwner(databasePath: string): DatabaseOwnerLock {
     throw new KerbsFlowError("DATABASE_OWNER_UNPROVEN", "database ownership could not be acquired");
   }
   const identity = fstatSync(fd);
-  const contents = JSON.stringify({ schemaVersion: "kerbsflow.database-owner/v1", pid: process.pid, acquiredAt: new Date().toISOString(), nonce });
   try {
     writeSync(fd, contents);
   } catch {
@@ -1850,7 +2014,7 @@ function acquireDatabaseOwner(databasePath: string): DatabaseOwnerLock {
       released = true;
       try {
         const current = lstatSync(path);
-        if (current.isFile() && current.dev === identity.dev && current.ino === identity.ino && readFileSync(path, "utf8") === contents) {
+        if (current.isFile() && current.dev === identity.dev && current.ino === identity.ino && readPrivateFileWithin(dirname(path), basename(path), 16 * 1024).toString("utf8") === contents) {
           unlinkSync(path);
         }
       } catch {
@@ -2290,6 +2454,9 @@ function parsePhaseValidationAuthorityRow(row: Row): StoredPhaseValidationAuthor
     changedPaths,
     commandId: stringValue(row.command_id, "phase_validation_authority.command_id"),
     commandHash: stringValue(row.command_hash, "phase_validation_authority.command_hash"),
+    declaration: row.declaration_json === null ? null as unknown as CheckIntent : JSON.parse(stringValue(row.declaration_json, "declaration_json")) as CheckIntent,
+    candidateFingerprint: row.candidate_fingerprint === null ? "legacy_unbound" : stringValue(row.candidate_fingerprint, "candidate_fingerprint"),
+    headOid: row.head_oid === null ? "legacy_unbound" : stringValue(row.head_oid, "head_oid"),
     createdAt: stringValue(row.created_at, "phase_validation_authority.created_at"),
   };
 }

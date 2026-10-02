@@ -1,6 +1,8 @@
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -461,3 +463,77 @@ export function executionRequest(cwd: string, scenario: string, attempt: string)
     expectedResultSchema: CONTRACT_VERSIONS.executorResult,
   };
 }
+
+for (const scenario of ["nonzero-secret", "malformed-jsonl-secret", "malformed-final-secret", "oversized-terminal", "sanitation-failure"] as const) {
+  test(`Codex shared terminal staging rejects unsafe material before promotion: ${scenario}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "kerbsflow-terminal-safety-"));
+    try {
+      const cliPath = createFakeCodex(root);
+      const marker = "sk-syntheticterminalcredential";
+      const body = `if (scenario === ${JSON.stringify(scenario)}) {
+` + (
+        scenario === "oversized-terminal" ? `writeFileSync(resultPath, 'x'.repeat(1024 * 1024 + 1)); process.exit(0);` :
+        scenario === "malformed-final-secret" ? `writeFileSync(resultPath, 'not-json ' + ${JSON.stringify(marker)}); process.exit(0);` :
+        scenario === "malformed-jsonl-secret" ? `console.log('{not-json'); writeFileSync(resultPath, JSON.stringify({...base, summary:${JSON.stringify(marker)}})); process.exit(0);` :
+        `writeFileSync(resultPath, JSON.stringify({...base, summary:${JSON.stringify(marker)}})); process.exit(7);`
+      ) + "\n}\n";
+      writeFileSync(cliPath, readFileSync(cliPath, "utf8").replace('if (scenario === "unknown-event")', body + 'if (scenario === "unknown-event")'));
+      const adapter = new CodexAdapter({ cliPath, runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+      const handle = adapter.start(executionRequest(root, scenario, "attempt_terminal_safety"));
+      const path = join(root, "codex-attempts", handle.attemptId, "executor-result.json");
+      if (scenario === "sanitation-failure") {
+        // Wait for exact OS process settlement before constructing a filesystem failure.
+        await adapter.processEvidence(handle.attemptId);
+        rmSync(path);
+        mkdirSync(path);
+        writeFileSync(join(path, "private-diagnostic"), marker);
+      }
+      const raw = await adapter.wait(handle);
+      assert.throws(() => parseExecutorResult(raw));
+      assert.doesNotMatch(JSON.stringify(raw), new RegExp(marker));
+      if (scenario !== "sanitation-failure") {
+        assert.doesNotMatch(readFileSync(path, "utf8"), new RegExp(marker));
+        assert.ok(readFileSync(path).byteLength < 1024);
+        const restarted = new CodexAdapter({ cliPath, runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+        assert.equal((await restarted.reconcile({ runId: handle.runId, taskId: handle.taskId, attemptId: handle.attemptId })).outcome, "unknown");
+      }
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+}
+
+test("Codex reviewer terminal failure sanitizes its exact staging before returning", async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-review-staging-"));
+  try {
+    const cliPath = createFakeCodex(root);
+    const marker = "sk-syntheticreviewcredential";
+    writeFileSync(cliPath, readFileSync(cliPath, "utf8").replace('if (schemaPath.includes("semantic-review-result.schema.json")) {', `if (schemaPath.includes("semantic-review-result.schema.json")) { writeFileSync(resultPath, ${JSON.stringify(marker)}); console.log('{invalid-jsonl'); process.exit(7); }\nif (schemaPath.includes("semantic-review-result.schema.json")) {`));
+    const adapter = new CodexAdapter({ cliPath, runtimeRoot: root, environment: { PATH: process.env.PATH, HOME: root } });
+    const handle = adapter.startReview({ schemaVersion: CONTRACT_VERSIONS.semanticReviewRequest, reviewAttemptId: asReviewId("review_unsafe"), runId: asRunId("run_codex"), taskId: asTaskId("task_codex"), attemptId: asAttemptId("attempt_review"), role: "review", workingDirectory: root, promptSummary: "synthetic reviewer", model: "fixture-model", permissionPolicy: { filesystem: "read_only", network: "denied" }, canonicalContextHash: "canonical", diffHash: "diff", validationIds: [], expectedResultSchema: CONTRACT_VERSIONS.semanticReviewResult });
+    const returned = await adapter.waitReview(handle);
+    assert.throws(() => parseSemanticReviewResult(returned));
+    assert.doesNotMatch(JSON.stringify(returned), new RegExp(marker));
+    assert.doesNotMatch(readFileSync(join(root, "codex-reviews", handle.reviewAttemptId, "semantic-review-result.json"), "utf8"), new RegExp(marker));
+    assert.deepEqual(await adapter.waitReview(handle), returned);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("public Codex smoke rejects absent opt-in before CLI invocation and proves its bounded phase with a synthetic CLI", () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-public-smoke-"));
+  try {
+    const cliPath = createFakeCodex(root);
+    writeFileSync(cliPath, readFileSync(cliPath, "utf8").replaceAll('result.txt', 'hello.txt').replaceAll('done\\n', 'KerbsFlow live smoke\\n'));
+    const script = fileURLToPath(new URL("../../scripts/live-codex-smoke.mjs", import.meta.url));
+    const disabled = spawnSync(process.execPath, [script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: root, CODEX_BIN: join(root, "must-not-execute") }, timeout: 5000 });
+    assert.equal(disabled.status, 1);
+    assert.match(disabled.stderr, /set KERBSFLOW_LIVE_CODEX=1/);
+    assert.doesNotMatch(disabled.stderr, /spawn.*must-not-execute/);
+    const enabled = spawnSync(process.execPath, [script], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: root, CODEX_BIN: cliPath, KERBSFLOW_LIVE_CODEX: "1" }, timeout: 30000, maxBuffer: 256 * 1024 });
+    assert.equal(enabled.status, 0, enabled.stderr + enabled.stdout);
+    const result = JSON.parse(enabled.stdout);
+    assert.equal(result.verdict, "PASS");
+    assert.match(result.boundary, /NEXT_PHASE only/);
+    assert.equal(result.validation, "passed");
+    assert.equal(result.originalStatus, "");
+    assert.deepEqual(result.changedPaths, ["hello.txt"]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

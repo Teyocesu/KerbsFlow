@@ -9,7 +9,7 @@ export function createGitRepository(): { root: string; head: string } {
   git(root, ["config", "user.name", "KerbsFlow Test"]);
   git(root, ["config", "user.email", "kerbsflow@example.invalid"]);
   writeFileSync(join(root, "README.md"), "synthetic repository\n", "utf8");
-  writeFileSync(join(root, "check.mjs"), "import { readFileSync } from 'node:fs';\nif (readFileSync('result.txt', 'utf8') !== 'done\\n') process.exit(1);\n", "utf8");
+  writeFileSync(join(root, "check.mjs"), "import { readFileSync } from 'node:fs';\nif (readFileSync('result.txt', 'utf8') !== 'done\\n') process.exit(1);\nconsole.log('KERBSFLOW_CHECK_PASSED');\n", "utf8");
   mkdirSync(join(root, "test"));
   writeFileSync(join(root, "test/example.test.ts"), "assert.equal(value, true);\n", "utf8");
   mkdirSync(join(root, "docs"));

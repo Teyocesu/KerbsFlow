@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 
 import {
@@ -12,6 +13,7 @@ import {
   ExecutorResult,
   FailureClassification,
   HumanGate,
+  GateId,
   JsonValue,
   ReviewDecision,
   ReconcileOutcome,
@@ -65,7 +67,7 @@ import { detectAntiGreenwashing } from "./anti-greenwashing.js";
 import { decideTrustedReview } from "./phase3.js";
 import { hashCanonicalDocuments } from "./canonical.js";
 import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
-import { bindingFor } from "./verifier.js";
+import { bindingFor, checkIntentHash } from "./verifier.js";
 import {
   PHASE4_ROUTING_POLICY,
   assertAttemptRoutingBinding,
@@ -89,6 +91,8 @@ import {
   parsePlanningSteerObservation,
   type PlanningSteerObservation,
 } from "./planning.js";
+
+import { assertRecoverySettlementAuthority, type RecoverySettlementAuthority } from "./run-coordinator.js";
 
 export interface CoreOptions {
   store: StateStore;
@@ -556,11 +560,35 @@ export class KerbsFlowCore {
     return result;
   }
 
+  recoveryCandidateFingerprint(runId: RunId): string {
+    const stored = this.store.getWorktree(runId);
+    if (stored === undefined) throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "recovery requires the owned candidate");
+    const worktree: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: runId, repositoryPath: stored.repositoryPath, gitCommonDirectory: stored.gitCommonDirectory, worktreeGitDirectory: stored.worktreeGitDirectory, baseOid: stored.baseOid, branch: stored.branch, path: stored.worktreePath, markerPath: stored.markerPath, createdAt: stored.createdAt };
+    return new GitWorktreeManager(dirname(dirname(stored.markerPath))).inspect(worktree).candidateFingerprint;
+  }
+
+  async inspectRecoveryOutcome(runId: RunId): Promise<ReconcileOutcome> {
+    const run = this.requiredModel(runId).run;
+    const attempt = this.requiredAttempt(run.activeAttemptId);
+    return this.adapter.reconcile({ runId, taskId: attempt.taskId, attemptId: attempt.attemptId });
+  }
+
+  async settleRecoveredAttempt(authority: RecoverySettlementAuthority): Promise<CommandResult> {
+    assertRecoverySettlementAuthority(authority);
+    const attempt = this.requiredAttempt(authority.attemptId);
+    if (attempt.runId !== authority.runId || attempt.taskId !== authority.taskId || attempt.providerIdentityJson !== authority.providerIdentityJson || attempt.adapterDescriptorJson !== authority.adapterDescriptorJson || this.recoveryCandidateFingerprint(authority.runId) !== authority.candidateFingerprint) throw new KerbsFlowError("RECOVERY_SETTLEMENT_STALE", "terminal evidence does not match persisted attempt, provider handle, and candidate");
+    const descriptor = parseAdapterDescriptor(JSON.parse(authority.adapterDescriptorJson));
+    if (authority.result.executor.adapter !== descriptor.adapter) throw new KerbsFlowError("RECOVERY_PROVIDER_MISMATCH", "terminal result differs from the persisted provider boundary");
+    if (authority.result.runId !== authority.runId || authority.result.taskId !== authority.taskId || authority.result.attemptId !== authority.attemptId) throw new KerbsFlowError("RESULT_SCOPE_MISMATCH", "recovery terminal result belongs to a different attempt");
+    return this.completeAttempt(authority.runId, authority.expectedStateVersion, authority.idempotencyKey, authority.result, authority);
+  }
+
   async completeFakeAttempt(runId: RunId, expectedStateVersion: number, idempotencyKey: string, suppliedResult?: unknown): Promise<CommandResult> {
     return this.completeAttempt(runId, expectedStateVersion, idempotencyKey, suppliedResult);
   }
 
-  async completeAttempt(runId: RunId, expectedStateVersion: number, idempotencyKey: string, suppliedResult?: unknown): Promise<CommandResult> {
+  async completeAttempt(runId: RunId, expectedStateVersion: number, idempotencyKey: string, suppliedResult?: unknown, recovery?: RecoverySettlementAuthority): Promise<CommandResult> {
+    if (recovery !== undefined) assertRecoverySettlementAuthority(recovery);
     const model = this.requiredModel(runId);
     const attempt = this.requiredAttempt(model.run.activeAttemptId);
     let rawResult = suppliedResult;
@@ -581,6 +609,7 @@ export class KerbsFlowCore {
     } catch {
       rawJson = { schemaVersion: "kerbsflow.executor-result/invalid", error: "result was not JSON data" };
     }
+    if (containsLikelySecret(rawJson)) rawJson = { schemaVersion: "kerbsflow.executor-result/invalid", error: "likely credential material rejected before persistence" };
     let parsed: ExecutorResult | undefined;
     let malformedReason: string | undefined;
     try {
@@ -601,9 +630,10 @@ export class KerbsFlowCore {
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "complete_attempt", {
       attemptId: attempt.attemptId,
       result: rawJson,
-    });
+      ...(recovery === undefined ? {} : { recoveryBinding: { providerIdentityJson: recovery.providerIdentityJson, adapterDescriptorJson: recovery.adapterDescriptorJson, candidateFingerprint: recovery.candidateFingerprint } }),
+    }, recovery?.commandId);
     const result = this.store.executeCommand(command, ({ tx, run, now }) => {
-      if (run.state !== "EXECUTE") {
+      if (run.state !== "EXECUTE" && !(run.state === "RECOVERY" && recovery !== undefined && run.activeAttemptId === recovery.attemptId && run.currentTaskId === recovery.taskId)) {
         throw new KerbsFlowError("INVALID_COMMAND_STATE", `attempt completion requires EXECUTE, found ${run.state}`);
       }
       const current = this.attemptInTransaction(tx, attempt.attemptId);
@@ -614,6 +644,7 @@ export class KerbsFlowCore {
       if (cancellation !== undefined) {
         throw new KerbsFlowError("ATTEMPT_CANCELLATION_PENDING", `attempt ${current.attemptId} has durable cancellation intent; normal result ingestion is blocked`);
       }
+      if (recovery !== undefined && (current.providerIdentityJson !== recovery.providerIdentityJson || current.adapterDescriptorJson !== recovery.adapterDescriptorJson || this.recoveryCandidateFingerprint(runId) !== recovery.candidateFingerprint)) throw new KerbsFlowError("RECOVERY_SETTLEMENT_STALE", "recovery identity changed before commit");
       const artifact = this.artifacts.put(runId, "executor-result", JSON.stringify(rawJson), attempt.attemptId);
       const persistedResult = parsed === undefined ? undefined : { ...parsed, artifacts: [...parsed.artifacts, artifact.artifactId] };
       this.insertArtifact(tx, artifact, now);
@@ -636,11 +667,16 @@ export class KerbsFlowCore {
       }
       const lifecycle = outcomeToAttemptLifecycle(persistedResult.outcome);
       tx.run("UPDATE attempts SET lifecycle = ?, outcome_json = ?, failure_class = ?, ended_at = ?, updated_at = ? WHERE attempt_id = ?", lifecycle, JSON.stringify(persistedResult), persistedResult.failureClass, now, now, current.attemptId);
+      if (recovery !== undefined && persistedResult.outcome === "failed") return {
+        transition: { to: "FAILED", actor: "recovery", reasonCode: "recovered_terminal_failure_no_owned_retry", taskId: current.taskId, attemptId: current.attemptId, payload: { failureClass: persistedResult.failureClass } },
+        runPatch: { recoveryRequired: false, recoveryReason: null }, details: { attemptId: current.attemptId, outcome: "failed" },
+      } satisfies CommandMutation;
       if (persistedResult.outcome === "blocked") {
         if (persistedResult.humanGate === null) {
           throw new KerbsFlowError("HUMAN_GATE_REQUIRED", "blocked executor result must contain a human gate");
         }
-        const gate = this.assertExecutorGate(persistedResult.humanGate, runId, current.taskId, current.attemptId);
+        const proposed = this.assertExecutorGate(persistedResult.humanGate, runId, current.taskId, current.attemptId);
+        const gate: HumanGate = { ...proposed, evidenceRefs: [artifact.artifactId], evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(`validation_gate_${proposed.gateId}`), kind: "other", classification: "not_tested", summary: "Core-owned executor result; claims are not independently validated", artifactRef: artifact.artifactId }, ...(proposed.evidence ?? []).map(({ artifactRef: _ref, ...e }) => e)] };
         this.insertGate(tx, gate, now);
         tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", "blocked", now, current.taskId);
         return {
@@ -661,14 +697,14 @@ export class KerbsFlowCore {
         tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", "cancelled", now, current.taskId);
         return {
           transition: {
-            to: "RECOVERY",
-            actor: "adapter",
+            to: recovery === undefined ? "RECOVERY" : "CANCELLED",
+            actor: recovery === undefined ? "adapter" : "recovery",
             reasonCode: "adapter_cancelled",
             taskId: current.taskId,
             attemptId: current.attemptId,
             payload: { outcome: persistedResult.outcome },
           },
-          runPatch: { recoveryRequired: true, recoveryReason: "adapter cancellation requires reconciliation" },
+          runPatch: { recoveryRequired: recovery === undefined, recoveryReason: recovery === undefined ? "adapter cancellation requires reconciliation" : null },
           details: { attemptId: current.attemptId, outcome: persistedResult.outcome },
         } satisfies CommandMutation;
       }
@@ -713,17 +749,9 @@ export class KerbsFlowCore {
       if (attempt.runId !== runId || attempt.taskId !== run.currentTaskId) {
         throw new KerbsFlowError("ATTEMPT_SCOPE_MISMATCH", "active attempt does not belong to the current run and task");
       }
-      tx.run(
-        "INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        bundle.validationId,
-        runId,
-        bundle.taskId,
-        bundle.attemptId ?? null,
-        bundle.level,
-        bundle.outcome,
-        JSON.stringify(bundle),
-        now,
-      );
+      const persisted = this.store.getValidation(bundle.validationId);
+      if (persisted === undefined || canonicalJson(persisted.bundle) !== canonicalJson(bundle)) throw new KerbsFlowError("VALIDATION_AUTHORITY_REQUIRED", "focused validation requires immutable persisted independent authority");
+      this.assertFocusedAuthority(bundle);
       tx.run("UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ?", "review_pending", now, bundle.taskId);
       return {
         transition: {
@@ -824,6 +852,8 @@ export class KerbsFlowCore {
       throw new KerbsFlowError("PHASE_VALIDATION_UNPERSISTED", "trusted phase closure requires a previously persisted authoritative phase validation");
     }
     const validation = persistedValidation.bundle;
+    const declaration = this.store.getValidationIntent(runId, "phase");
+    if (authority.declaration == null || declaration === undefined || checkIntentHash(declaration) !== authority.commandHash || checkIntentHash(authority.declaration) !== authority.commandHash || declaration.commandId !== authority.commandId) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "phase evidence has no matching trusted declaration");
     const storedWorktree = this.store.getWorktree(runId);
     if (storedWorktree === undefined) {
       throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "trusted phase closure requires the persisted owned worktree");
@@ -849,6 +879,8 @@ export class KerbsFlowCore {
       diffHash: authority.diffHash,
       changedPathsHash: authority.changedPathsHash,
       changedPaths: authority.changedPaths,
+      candidateFingerprint: authority.candidateFingerprint,
+      headOid: authority.headOid,
     })) {
       throw new KerbsFlowError("PHASE_VALIDATION_STALE", "owned worktree diff or changed-path evidence changed after phase validation");
     }
@@ -956,6 +988,82 @@ export class KerbsFlowCore {
     });
   }
 
+  completeTrustedFullValidation(runId: RunId, expectedStateVersion: number, idempotencyKey: string, validationId: ValidationId): CommandResult {
+    const persisted = this.store.getValidation(validationId);
+    const authority = this.store.getPhaseValidationAuthority(validationId);
+    const declaration = this.store.getValidationIntent(runId, "full");
+    if (persisted === undefined || authority === undefined || persisted.bundle.level !== "full" || persisted.bundle.runId !== runId || authority.declaration == null || authority.declaration.level !== "full" || declaration === undefined || checkIntentHash(declaration) !== authority.commandHash || checkIntentHash(authority.declaration) !== authority.commandHash || declaration.commandId !== authority.commandId) throw new KerbsFlowError("FULL_VALIDATION_AUTHORITY_REQUIRED", "full completion requires matching persisted full declaration and verifier authority");
+    const binding = this.currentCandidateBinding(runId);
+    if (binding.candidateFingerprint !== authority.candidateFingerprint || binding.headOid !== authority.headOid || binding.diffHash !== authority.diffHash || binding.baseOid !== authority.baseOid || binding.worktreePath !== authority.worktreePath || binding.worktreeGitDirectory !== authority.worktreeGitDirectory) throw new KerbsFlowError("FULL_VALIDATION_STALE", "full evidence belongs to a changed candidate");
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "validation", { validationId, level: "full", candidateFingerprint: authority.candidateFingerprint });
+    return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
+      const validation = persisted.bundle;
+      if (run.state !== "FINAL_VERIFY" || validation.taskId !== run.currentTaskId || validation.attemptId !== run.activeAttemptId) throw new KerbsFlowError("VALIDATION_SCOPE_MISMATCH", "full evidence differs from current FINAL_VERIFY context");
+      if (validation.outcome !== "passed" || validation.checks.length === 0 || validation.checks.some(check => check.outcome !== "passed") || !validation.evidence.some(e => e.kind === "command" && e.classification === "automatically_tested")) return { transition: { to: "FAILED", actor: "verifier", reasonCode: "full_validation_failed", taskId: validation.taskId, attemptId: validation.attemptId, payload: { validationId } }, details: { validationId, outcome: "failed" } } satisfies CommandMutation;
+      const phaseRows = tx.all("SELECT validation_id, level, outcome, bundle_json FROM validations WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND level = 'phase' ORDER BY created_at DESC LIMIT 20", runId, validation.taskId, validation.attemptId!);
+      const acceptedPhaseIds = new Set(tx.all("SELECT payload_json FROM transitions WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND from_state = 'VERIFY_PHASE' AND to_state = 'NEXT_PHASE' AND reason_code = 'trusted_phase_close'", runId, validation.taskId, validation.attemptId!).map(row => (JSON.parse(String(row.payload_json)) as { validationId?: string }).validationId));
+      const matchingPhase = phaseRows.filter(row => {
+        const phaseAuthority = this.store.getPhaseValidationAuthority(asValidationId(String(row.validation_id)));
+        return row.outcome === "passed" && acceptedPhaseIds.has(String(row.validation_id)) && phaseAuthority?.candidateFingerprint === authority.candidateFingerprint;
+      });
+      if (matchingPhase.length === 0) throw new KerbsFlowError("RELEASE_PHASE_EVIDENCE_REQUIRED", "release gate requires accepted phase evidence");
+      const reviews = tx.all("SELECT review_id, outcome FROM reviews WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT 20", runId, validation.taskId);
+      const descriptor = this.store.getAttempt(validation.attemptId!)?.adapterDescriptorJson;
+      const adapter = descriptor === null || descriptor === undefined ? null : parseAdapterDescriptor(JSON.parse(descriptor));
+      const bundle = {
+        schemaVersion: "kerbsflow.release-bundle/v1", runId, taskId: validation.taskId, attemptId: validation.attemptId,
+        candidate: { headOid: authority.headOid, baseOid: authority.baseOid, fingerprint: authority.candidateFingerprint, diffHash: authority.diffHash, changedPathsHash: authority.changedPathsHash },
+        fullValidation: { validationId, commandId: authority.commandId, declarationHash: authority.commandHash, positiveProof: "matched", classification: "automatically_tested", evidence: validation.evidence.map(e => ({ id: e.id, kind: e.kind, classification: e.classification, summary: e.kind === "command" ? "Trusted full check executed with matching positive proof" : "Independent full-validation evidence; consult the validation record" })) },
+        phaseValidations: matchingPhase.map(row => ({ validationId: String(row.validation_id), outcome: String(row.outcome), classification: "automatically_tested" })),
+        reviews: reviews.map(row => ({ reviewId: String(row.review_id), outcome: String(row.outcome), classification: "not_tested", summary: "Persisted review decision; acceptance-specific review proof is not inferred" })),
+        acceptanceEvidence: Array.from({ length: 15 }, (_, index) => ({ acceptanceId: `AC${index + 1}`, classification: "not_tested", summary: "No acceptance-specific evidence was declared; full check success does not independently prove this acceptance criterion", references: [] })),
+        facts: { runtime: process.version, platform: process.platform, officialSupport: "macOS only; Linux unsupported preview; Windows unsupported", license: "Apache-2.0", copyright: "Teyocesu 2026", adapter: adapter?.adapter ?? "unknown", adapterVersion: adapter?.adapterVersion ?? "unknown" },
+        limitations: ["Human readiness decision only; no commit, push, merge, tag, release, publish, deployment or production action", ...(adapter?.adapter === "opencode" ? ["OpenCode workload isolation is tool_policy_only; no OS enforcement claim"] : []), "Acceptance-specific missing evidence remains not_tested"],
+      };
+      const json = JSON.stringify(bundle);
+      if (Buffer.byteLength(json) > 128 * 1024 || containsLikelySecret(json)) throw new KerbsFlowError("RELEASE_BUNDLE_UNSAFE", "release bundle exceeds its bound or contains sensitive material");
+      const artifact = this.artifacts.put(runId, "release-readiness", json, validation.attemptId);
+      this.insertArtifact(tx, artifact, now);
+      const gateId = asGateId(nextId("gate"));
+      const gate: HumanGate = { schemaVersion: CONTRACT_VERSIONS.humanGate, gateId, runId, taskId: validation.taskId, ...(validation.attemptId === undefined ? {} : { attemptId: validation.attemptId }), reasonCode: "release_readiness_decision", summary: `Candidate ${authority.headOid}; fingerprint ${authority.candidateFingerprint}; full ${validationId} passed. AC1–AC15 acceptance-specific support is not_tested. Human readiness decision has no remote side effect.`, evidenceRefs: [artifact.artifactId], evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(nextId("validation")), kind: "command", classification: "automatically_tested", summary: `Trusted full check ${declaration.commandId} passed for the exact candidate`, artifactRef: artifact.artifactId }, { schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(nextId("validation")), kind: "other", classification: "not_tested", summary: "AC1–AC15 acceptance-specific support missing; inspect the immutable bundle and known limitations" }], options: [{ id: "accept_readiness", label: "Accept release readiness", consequence: "Record the human readiness decision as DONE. No release action occurs.", target: "DONE" }, { id: "request_corrections", label: "Request corrections", consequence: "Persist a corrections request for a separately approved remediation run; this gate remains open.", target: "HUMAN_RELEASE_GATE" }, { id: "cancel_readiness", label: "Cancel readiness", consequence: "Cancel this readiness run and preserve the evidence.", target: "CANCELLED" }], status: "open" };
+      this.insertGate(tx, gate, now);
+      tx.run("INSERT INTO release_bundles (gate_id, run_id, full_validation_id, candidate_fingerprint, head_oid, bundle_json, bundle_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", gateId, runId, validationId, authority.candidateFingerprint, authority.headOid, json, createHash("sha256").update(json).digest("hex"), now);
+      return { transition: { to: "HUMAN_RELEASE_GATE", actor: "verifier", reasonCode: "full_validation_accepted", taskId: validation.taskId, attemptId: validation.attemptId, gateId, payload: { validationId, candidateFingerprint: authority.candidateFingerprint } }, runPatch: { currentGateId: gateId }, details: { gateId, validationId } } satisfies CommandMutation;
+    });
+  }
+
+  private currentCandidateBinding(runId: RunId) {
+    const stored = this.store.getWorktree(runId);
+    if (stored === undefined) throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "validation requires persisted worktree ownership");
+    const worktree: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: runId, repositoryPath: stored.repositoryPath, gitCommonDirectory: stored.gitCommonDirectory, worktreeGitDirectory: stored.worktreeGitDirectory, baseOid: stored.baseOid, branch: stored.branch, path: stored.worktreePath, markerPath: stored.markerPath, createdAt: stored.createdAt };
+    return bindingFor(worktree, new GitWorktreeManager(dirname(dirname(stored.markerPath))).inspect(worktree));
+  }
+
+  resolveReleaseGate(runId: RunId, expectedStateVersion: number, idempotencyKey: string, gateId: GateId, optionId: string, note?: string, commandId?: CommandId): CommandResult {
+    if (note !== undefined && (Buffer.byteLength(note) > 2048 || containsLikelySecret(note))) throw new KerbsFlowError("RELEASE_NOTE_INVALID", "human note must be bounded and contain no likely credential");
+    if (!["accept_readiness", "request_corrections", "cancel_readiness"].includes(optionId)) throw new KerbsFlowError("GATE_OPTION_INVALID", "release gate supports only readiness, corrections, or cancellation");
+    const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "gate_resolution", { gateId, optionId, ...(note === undefined ? {} : { note }) }, commandId);
+    const replay = this.store.replayCommand(command);
+    if (replay !== undefined) return replay;
+    const bundle = this.store.getReleaseBundle(gateId);
+    if (bundle === undefined) throw new KerbsFlowError("RELEASE_BUNDLE_REQUIRED", "release gate has no trusted immutable evidence bundle");
+    if (optionId === "accept_readiness" && this.currentCandidateBinding(runId).candidateFingerprint !== bundle.candidateFingerprint) throw new KerbsFlowError("RELEASE_CANDIDATE_STALE", "candidate changed after release bundle creation");
+    return this.store.executeCommand(command, ({ tx, run, now }) => {
+      if (run.state !== "HUMAN_RELEASE_GATE" || run.currentGateId !== gateId) throw new KerbsFlowError("GATE_SCOPE_MISMATCH", "exact release gate is not open at this state version");
+      const stored = this.gateInTransaction(tx, gateId);
+      if (stored.runId !== runId || stored.status !== "open" || !stored.gate.options.some(option => option.id === optionId)) throw new KerbsFlowError("GATE_OPTION_INVALID", "release option differs from immutable offered options");
+      if (optionId === "request_corrections") {
+        if (tx.get("SELECT gate_id FROM release_corrections WHERE gate_id = ?", gateId) !== undefined) throw new KerbsFlowError("RELEASE_CORRECTIONS_CONFLICT", "corrections request already persisted for this exact bundle");
+        tx.run("INSERT INTO release_corrections (gate_id, run_id, command_id, actor, note, created_at) VALUES (?, ?, ?, 'human', ?, ?)", gateId, runId, command.commandId, note ?? "", now);
+        return { details: { gateId, optionId, disposition: "corrections_requested_for_separately_approved_run" } } satisfies CommandMutation;
+      }
+      const target = optionId === "accept_readiness" ? "DONE" : "CANCELLED";
+      const gate: HumanGate = { ...stored.gate, status: target === "DONE" ? "resolved" : "rejected", resolution: { optionId, actor: "human", resolvedAt: now, ...(note === undefined ? {} : { note }) } };
+      tx.run("UPDATE human_gates SET status = ?, gate_json = ?, resolved_at = ? WHERE gate_id = ?", gate.status, JSON.stringify(gate), now, gateId);
+      return { transition: { to: target, actor: "human", reasonCode: "human_release_readiness_decision", gateId, payload: { optionId, bundleHash: bundle.bundleHash } }, runPatch: { currentGateId: null }, details: { gateId, optionId, target, remoteAction: false } } satisfies CommandMutation;
+    });
+  }
+
   gateMissingPhaseValidation(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "phase", { reasonCode: "phase_validation_plan_missing" });
     return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
@@ -989,7 +1097,7 @@ export class KerbsFlowCore {
   gateVerificationSandboxUnavailable(runId: RunId, expectedStateVersion: number, idempotencyKey: string): CommandResult {
     const command = this.specializedCommand(runId, expectedStateVersion, idempotencyKey, "validation", { reasonCode: "verification_sandbox_unavailable" });
     return this.store.executeCommand(command, ({ tx, run, now, nextId }) => {
-      if ((run.state !== "VERIFY_FOCUSED" && run.state !== "VERIFY_PHASE") || run.currentTaskId === null || run.activeAttemptId === null) {
+      if ((run.state !== "VERIFY_FOCUSED" && run.state !== "VERIFY_PHASE" && run.state !== "FINAL_VERIFY") || run.currentTaskId === null || run.activeAttemptId === null) {
         throw new KerbsFlowError("INVALID_COMMAND_STATE", "sandbox availability gate requires a current verification attempt");
       }
       const gate: HumanGate = {
@@ -1907,6 +2015,10 @@ export class KerbsFlowCore {
   }
 
   private insertGate(tx: SqlTransaction, gate: HumanGate, now: string): void {
+    for (const ref of [...gate.evidenceRefs, ...(gate.evidence ?? []).flatMap(e => e.artifactRef === undefined ? [] : [e.artifactRef])]) {
+      const artifact = tx.get("SELECT run_id FROM artifacts WHERE artifact_id = ?", ref);
+      if (artifact?.run_id !== gate.runId) throw new KerbsFlowError("GATE_EVIDENCE_SCOPE_MISMATCH", "gate requires exact Core-owned run-scoped artifact references");
+    }
     const normalizedGate: HumanGate = gate.evidence !== undefined && gate.evidence.length > 0
       ? gate
       : {
@@ -1937,6 +2049,10 @@ export class KerbsFlowCore {
     }
     if (gate.recommendation !== undefined && gate.evidenceRefs.length === 0 && (gate.evidence?.length ?? 0) === 0) {
       throw new KerbsFlowError("GATE_RECOMMENDATION_UNSUPPORTED", "executor gate recommendation requires classified supporting evidence");
+    }
+    for (const ref of [...gate.evidenceRefs, ...(gate.evidence ?? []).flatMap(e => e.artifactRef === undefined ? [] : [e.artifactRef])]) {
+      const owned = this.store.getArtifactRecord(ref);
+      if (owned === undefined || owned.runId !== runId) throw new KerbsFlowError("GATE_EVIDENCE_SCOPE_MISMATCH", "executor gate references foreign or unknown evidence");
     }
     const seenOptionIds = new Set<string>();
     for (const option of gate.options) {
@@ -2014,6 +2130,14 @@ export class KerbsFlowCore {
     return result;
   }
 
+  private assertFocusedAuthority(bundle: ValidationBundle): void {
+    const authority = this.store.getPhaseValidationAuthority(bundle.validationId);
+    const declaration = this.store.getValidationIntent(bundle.runId, "focused");
+    if (authority?.declaration?.level !== "focused" || declaration === undefined || authority.commandHash !== checkIntentHash(declaration) || authority.commandHash !== checkIntentHash(authority.declaration)) throw new KerbsFlowError("VALIDATION_AUTHORITY_REQUIRED", "focused validation has no matching trusted declaration");
+    const current = this.currentCandidateBinding(bundle.runId);
+    if (canonicalJson(current) !== canonicalJson({ worktreePath: authority.worktreePath, worktreeGitDirectory: authority.worktreeGitDirectory, baseOid: authority.baseOid, diffHash: authority.diffHash, changedPathsHash: authority.changedPathsHash, changedPaths: authority.changedPaths, candidateFingerprint: authority.candidateFingerprint, headOid: authority.headOid })) throw new KerbsFlowError("VALIDATION_CANDIDATE_STALE", "focused validation belongs to a changed candidate");
+  }
+
   private focusedValidationInTransaction(
     tx: SqlTransaction,
     runId: RunId,
@@ -2045,6 +2169,7 @@ export class KerbsFlowCore {
     ) {
       throw new KerbsFlowError("PERSISTED_CONTRACT_INVALID", "persisted focused validation columns and contract do not agree");
     }
+    this.assertFocusedAuthority(validation);
     return validation;
   }
 }

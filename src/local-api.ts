@@ -361,7 +361,7 @@ export class LocalApiServer {
       controls: this.dependencies.coordinator.getControlAvailability(runId),
       currentTask: snapshotTask(model.currentTask),
       activeAttempt: snapshotAttempt(model),
-      currentGate: snapshotGate(model, actionableGateOptionIds),
+      currentGate: snapshotGate(model, actionableGateOptionIds, this.dependencies.store),
       pendingSteer: snapshotPendingSteer(this.dependencies.store.getPendingSteerInstruction(runId)),
       latestValidation: snapshotValidation(model),
       latestReview: snapshotReview(model),
@@ -862,7 +862,7 @@ function snapshotAttempt(model: ReadModel): unknown {
   };
 }
 
-function snapshotGate(model: ReadModel, actionableOptionIds: readonly string[]): unknown {
+function snapshotGate(model: ReadModel, actionableOptionIds: readonly string[], store: StateStore): unknown {
   const stored = model.currentGate;
   if (stored === undefined) return null;
   const gate = stored.gate;
@@ -885,6 +885,16 @@ function snapshotGate(model: ReadModel, actionableOptionIds: readonly string[]):
     status: stored.status,
     reasonCode: safeSnapshotText(gate.reasonCode, 120),
     summary: safeSnapshotText(gate.summary, 500),
+    evidenceRefs: gate.evidenceRefs.slice(0, 20).filter(ref => store.getArtifactRecord(ref)?.runId === model.run.runId),
+    evidence: (gate.evidence ?? []).slice(0, 20).map(evidence => ({
+      id: evidence.id,
+      classification: evidence.classification,
+      kind: evidence.kind,
+      summary: safeSnapshotText(evidence.summary, 500),
+      ...(evidence.artifactRef === undefined || store.getArtifactRecord(evidence.artifactRef)?.runId !== model.run.runId ? {} : { artifactId: evidence.artifactRef }),
+    })),
+    correctionsRequested: store.getReleaseBundle(stored.gateId) !== undefined && store.hasReleaseCorrections(stored.gateId),
+    missingSupport: (gate.evidence?.length ?? 0) === 0 ? "No classified supporting evidence is available" : null,
     options: actionableOptions.filter((option) => retained.has(option)).map((option) => ({
       id: snapshotControlId(option.id),
       label: safeSnapshotText(option.label, 200),

@@ -976,7 +976,7 @@ function makeCoordinatorFixture(adapter = new FakeAdapter(fixedClock(), new Sequ
     launchProfileId: "synthetic-test-profile/v1",
     launchProfileHash: "a".repeat(64),
     canonicalRepositoryPath: root,
-    focusedCheck: { name: "synthetic", executable: process.execPath, args: ["-e", "process.exit(0)"], timeoutMs: 1000 },
+    focusedCheck: { name: "synthetic", executable: process.execPath, args: ["-e", "process.exit(0)"], timeoutMs: 1000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
     executionTimeoutMs: 1000,
     planningMaster: unusedPlanningMaster(),
   };

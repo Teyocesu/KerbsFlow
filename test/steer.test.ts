@@ -9,7 +9,7 @@ import {
 import { KerbsFlowError } from "../src/errors.js";
 import { KerbsFlowCore } from "../src/core.js";
 import { StateStore } from "../src/persistence.js";
-import { createFixture, primeReady, reviewFor, validationFor } from "./helpers.js";
+import { createFixture, primeReady, reviewFor, authoritativeFocusedFor } from "./helpers.js";
 
 test("steer persists one pending instruction, survives restart, and is consumed exactly once", async () => {
   const fixture = createFixture();
@@ -131,7 +131,7 @@ test("rework observes pending steer and rejects broadened or weakened protection
     fixture.adapter.script(fixture.taskId, "success");
     await fixture.core.beginFakeAttempt(fixture.runId, 4, "rework:begin");
     await fixture.core.completeFakeAttempt(fixture.runId, 4, "rework:complete");
-    fixture.core.recordFocusedValidation(fixture.runId, 5, "rework:validate", validationFor(fixture, "passed"));
+    fixture.core.recordFocusedValidation(fixture.runId, 5, "rework:validate", await authoritativeFocusedFor(fixture, "passed"));
     fixture.core.review(fixture.runId, 6, "rework:review", { ...reviewFor(fixture, "rework", "rework-steer"), failureClass: "implementation_failure" });
     assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "REWORK");
 
@@ -196,7 +196,7 @@ test("steer rejects terminal runs without incrementing state", async () => {
     fixture.core.prepareExecution(fixture.runId, 3, "terminal:prepare");
     await fixture.core.beginFakeAttempt(fixture.runId, 4, "terminal:begin");
     await fixture.core.completeFakeAttempt(fixture.runId, 4, "terminal:complete");
-    fixture.core.recordFocusedValidation(fixture.runId, 5, "terminal:validate", validationFor(fixture, "passed"));
+    fixture.core.recordFocusedValidation(fixture.runId, 5, "terminal:validate", await authoritativeFocusedFor(fixture, "passed"));
     fixture.core.review(fixture.runId, 6, "terminal:review", reviewFor(fixture, "failed", "terminal"));
     assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "FAILED");
     const version = fixture.core.readModel(fixture.runId)!.run.stateVersion;

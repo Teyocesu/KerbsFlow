@@ -348,6 +348,18 @@ function renderHumanGate(snapshot, session) {
   summary.append(makeText("p", item.summary, "gate-description"));
   elements.humanGate.append(summary);
 
+  const supporting = document.createElement("div");
+  supporting.className = "gate-evidence";
+  supporting.append(makeText("h3", "Gate supporting evidence"));
+  for (const value of asArray(item.evidence)) {
+    const evidence = asObject(value);
+    supporting.append(makeText("p", `${displayLabel(evidence.classification)}: ${evidence.summary ?? "Unknown support"}`));
+    if (typeof evidence.artifactId === "string") supporting.append(makeText("code", evidence.artifactId));
+  }
+  for (const ref of asArray(item.evidenceRefs)) supporting.append(makeText("code", ref));
+  if (item.missingSupport) supporting.append(makeText("p", item.missingSupport));
+  elements.humanGate.append(supporting);
+
   const evidenceRows = [];
   if (snapshot.latestValidation !== null && snapshot.latestValidation !== undefined) {
     const validation = asObject(snapshot.latestValidation);
@@ -373,6 +385,7 @@ function renderHumanGate(snapshot, session) {
     elements.humanGate.append(evidence);
   }
 
+  if (item.correctionsRequested === true) elements.humanGate.append(makeText("p", "Corrections request recorded for a separately approved run. This gate remains open."));
   const options = asArray(item.options);
   if (options.length === 0) {
     addEmpty(elements.humanGate, asObject(snapshot.run).state === "PAUSED" && asObject(snapshot.controls).resume === true
@@ -667,6 +680,7 @@ function renderSnapshot(snapshot, session) {
   session.stateVersion = run.stateVersion;
   session.currentGateId = asObject(snapshot.currentGate).gateId;
   session.currentGateStatus = asObject(snapshot.currentGate).status;
+  session.correctionsRequested = asObject(snapshot.currentGate).correctionsRequested === true;
   session.snapshot = snapshot;
   elements.runMeta.replaceChildren(
     makeText("code", session.runId, "run-meta-id identifier"),
@@ -823,7 +837,9 @@ async function submitRunMutation(session, command, payload, kind, gateId) {
     } else if (kind === "steer") {
       setSessionNotice(session, "Steer accepted for the next safe planning boundary.", "success");
     } else if (kind === "gate") {
-      if (session.currentGateId !== gateId || session.currentGateStatus !== "open") {
+      if (session.currentGateId === gateId && session.correctionsRequested && asObject(result.details).disposition === "corrections_requested_for_separately_approved_run") {
+        setSessionNotice(session, "Corrections request recorded. This gate remains open for a readiness decision.", "success");
+      } else if (session.currentGateId !== gateId || session.currentGateStatus !== "open") {
         setSessionNotice(session, "The human gate resolution is recorded in the fresh snapshot.", "success");
       } else {
         setSessionNotice(session, "The response arrived, but the fresh snapshot still shows this gate open.", "warning");

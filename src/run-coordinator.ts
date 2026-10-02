@@ -7,6 +7,7 @@ import {
   type CommandId,
   type CommandResult,
   type ExecutorResult,
+  type ReconcileOutcome,
   type GateId,
   type RunId,
   type TaskId,
@@ -25,7 +26,7 @@ import type { PlanningMaster } from "./planning.js";
 import { StateStore, type RunLaunchBinding, type StoredGate } from "./persistence.js";
 import { RandomIdSource, type IdSource } from "./runtime.js";
 import { isLegalTransition } from "./state-machine.js";
-import type { FocusedCheckCommand, PhaseCheckCommand } from "./verifier.js";
+import { checkIntent, type FocusedCheckCommand, type PhaseCheckCommand, type FullCheckCommand } from "./verifier.js";
 
 export interface TrustedLaunchProfile {
   launchProfileId: string;
@@ -34,6 +35,7 @@ export interface TrustedLaunchProfile {
   expectedBaseOid?: string;
   focusedCheck: FocusedCheckCommand;
   phaseCheck?: PhaseCheckCommand;
+  fullCheck?: FullCheckCommand;
   executionTimeoutMs: number;
   failurePolicy?: Phase2LoopRequest["failurePolicy"];
   semanticReview?: Phase2LoopRequest["semanticReview"];
@@ -146,7 +148,26 @@ interface RunReservation {
   heldGate?: HeldGateBoundary;
   failureDispositionClaim?: FailureDispositionClaim;
   executionDispatchClaim?: ExecutionDispatchClaim;
+  recoveryClaim?: object;
   signalledAttempts: Set<string>;
+}
+
+const RECOVERY_SETTLEMENTS = new WeakSet<object>();
+export interface RecoverySettlementAuthority {
+  runId: RunId;
+  taskId: TaskId;
+  attemptId: AttemptId;
+  providerIdentityJson: string;
+  adapterDescriptorJson: string;
+  candidateFingerprint: string;
+  expectedStateVersion: number;
+  reservation: object;
+  result: ExecutorResult;
+  commandId: CommandId;
+  idempotencyKey: string;
+}
+export function assertRecoverySettlementAuthority(value: unknown): asserts value is RecoverySettlementAuthority {
+  if (value === null || typeof value !== "object" || !RECOVERY_SETTLEMENTS.has(value)) throw new KerbsFlowError("RECOVERY_SETTLEMENT_AUTHORITY_REQUIRED", "terminal settlement requires the exact coordinator reconciliation authority");
 }
 
 export class Phase2DriveControlStop extends Error {
@@ -163,7 +184,7 @@ export class RunCoordinator {
   constructor(
     private readonly core: KerbsFlowCore,
     private readonly store: StateStore,
-    private readonly phase2: Pick<Phase2Loop, "driveStarted">,
+    private readonly phase2: Pick<Phase2Loop, "driveStarted"> & Partial<Pick<Phase2Loop, "continueRecovered">>,
     launchProfile: TrustedLaunchProfile,
     private readonly ids: IdSource = new RandomIdSource(),
   ) {
@@ -173,6 +194,53 @@ export class RunCoordinator {
       throw new KerbsFlowError("MULTIPLE_UNFINISHED_RUNS", "startup found multiple unfinished runs; one RunCoordinator cannot truthfully own more than one drive");
     }
     if (unfinished.length === 1) this.reservation = newReservation(unfinished[0]!.runId, true);
+  }
+
+  async reconcileRecovery(request: CoordinatorControlRequest): Promise<CommandResult | ReconcileOutcome> {
+    const replay = this.store.replayRecoverySettlement(request);
+    if (replay !== undefined) return replay;
+    const reservation = this.requireReservation(request.runId);
+    if (reservation.recoveryClaim !== undefined || reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.gateResolutionClaim !== undefined || reservation.failureDispositionClaim !== undefined || reservation.executionDispatchClaim !== undefined) throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "reconciliation requires exclusive coordinator reservation");
+    const run = this.assertRequestVersion(request.runId, request.expectedStateVersion);
+    const launch = this.store.getRunLaunchBinding(request.runId);
+    if (launch !== undefined && (launch.launchProfileHash !== this.profile.launchProfileHash || launch.launchProfileId !== this.profile.launchProfileId || launch.canonicalRepositoryPath !== this.profile.canonicalRepositoryPath)) throw new KerbsFlowError("LAUNCH_PROFILE_MISMATCH", "recovery requires the exact persisted launch profile");
+    if (run.state !== "RECOVERY" || run.activeAttemptId === null) throw new KerbsFlowError("INVALID_COMMAND_STATE", "reconciliation requires RECOVERY and a persisted active attempt");
+    const attempt = this.store.getAttempt(run.activeAttemptId)!;
+    if (attempt.providerIdentityJson === null || attempt.adapterDescriptorJson === null) return { outcome: "unknown", summary: "recovery lacks exact persisted provider identity; no new attempt is permitted" };
+    const claim = {};
+    reservation.recoveryClaim = claim;
+    try {
+      const fingerprint = this.core.recoveryCandidateFingerprint(request.runId);
+      const outcome = await this.core.inspectRecoveryOutcome(request.runId);
+      if (outcome.outcome !== "terminal") return outcome;
+      if (this.reservation !== reservation || reservation.recoveryClaim !== claim) throw new KerbsFlowError("RECOVERY_RESERVATION_STALE", "reconciliation lost its exact reservation");
+      const authority: RecoverySettlementAuthority = freezeSettlement({ ...request, taskId: attempt.taskId, attemptId: attempt.attemptId, providerIdentityJson: attempt.providerIdentityJson, adapterDescriptorJson: attempt.adapterDescriptorJson, candidateFingerprint: fingerprint, reservation: claim, result: parseExecutorResult(outcome.result) });
+      RECOVERY_SETTLEMENTS.add(authority);
+      const settled = await this.core.settleRecoveredAttempt(authority);
+      if (settled.to === "VERIFY_FOCUSED" && this.phase2.continueRecovered !== undefined) {
+        const binding = this.store.getRunLaunchBinding(request.runId);
+        if (binding !== undefined && (binding.launchProfileHash !== this.profile.launchProfileHash || binding.launchProfileId !== this.profile.launchProfileId || binding.canonicalRepositoryPath !== this.profile.canonicalRepositoryPath)) throw new KerbsFlowError("LAUNCH_PROFILE_MISMATCH", "restart continuation needs the exact trusted launch profile");
+        reservation.startupBlocked = false;
+        reservation.driveSettled = false;
+        reservation.settled = deferred<void>();
+        const driveRequest = this.driveRequest(request.runId, attempt.taskId, this.store.getRun(request.runId)!.objective);
+        reservation.drivePromise = Promise.resolve().then(() => this.phase2.continueRecovered!(driveRequest, {
+          planningMaster: this.profile.planningMaster,
+          checkpoint: () => this.checkpoint(reservation),
+          claimFailureDisposition: () => this.claimFailureDisposition(reservation),
+          claimExecutionDispatch: () => this.claimExecutionDispatch(reservation),
+          waitForGateResolution: boundary => this.waitForGateResolution(reservation, boundary),
+        })).then(result => { reservation.driveResult = result; }, (error: unknown) => { reservation.driveError = error; }).finally(() => {
+          reservation.driveSettled = true;
+          reservation.settled.resolve();
+          this.reconcileTerminalReservation(reservation);
+        });
+      }
+      return settled;
+    } finally {
+      if (reservation.recoveryClaim === claim) delete reservation.recoveryClaim;
+      this.reconcileTerminalReservation(reservation);
+    }
   }
 
   get activeRunId(): RunId | undefined {
@@ -198,10 +266,14 @@ export class RunCoordinator {
     if (reservation === undefined || reservation.runId !== runId) return [];
     const run = this.store.getRun(runId);
     const storedGate = this.store.getGate(gateId);
-    if (run === undefined || run.state !== "HUMAN_GATE" || run.currentGateId !== gateId
+    if (run === undefined || (run.state !== "HUMAN_GATE" && run.state !== "HUMAN_RELEASE_GATE") || run.currentGateId !== gateId
       || storedGate === undefined || storedGate.runId !== runId || storedGate.gateId !== gateId
       || storedGate.status !== "open" || storedGate.gate.status !== "open") return [];
 
+    if (run.state === "HUMAN_RELEASE_GATE") {
+      if (this.store.getReleaseBundle(gateId) === undefined || reservation.cancelClaim !== undefined || reservation.pauseClaim !== undefined || reservation.recoveryClaim !== undefined) return [];
+      return storedGate.gate.options.filter(option => ["accept_readiness", "request_corrections", "cancel_readiness"].includes(option.id) && (option.id !== "request_corrections" || !this.store.hasReleaseCorrections(gateId))).map(option => option.id);
+    }
     const actionable = new Set<string>();
     for (const option of storedGate.gate.options) {
       try {
@@ -456,6 +528,16 @@ export class RunCoordinator {
 
   resolveGate(request: CoordinatorGateResolutionRequest): Promise<CommandResult> {
     request = { ...request };
+    const releaseBundle = this.store.getReleaseBundle(request.gateId);
+    if (releaseBundle !== undefined) {
+      const gate = this.store.getGate(request.gateId);
+      if (gate?.runId !== request.runId) throw new KerbsFlowError("GATE_SCOPE_MISMATCH", "release gate belongs to another run");
+      const reservation = this.reservation;
+      if (reservation?.runId === request.runId && (reservation.cancelClaim !== undefined || reservation.pauseClaim !== undefined || reservation.recoveryClaim !== undefined || reservation.gateResolutionClaim !== undefined)) throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "release decision conflicts with owned control operation");
+      const result = this.core.resolveReleaseGate(request.runId, request.expectedStateVersion, request.idempotencyKey, request.gateId, request.optionId, request.note, request.commandId);
+      this.reconcileTerminalReservation();
+      return Promise.resolve(result);
+    }
     const command = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
       commandId: request.commandId,
@@ -892,6 +974,7 @@ export class RunCoordinator {
     if (reservation === undefined || reservation.runId !== runId) {
       throw new KerbsFlowError("RUN_NOT_OWNED", `run ${runId} does not own the coordinator drive reservation`);
     }
+    if (reservation.recoveryClaim !== undefined) throw new KerbsFlowError("CONTROL_COMMAND_IN_PROGRESS", "reconciliation owns this reservation");
     return reservation;
   }
 
@@ -925,7 +1008,7 @@ export class RunCoordinator {
     if (reservation === undefined || this.reservation !== reservation || (!reservation.startupBlocked && !reservation.driveSettled)
       || reservation.pauseClaim !== undefined || reservation.cancelClaim !== undefined || reservation.cancelRequested
       || reservation.gateResolutionClaim !== undefined || reservation.heldGate !== undefined || reservation.failureDispositionClaim !== undefined
-      || reservation.executionDispatchClaim !== undefined) return;
+      || reservation.executionDispatchClaim !== undefined || reservation.recoveryClaim !== undefined) return;
 
     const run = this.store.getRun(reservation.runId);
     if (this.reservation === reservation && run?.runId === reservation.runId && isTerminalState(run.state)) {
@@ -961,12 +1044,21 @@ export class RunCoordinator {
       ...(this.profile.expectedBaseOid === undefined ? {} : { expectedBaseOid: this.profile.expectedBaseOid }),
       focusedCheck: this.profile.focusedCheck,
       ...(this.profile.phaseCheck === undefined ? {} : { phaseCheck: this.profile.phaseCheck }),
+      ...(this.profile.fullCheck === undefined ? {} : { fullCheck: this.profile.fullCheck }),
       executionTimeoutMs: this.profile.executionTimeoutMs,
       ...(this.profile.failurePolicy === undefined ? {} : { failurePolicy: this.profile.failurePolicy }),
       ...(this.profile.semanticReview === undefined ? {} : { semanticReview: this.profile.semanticReview }),
     };
   }
 
+}
+
+function freezeSettlement<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const nested of Object.values(value as Record<string, unknown>)) freezeSettlement(nested);
+    Object.freeze(value);
+  }
+  return value;
 }
 
 function canonicalTrustedLaunchProfile(value: TrustedLaunchProfile): TrustedLaunchProfile {
@@ -986,10 +1078,11 @@ function canonicalTrustedLaunchProfile(value: TrustedLaunchProfile): TrustedLaun
   } catch {
     throw new KerbsFlowError("LAUNCH_PROFILE_INVALID", "trusted repository path must resolve to an existing directory");
   }
-  const focusedCheck = Object.freeze({ ...value.focusedCheck, args: [...value.focusedCheck.args] });
+  const focusedCheck = checkIntent("focused", value.focusedCheck);
   const phaseCheck = value.phaseCheck === undefined
     ? undefined
-    : Object.freeze({ ...value.phaseCheck, args: [...value.phaseCheck.args] });
+    : checkIntent("phase", value.phaseCheck) as PhaseCheckCommand;
+  const fullCheck = value.fullCheck === undefined ? undefined : checkIntent("full", value.fullCheck) as FullCheckCommand;
   const failurePolicy = value.failurePolicy === undefined
     ? undefined
     : Object.freeze({
@@ -1005,6 +1098,7 @@ function canonicalTrustedLaunchProfile(value: TrustedLaunchProfile): TrustedLaun
     ...(value.expectedBaseOid === undefined ? {} : { expectedBaseOid: value.expectedBaseOid }),
     focusedCheck,
     ...(phaseCheck === undefined ? {} : { phaseCheck }),
+    ...(fullCheck === undefined ? {} : { fullCheck }),
     executionTimeoutMs: value.executionTimeoutMs,
     ...(failurePolicy === undefined ? {} : { failurePolicy }),
     ...(semanticReview === undefined ? {} : { semanticReview }),

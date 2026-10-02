@@ -39,7 +39,7 @@ import { StateStore, type StoredFailureOccurrence } from "./persistence.js";
 import { IndependentSemanticReviewer } from "./reviewer.js";
 import type { IdSource } from "./runtime.js";
 import { Phase2DriveControlStop } from "./run-coordinator.js";
-import { FocusedVerifier, type FocusedCheckCommand, type FocusedVerificationResult, type PhaseCheckCommand } from "./verifier.js";
+import { FocusedVerifier, type FocusedCheckCommand, type FocusedVerificationResult, type PhaseCheckCommand, type FullCheckCommand, checkIntent, checkIntentHash } from "./verifier.js";
 
 export interface Phase2LoopRequest {
   runId: RunId;
@@ -50,6 +50,7 @@ export interface Phase2LoopRequest {
   planningDecision?: PlanningDecision;
   focusedCheck: FocusedCheckCommand;
   phaseCheck?: PhaseCheckCommand;
+  fullCheck?: FullCheckCommand;
   executionTimeoutMs: number;
   failurePolicy?: {
     transientFailureClasses?: FailureClassification[];
@@ -108,6 +109,12 @@ export class Phase2Loop {
   async driveStarted(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
     const planningMaster = controls.planningMaster ?? this.planningMaster;
     this.assertRequest(request, planningMaster);
+    for (const [level, check] of [["focused", request.focusedCheck], ["phase", request.phaseCheck], ["full", request.fullCheck]] as const) {
+      if (check !== undefined) {
+        const intent = this.store.recordValidationIntent(request.runId, level, check);
+        this.verifier.declare(request.runId, level, intent);
+      }
+    }
     const started = this.store.getRun(request.runId);
     if (started === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} was not accepted before Phase2Loop.driveStarted`);
     if (started.state !== "INTAKE" || this.store.getWorktree(request.runId) !== undefined || started.currentTaskId !== null || started.activeAttemptId !== null) {
@@ -133,7 +140,24 @@ export class Phase2Loop {
     }
   }
 
-  private async drive(request: Phase2LoopRequest, controls: Phase2DriveControls): Promise<Phase2LoopResult> {
+  async continueRecovered(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
+    const model = this.store.readModel(request.runId);
+    if (model?.run.state !== "VERIFY_FOCUSED" || model.currentTask?.taskId !== request.taskId || model.activeAttempt?.lifecycle !== "SUCCEEDED" || model.activeAttempt.outcomeJson === null) throw new KerbsFlowError("RECOVERED_CONTINUATION_INVALID", "validation continuation requires the exact persisted succeeded attempt");
+    const stored = this.store.getWorktree(request.runId);
+    if (stored === undefined) throw new KerbsFlowError("WORKTREE_RECORD_REQUIRED", "recovered continuation requires persisted ownership");
+    for (const [level, check] of [["focused", request.focusedCheck], ["phase", request.phaseCheck], ["full", request.fullCheck]] as const) {
+      if (check === undefined) continue;
+      const intent = this.store.getValidationIntent(request.runId, level);
+      if (intent === undefined || checkIntentHash(intent) !== checkIntentHash(checkIntent(level, check))) throw new KerbsFlowError("CHECK_INTENT_MISMATCH", "restart cannot substitute launch checks or promote legacy intent");
+      this.verifier.declare(request.runId, level, intent);
+    }
+    const intake = this.git.intake(stored.repositoryPath, { expectedBaseOid: stored.baseOid });
+    const worktree: WorktreeRecord = { schemaVersion: "kerbsflow.worktree/v1", runKey: request.runId, repositoryPath: stored.repositoryPath, gitCommonDirectory: stored.gitCommonDirectory, worktreeGitDirectory: stored.worktreeGitDirectory, baseOid: stored.baseOid, branch: stored.branch, path: stored.worktreePath, markerPath: stored.markerPath, createdAt: stored.createdAt };
+    this.git.inspect(worktree);
+    return this.drive(request, controls, { intake, worktree, decision: model.currentTask.decision });
+  }
+
+  private async drive(request: Phase2LoopRequest, controls: Phase2DriveControls, recovered?: { intake: RepositoryIntake; worktree: WorktreeRecord; decision: PlanningDecision }): Promise<Phase2LoopResult> {
     const planningMaster = controls.planningMaster ?? this.planningMaster;
     const started = this.store.getRun(request.runId)!;
     let command: Pick<CommandResult, "to" | "stateVersion"> = { to: started.state, stateVersion: started.stateVersion };
@@ -153,106 +177,118 @@ export class Phase2Loop {
     };
     await checkpoint();
     let intake: RepositoryIntake;
-    try {
-      intake = this.git.intake(request.repositoryPath, request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid });
-      await checkpoint();
-      new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
-      command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
-    } catch (error) {
-      const category = classifyInitialPlanningFailure(error);
-      if (category === "control" || category === "integrity") throw error;
-      const environmentFailure = error instanceof Error && "errno" in error && typeof error.errno === "number"
-        && "syscall" in error && typeof error.syscall === "string";
-      const gateable = category === "trust" || (category === "unknown" && !(error instanceof KerbsFlowError) && !environmentFailure) || (error instanceof KerbsFlowError && (
-        error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH"
-        || error.code === "GIT_EXECUTABLE_CONFIG_GATE" || error.code === "GIT_CHECKOUT_FILTER_GATE"));
-      const code = error instanceof KerbsFlowError ? error.code : "INTAKE_ENVIRONMENT_FAILED";
-      const summary = gateable
-        ? "Repository or canonical intake is unsafe or ambiguous. No planner or executor started; review the trusted input before another run."
-        : "Repository or canonical intake could not complete. No planner or executor started; repair the environment before another run.";
-      command = await atDisposition(version => gateable
-        ? this.core.gateIntake(request.runId, version, `${request.runId}:intake-gate`, code, summary)
-        : this.core.failIntake(request.runId, version, `${request.runId}:intake-failed`, code, summary));
-      return { verdict: gateable ? "HUMAN_GATE" : "FAILED", intakeIssue: { code, summary }, stateVersion: command.stateVersion };
-    }
-    await checkpoint();
     let worktree: WorktreeRecord | undefined;
-    let worktreeFailure: unknown;
-    try {
-      worktree = this.git.create(intake, request.runId);
-    } catch (error) {
-      worktreeFailure = error;
-    }
-    if (worktree === undefined) {
-      const error = worktreeFailure;
-      const uncertain = error instanceof KerbsFlowError && error.code === "WORKTREE_CREATION_UNCERTAIN";
-      const reasonCode = classifyPreIntentWorktreeFailure(error);
-      if (!uncertain && reasonCode === undefined) {
-        await checkpoint();
-        throw error;
-      }
-      if (controls.claimFailureDisposition === undefined) await checkpoint();
-      const boundary = await controls.claimFailureDisposition?.();
+    let decision: PlanningDecision;
+    let currentRoutingDecision: TrustedRoutingDecision | undefined;
+    if (recovered !== undefined) {
+      intake = recovered.intake;
+      worktree = recovered.worktree;
+      decision = recovered.decision;
+    } else {
       try {
-        if (boundary !== undefined) command = { ...command, stateVersion: boundary.stateVersion };
-        if (uncertain) {
-          command = this.core.gatePlanWorktreeCreationUncertain(request.runId, command.stateVersion, `${request.runId}:worktree-creation-uncertain`);
+        intake = this.git.intake(request.repositoryPath, request.expectedBaseOid === undefined ? {} : { expectedBaseOid: request.expectedBaseOid });
+        await checkpoint();
+        new CanonicalIntentGuard(this.store).capture(request.runId, intake.repositoryPath, intake.baseOid);
+        command = this.core.completeIntake(request.runId, command.stateVersion, `${request.runId}:intake`);
+      } catch (error) {
+        const category = classifyInitialPlanningFailure(error);
+        if (category === "control" || category === "integrity") throw error;
+        const environmentFailure = error instanceof Error && "errno" in error && typeof error.errno === "number"
+          && "syscall" in error && typeof error.syscall === "string";
+        const gateable = category === "trust" || (category === "unknown" && !(error instanceof KerbsFlowError) && !environmentFailure) || (error instanceof KerbsFlowError && (
+          error.code === "ORIGINAL_CHECKOUT_DIRTY" || error.code === "BASE_OID_MISMATCH"
+          || error.code === "GIT_EXECUTABLE_CONFIG_GATE" || error.code === "GIT_CHECKOUT_FILTER_GATE"));
+        const code = error instanceof KerbsFlowError ? error.code : "INTAKE_ENVIRONMENT_FAILED";
+        const summary = gateable
+          ? "Repository or canonical intake is unsafe or ambiguous. No planner or executor started; review the trusted input before another run."
+          : "Repository or canonical intake could not complete. No planner or executor started; repair the environment before another run.";
+        command = await atDisposition(version => gateable
+          ? this.core.gateIntake(request.runId, version, `${request.runId}:intake-gate`, code, summary)
+          : this.core.failIntake(request.runId, version, `${request.runId}:intake-failed`, code, summary));
+        return { verdict: gateable ? "HUMAN_GATE" : "FAILED", intakeIssue: { code, summary }, stateVersion: command.stateVersion };
+      }
+      await checkpoint();
+      let worktreeFailure: unknown;
+      try {
+        worktree = this.git.create(intake, request.runId);
+      } catch (error) {
+        worktreeFailure = error;
+      }
+      if (worktree === undefined) {
+        const error = worktreeFailure;
+        const uncertain = error instanceof KerbsFlowError && error.code === "WORKTREE_CREATION_UNCERTAIN";
+        const reasonCode = classifyPreIntentWorktreeFailure(error);
+        if (!uncertain && reasonCode === undefined) {
+          await checkpoint();
+          throw error;
+        }
+        if (controls.claimFailureDisposition === undefined) await checkpoint();
+        const boundary = await controls.claimFailureDisposition?.();
+        try {
+          if (boundary !== undefined) command = { ...command, stateVersion: boundary.stateVersion };
+          if (uncertain) {
+            command = this.core.gatePlanWorktreeCreationUncertain(request.runId, command.stateVersion, `${request.runId}:worktree-creation-uncertain`);
+            return {
+              verdict: "HUMAN_GATE",
+              intake,
+              intakeIssue: { code: "WORKTREE_CREATION_UNCERTAIN", summary: "Worktree creation is uncertain; its durable intent marker and any partial Git state are preserved for review." },
+              stateVersion: command.stateVersion,
+            };
+          }
+          if (reasonCode === undefined) throw error;
+          command = this.core.failPlanWorktreeSetup(request.runId, command.stateVersion, `${request.runId}:worktree-setup-failed`, reasonCode);
           return {
-            verdict: "HUMAN_GATE",
+            verdict: "FAILED",
             intake,
-            intakeIssue: { code: "WORKTREE_CREATION_UNCERTAIN", summary: "Worktree creation is uncertain; its durable intent marker and any partial Git state are preserved for review." },
+            intakeIssue: { code: error instanceof KerbsFlowError ? error.code : "WORKTREE_SETUP_FAILED", summary: `Worktree setup failed before creation intent: ${reasonCode}.` },
             stateVersion: command.stateVersion,
           };
+        } finally {
+          boundary?.release();
         }
-        if (reasonCode === undefined) throw error;
-        command = this.core.failPlanWorktreeSetup(request.runId, command.stateVersion, `${request.runId}:worktree-setup-failed`, reasonCode);
-        return {
-          verdict: "FAILED",
-          intake,
-          intakeIssue: { code: error instanceof KerbsFlowError ? error.code : "WORKTREE_SETUP_FAILED", summary: `Worktree setup failed before creation intent: ${reasonCode}.` },
-          stateVersion: command.stateVersion,
-        };
-      } finally {
-        boundary?.release();
       }
+      this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
+      await checkpoint();
+      const planned = await this.acceptInitialPlan(request, command.stateVersion, planningMaster, controls.checkpoint, controls.claimFailureDisposition);
+      command = planned.command;
+      if (planned.decision === null) return { verdict: command.to === "HUMAN_GATE" ? "HUMAN_GATE" : "FAILED", intake, worktree, stateVersion: command.stateVersion };
+      await checkpoint();
+      decision = planned.decision;
+      currentRoutingDecision = planned.routingDecision;
+      this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
     }
-    this.store.recordWorktree({ runId: request.runId, repositoryPath: worktree.repositoryPath, gitCommonDirectory: worktree.gitCommonDirectory, worktreeGitDirectory: worktree.worktreeGitDirectory, baseOid: worktree.baseOid, branch: worktree.branch, worktreePath: worktree.path, markerPath: worktree.markerPath, createdAt: worktree.createdAt });
-    await checkpoint();
-    const planned = await this.acceptInitialPlan(request, command.stateVersion, planningMaster, controls.checkpoint, controls.claimFailureDisposition);
-    command = planned.command;
-    if (planned.decision === null) return { verdict: command.to === "HUMAN_GATE" ? "HUMAN_GATE" : "FAILED", intake, worktree, stateVersion: command.stateVersion };
-    await checkpoint();
-    let decision = planned.decision;
-    let currentRoutingDecision = planned.routingDecision;
-    this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
-    let attempts = 0;
+    let attempts = recovered === undefined ? 0 : this.store.countTaskAttempts(request.runId, request.taskId);
+    let resumeValidation = recovered !== undefined;
     let nextSelectionReason = currentRoutingDecision?.selectionReason ?? "pre-Phase-4 planning route";
     let nextEscalationReason: string | undefined;
 
     while (true) {
-      if (controls.claimExecutionDispatch === undefined) await checkpoint();
-      const dispatch = await controls.claimExecutionDispatch?.();
-      try {
-        if (dispatch !== undefined) command = { ...command, stateVersion: dispatch.stateVersion };
-        this.assertRoutingForPlanningDecision(decision, currentRoutingDecision);
-        attempts += 1;
-        command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
-        if (currentRoutingDecision !== undefined) {
-          const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
-          if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing provenance requires the prepared attempt");
-          this.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
-            routingDecision: currentRoutingDecision,
-            planningDecision: decision,
-            attemptId,
-            selectionReason: nextSelectionReason,
-            ...(nextEscalationReason === undefined ? {} : { escalationReason: nextEscalationReason }),
-          }));
+      if (!resumeValidation) {
+        if (controls.claimExecutionDispatch === undefined) await checkpoint();
+        const dispatch = await controls.claimExecutionDispatch?.();
+        try {
+          if (dispatch !== undefined) command = { ...command, stateVersion: dispatch.stateVersion };
+          this.assertRoutingForPlanningDecision(decision, currentRoutingDecision);
+          attempts += 1;
+          command = this.core.prepareExecution(request.runId, command.stateVersion, `${request.runId}:prepare:${attempts}`);
+          if (currentRoutingDecision !== undefined) {
+            const attemptId = this.store.readModel(request.runId)?.run.activeAttemptId;
+            if (attemptId === null || attemptId === undefined) throw new KerbsFlowError("ATTEMPT_REQUIRED", "routing provenance requires the prepared attempt");
+            this.store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({
+              routingDecision: currentRoutingDecision,
+              planningDecision: decision,
+              attemptId,
+              selectionReason: nextSelectionReason,
+              ...(nextEscalationReason === undefined ? {} : { escalationReason: nextEscalationReason }),
+            }));
+          }
+          command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
+        } finally {
+          dispatch?.release();
         }
-        command = await this.core.beginAttempt(request.runId, command.stateVersion, `${request.runId}:begin:${attempts}`, worktree.path, { prompt: buildExecutorPrompt(decision), timeoutMs: request.executionTimeoutMs });
-      } finally {
-        dispatch?.release();
+        command = await this.core.completeAttempt(request.runId, command.stateVersion, `${request.runId}:complete:${attempts}`);
       }
-      command = await this.core.completeAttempt(request.runId, command.stateVersion, `${request.runId}:complete:${attempts}`);
+      resumeValidation = false;
       await checkpoint();
       const afterExecution = this.store.readModel(request.runId);
       if (afterExecution === undefined) throw new KerbsFlowError("RUN_NOT_FOUND", `run ${request.runId} disappeared`);
@@ -332,7 +368,7 @@ export class Phase2Loop {
         throw new KerbsFlowError("PHASE2_BOUNDARY_INVALID", `executor completed at unexpected state ${afterExecution.run.state}`);
       }
       const executorResult = parseExecutorResult(JSON.parse(afterExecution.activeAttempt.outcomeJson));
-      let focused: FocusedVerificationResult;
+      let focused: Awaited<ReturnType<FocusedVerifier["verify"]>>;
       try {
         await checkpoint();
         focused = await this.verifier.verify(intake, worktree, decision, executorResult, request.focusedCheck);
@@ -342,6 +378,7 @@ export class Phase2Loop {
         return { verdict: "HUMAN_GATE", intake, worktree, executorResult, attempts, stateVersion: command.stateVersion };
       }
       await checkpoint();
+      this.store.recordAuthoritativePhaseValidation(focused.authoritative);
       command = this.core.recordFocusedValidation(request.runId, command.stateVersion, `${request.runId}:focused:${attempts}`, focused.bundle);
       await checkpoint();
       if (focused.bundle.outcome !== "passed") {
@@ -459,6 +496,22 @@ export class Phase2Loop {
         currentRoutingDecision = reworked.routingDecision;
         this.persistAcceptedRoutingDecision(decision, currentRoutingDecision);
         continue;
+      }
+      if (command.to === "NEXT_PHASE" && request.fullCheck !== undefined) {
+        await checkpoint();
+        command = this.core.completePhase(request.runId, command.stateVersion, `${request.runId}:enter-full:${attempts}`, "FINAL_VERIFY");
+        await checkpoint();
+        let full: Awaited<ReturnType<FocusedVerifier["verifyFull"]>>;
+        try { full = await this.verifier.verifyFull(intake, worktree, decision, executorResult, request.fullCheck); }
+        catch (error) {
+          if (!(error instanceof KerbsFlowError) || error.code !== "VERIFICATION_SANDBOX_UNAVAILABLE") throw error;
+          command = await atDisposition(version => this.core.gateVerificationSandboxUnavailable(request.runId, version, `${request.runId}:full-sandbox-gate:${attempts}`));
+          return { verdict: "HUMAN_GATE", intake, worktree, executorResult, verification: phase.verification, attempts, stateVersion: command.stateVersion };
+        }
+        await checkpoint();
+        this.store.recordAuthoritativePhaseValidation(full.authoritative);
+        command = await atDisposition(version => this.core.completeTrustedFullValidation(request.runId, version, `${request.runId}:full-close:${attempts}`, full.authoritative.bundle.validationId));
+        return { verdict: command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: full.verification, attempts, stateVersion: command.stateVersion };
       }
       return { verdict: command.to === "NEXT_PHASE" ? "PASS" : command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: phase.verification, attempts, stateVersion: command.stateVersion };
     }

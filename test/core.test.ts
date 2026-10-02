@@ -10,6 +10,9 @@ import {
   DEFAULT_USER_PREFERENCES,
   ExecutorResult,
   HumanGate,
+  asDecisionId,
+  asArtifactId,
+  asTaskId,
   asAttemptId,
   asCommandId,
   asGateId,
@@ -21,7 +24,7 @@ import { IdempotencyConflictError, StateVersionConflictError } from "../src/erro
 import { KerbsFlowCore } from "../src/core.js";
 import { StateStore } from "../src/persistence.js";
 import { StateMachineError } from "../src/state-machine.js";
-import { createFixture, executorResultFor, primeExecute, primeReady, reviewFor, validationFor, TestFixture } from "./helpers.js";
+import { createFixture, executorResultFor, primeExecute, primeReady, reviewFor, validationFor, authoritativeFocusedFor, TestFixture } from "./helpers.js";
 
 function reopen(fixture: TestFixture): void {
   fixture.store.close();
@@ -57,7 +60,7 @@ async function completeFirstAttemptForRework(fixture: TestFixture): Promise<Retu
   fixture.adapter.script(fixture.taskId, "implementation_failure");
   await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin-first");
   await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete-first");
-  fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-first", validationFor(fixture, "passed"));
+  fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-first", await authoritativeFocusedFor(fixture, "passed"));
   fixture.core.review(fixture.runId, 6, "review-first", { ...reviewFor(fixture, "rework", "first"), failureClass: "implementation_failure" });
   fixture.core.reworkToReady(fixture.runId, 7, "ready-second");
   fixture.core.prepareExecution(fixture.runId, 8, "prepare-second");
@@ -76,7 +79,7 @@ test("fake vertical loop persists through close and reopen", async () => {
     assert.equal(begin.stateVersion, 4);
     const completed = await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete");
     assert.equal(completed.to, "VERIFY_FOCUSED");
-    const validated = fixture.core.recordFocusedValidation(fixture.runId, 5, "validate", validationFor(fixture, "passed"));
+    const validated = fixture.core.recordFocusedValidation(fixture.runId, 5, "validate", await authoritativeFocusedFor(fixture, "passed"));
     assert.equal(validated.to, "REVIEW");
     const reviewed = fixture.core.review(fixture.runId, 6, "review", reviewFor(fixture, "next_phase", "pass"));
     assert.equal(reviewed.to, "NEXT_PHASE");
@@ -251,7 +254,7 @@ test("fake implementation failure reaches bounded REWORK", async () => {
     fixture.adapter.script(fixture.taskId, "implementation_failure");
     await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin-failure");
     await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete-failure");
-    fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-failure", validationFor(fixture, "failed"));
+    fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-failure", await authoritativeFocusedFor(fixture, "failed"));
     const rework = fixture.core.review(fixture.runId, 6, "review-failure", { ...reviewFor(fixture, "rework", "failure"), failureClass: "implementation_failure" });
     assert.equal(rework.to, "REWORK");
     assert.equal(fixture.core.reworkToReady(fixture.runId, 7, "rework-ready").to, "READY");
@@ -299,7 +302,7 @@ test("focused validation accepts only the current active attempt", async () => {
     fixture.adapter.script(fixture.taskId, "success");
     await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin");
     await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete");
-    const accepted = fixture.core.recordFocusedValidation(fixture.runId, 5, "current-attempt", validationFor(fixture, "passed"));
+    const accepted = fixture.core.recordFocusedValidation(fixture.runId, 5, "current-attempt", await authoritativeFocusedFor(fixture, "passed"));
     assert.equal(accepted.to, "REVIEW");
     assert.equal(fixture.core.readModel(fixture.runId)?.latestValidation?.attemptId, fixture.core.readModel(fixture.runId)?.run.activeAttemptId);
   } finally {
@@ -552,6 +555,12 @@ test("executor gate evidence is persisted as an untrusted claim", async () => {
     const stored = fixture.core.readModel(fixture.runId)?.currentGate?.gate;
     assert.equal(stored?.evidence?.[0]?.classification, "not_tested");
     assert.match(stored?.evidence?.[0]?.summary ?? "", /not independently validated/i);
+    const owned = fixture.store.listArtifactRecords(fixture.runId, 10).find(artifact => artifact.kind === "executor-result");
+    assert.ok(owned);
+    assert.deepEqual(stored?.evidenceRefs, [owned.artifactId]);
+    assert.ok(stored?.evidence?.some(evidence => evidence.artifactRef === owned.artifactId));
+    reopen(fixture);
+    assert.deepEqual(fixture.core.readModel(fixture.runId)?.currentGate?.gate.evidenceRefs, [owned.artifactId]);
   } finally {
     fixture.close();
   }
@@ -605,3 +614,42 @@ test("the Phase 1 adapter descriptor is explicitly simulated, not a real provide
     fixture.close();
   }
 });
+
+test("focused Core consumption rejects a caller-created bundle without verifier authority", async () => {
+  const fixture = createFixture();
+  try {
+    primeExecute(fixture);
+    fixture.adapter.script(fixture.taskId, "success");
+    await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin-forged");
+    await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete-forged");
+    assert.throws(() => fixture.core.recordFocusedValidation(fixture.runId, 5, "forged-focused", validationFor(fixture)), /persisted independent authority/);
+    assert.equal(fixture.store.getRun(fixture.runId)?.state, "VERIFY_FOCUSED");
+  } finally { fixture.close(); }
+});
+
+for (const variant of ["unknown", "foreign"] as const) {
+  test(`executor gate rejects ${variant} artifact references before persistence`, async () => {
+    const fixture = createFixture();
+    try {
+      let ref = asArtifactId("artifact_unknown");
+      if (variant === "foreign") {
+        const runId = asRunId("run_foreign_artifact");
+        const taskId = asTaskId("task_foreign_artifact");
+        const foreign = { ...fixture, runId, taskId, decision: { ...fixture.decision, runId, taskId, decisionId: asDecisionId("decision_foreign_artifact") } };
+        foreign.core.startRun(runId, "synthetic foreign run", "foreign:start");
+        foreign.core.completeIntake(runId, 1, "foreign:intake");
+        foreign.core.plan(runId, 2, "foreign:plan", foreign.decision);
+        foreign.core.prepareExecution(runId, 3, "foreign:prepare");
+        const attemptId = fixture.store.getRun(runId)!.activeAttemptId!;
+        await fixture.core.completeFakeAttempt(runId, 4, "foreign:complete", { ...executorResultFor(foreign), runId, taskId, attemptId });
+        ref = fixture.store.listArtifactRecords(runId, 10)[0]!.artifactId;
+      }
+      primeExecute(fixture);
+      const result = blockedResult(fixture, [{ id: "cancel", label: "Cancel", consequence: "Preserve evidence", target: "CANCELLED" }, { id: "fail", label: "Fail", consequence: "Preserve evidence", target: "FAILED" }]);
+      result.humanGate!.evidenceRefs = [ref];
+      await assert.rejects(() => fixture.core.completeFakeAttempt(fixture.runId, 4, "foreign-gate", result), /foreign|unknown|owned/i);
+      assert.equal(fixture.store.getRun(fixture.runId)?.state, "EXECUTE");
+      assert.equal(fixture.store.listArtifactRecords(fixture.runId, 10).length, 0);
+    } finally { fixture.close(); }
+  });
+}

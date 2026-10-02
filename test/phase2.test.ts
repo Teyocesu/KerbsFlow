@@ -56,7 +56,7 @@ test("Phase 4 planning cannot execute without a runtime-trusted routing decision
       repositoryPath: fixture.repository.root,
       expectedBaseOid: fixture.repository.head,
       planningDecision,
-      focusedCheck: { name: "unused", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      focusedCheck: { name: "unused", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
     }), /trusted routing decision|routing authority/i);
     assert.equal(fixture.store.getRun(fixture.runId), undefined);
@@ -113,8 +113,8 @@ test("the real Phase 4 loop persists distinct OpenCode and Codex escalation prov
       expectedBaseOid: repository.head,
       planningDecision: routed.planningDecision,
       routingDecision: routed.routingDecision,
-      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
-      phaseCheck: { level: "phase", commandId: "phase4-routed", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+      phaseCheck: { level: "phase", commandId: "phase4-routed", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
       failurePolicy: { higherCodexRoute: { model: "fixture-model", reasoning: "high" } },
     });
@@ -245,8 +245,8 @@ test("Planning Master retries stale Steer and enforces Phase 4 rework escalation
       objective: "Planning Master current routing authority",
       repositoryPath: repository.root,
       expectedBaseOid: repository.head,
-      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
-      phaseCheck: { level: "phase", commandId: "phase4-pm", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+      phaseCheck: { level: "phase", commandId: "phase4-pm", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
       failurePolicy: { higherCodexRoute: { model: "fixture-model", reasoning: "high" } },
     });
@@ -390,12 +390,12 @@ test("independent verification fails the bundle when executor changed-path claim
       recommendedNext: "verify_focused",
       exit: { kind: "normal", code: 0 },
     };
-    const verification = await new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), ids).verify(
+    const verification = await verifyDeclared(new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), ids),
       intake,
       worktree,
       decision,
       executorResult,
-      { name: "exact content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      { name: "exact content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
     );
     assert.equal(verification.bundle.outcome, "failed");
     assert.equal(verification.executorDisagreements.length, 1);
@@ -422,12 +422,12 @@ for (const mutation of [
   test(`focused verification fails closed when the check mutates ${mutation.name}`, async () => {
     const fixture = verificationFixture(`check_mutation_${mutation.name.replaceAll(" ", "_")}`);
     try {
-      const verification = await fixture.verifier.verify(
+      const verification = await verifyDeclared(fixture.verifier,
         fixture.intake,
         fixture.worktree,
         fixture.decision,
         fixture.executorResult,
-        { name: "mutating focused check", executable: process.execPath, args: [...mutation.args], timeoutMs: 5000 },
+        { name: "mutating focused check", executable: process.execPath, args: [...mutation.args], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       );
       assert.notEqual(verification.checkResult.exitCode, 0);
       assert.equal(verification.bundle.outcome, "failed");
@@ -442,7 +442,7 @@ test("focused verification fails closed when the check mutates the original chec
   const fixture = verificationFixture("check_mutation_original");
   try {
     const originalReadme = join(fixture.repository.root, "README.md");
-    const verification = await fixture.verifier.verify(
+    const verification = await verifyDeclared(fixture.verifier,
       fixture.intake,
       fixture.worktree,
       fixture.decision,
@@ -452,6 +452,7 @@ test("focused verification fails closed when the check mutates the original chec
         executable: process.execPath,
         args: ["-e", "import {writeFileSync} from 'node:fs'; writeFileSync(process.argv[1], 'mutated by check\\n')", originalReadme],
         timeoutMs: 5000,
+        proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" },
       },
     );
     assert.notEqual(verification.checkResult.exitCode, 0);
@@ -470,7 +471,7 @@ test("a focused command cannot be promoted by calling the phase verifier", async
       fixture.worktree,
       fixture.decision,
       fixture.executorResult,
-      { name: "focused only", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 } as never,
+      { name: "focused only", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } } as never,
     ), /explicit phase command identity/);
   } finally {
     fixture.close();
@@ -517,8 +518,8 @@ test("synthetic real vertical loop writes only the owned worktree and passes ind
       repositoryPath: repository.root,
       expectedBaseOid: repository.head,
       planningDecision: decision,
-      focusedCheck: { name: "synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
-      phaseCheck: { level: "phase", commandId: "phase-synthetic-content", name: "phase synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      focusedCheck: { name: "synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+      phaseCheck: { level: "phase", commandId: "phase-synthetic-content", name: "phase synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
     });
     assert.equal(result.verdict, "PASS");
@@ -576,7 +577,7 @@ test("focused evidence alone cannot close a phase without an explicit phase comm
       objective: "missing phase validation",
       repositoryPath: repository.root,
       planningDecision: decision,
-      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
     });
     assert.equal(result.verdict, "HUMAN_GATE");
@@ -608,8 +609,8 @@ test("phase-command failure stays phase-scoped and cannot inherit focused succes
       objective: "phase command failure",
       repositoryPath: repository.root,
       planningDecision: decision,
-      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
-      phaseCheck: { level: "phase", commandId: "phase-always-fails", name: "phase failure", executable: process.execPath, args: ["-e", "process.exit(7)"], timeoutMs: 5000 },
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+      phaseCheck: { level: "phase", commandId: "phase-always-fails", name: "phase failure", executable: process.execPath, args: ["-e", "process.exit(7)"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
     });
     assert.equal(result.verdict, "HUMAN_GATE");
@@ -687,8 +688,8 @@ for (const semantic of [
         objective: `semantic ${semantic.outcome}`,
         repositoryPath: repository.root,
         planningDecision: decision,
-        focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
-        phaseCheck: { level: "phase", commandId: "phase-semantic", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+        focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+        phaseCheck: { level: "phase", commandId: "phase-semantic", name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
         executionTimeoutMs: 5000,
         semanticReview: { model: "fixture-review", canonicalContract: "synthetic canonical contract" },
       });
@@ -933,7 +934,7 @@ for (const intakeCase of ["tracked", "staged", "untracked", "base-mismatch", "fi
         repositoryPath: repository.root,
         expectedBaseOid: intakeCase === "base-mismatch" ? "0".repeat(40) : repository.head,
         planningDecision: decision,
-        focusedCheck: { name: "must not execute", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+        focusedCheck: { name: "must not execute", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
         executionTimeoutMs: 5000,
       });
       assert.equal(result.verdict, "HUMAN_GATE");
@@ -991,7 +992,7 @@ for (const expected of [
         objective: expected.scenario,
         repositoryPath: repository.root,
         planningDecision: decision,
-        focusedCheck: { name: "synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+        focusedCheck: { name: "synthetic content check", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
         executionTimeoutMs: 5000,
       });
       assert.equal(result.verdict, expected.verdict);
@@ -1169,7 +1170,7 @@ function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopReque
     runId,
     taskId,
     decision,
-    run: ({ reviewer, sandbox, planningMaster }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox; planningMaster?: PlanningMaster }) => new Phase2Loop(
+    run: ({ reviewer, sandbox, planningMaster, fullCheck }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox; planningMaster?: PlanningMaster; fullCheck?: Phase2LoopRequest["fullCheck"] }) => new Phase2Loop(
       codexCore(store, adapter, ids),
       store,
       gitManager,
@@ -1184,11 +1185,12 @@ function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopReque
       repositoryPath: repository.root,
       expectedBaseOid: repository.head,
       ...(planningMaster === undefined ? { planningDecision: decision } : {}),
-      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
-      phaseCheck: { level: "phase", commandId: `phase-${scenario}`, name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000 },
+      focusedCheck: { name: "focused content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
+      phaseCheck: { level: "phase", commandId: `phase-${scenario}`, name: "phase content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
       executionTimeoutMs: 5000,
       ...(failurePolicy === undefined ? {} : { failurePolicy }),
       semanticReview: { model: "fixture-review", canonicalContract: "synthetic canonical contract" },
+      ...(fullCheck === undefined ? {} : { fullCheck }),
     }),
     close() {
       store.close();
@@ -1263,4 +1265,83 @@ function verificationFixture(suffix: string): {
       rmSync(repository.root, { recursive: true, force: true });
     },
   };
+}
+
+async function verifyDeclared(verifier: FocusedVerifier, ...args: Parameters<FocusedVerifier["verify"]>) {
+  verifier.declare(args[2].runId, "focused", args[4]);
+  return verifier.verify(...args);
+}
+
+for (const [name, body, expected] of [
+  ["false-zero", "", "failed"],
+  ["inconclusive", "console.log('inconclusive')", "failed"],
+  ["empty-cancelled-suite", "console.log('# tests 0\\n# cancelled 1')", "failed"],
+  ["wrong-proof", "console.log('WRONG_PROOF')", "failed"],
+  ["positive-proof", "console.log('ASSERTION_PROVED')", "passed"],
+] as const) {
+  test(`trusted check proof rejects insufficient output: ${name}`, async () => {
+    const fixture = verificationFixture(`proof_${name}`);
+    try {
+      const check = { name, executable: process.execPath, args: ["-e", body], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "ASSERTION_PROVED" } };
+      fixture.verifier.declare(fixture.decision.runId, "focused", check);
+      const result = await fixture.verifier.verify(fixture.intake, fixture.worktree, fixture.decision, fixture.executorResult, check);
+      assert.equal(result.bundle.outcome, expected);
+      assert.match(result.bundle.evidence.find(e => e.kind === "command")!.summary, /declared positive proof/);
+    } finally { fixture.close(); }
+  });
+}
+
+test("trusted declaration copies arguments and rejects substituted or mutated commands before execution", async () => {
+  const fixture = verificationFixture("intent_substitution");
+  try {
+    const check = { level: "phase" as const, commandId: "declared", name: "assert result", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } };
+    const intent = fixture.verifier.declare(fixture.decision.runId, "phase", check);
+    check.args[0] = "different.mjs";
+    assert.deepEqual(intent.args, ["check.mjs"]);
+    assert.ok(Object.isFrozen(intent.args));
+    await assert.rejects(fixture.verifier.verifyPhase(fixture.intake, fixture.worktree, fixture.decision, fixture.executorResult, check), /trusted launch declaration/);
+    await assert.rejects(fixture.verifier.verifyPhase(fixture.intake, fixture.worktree, fixture.decision, fixture.executorResult, { ...check, commandId: "substituted" }), /trusted launch declaration/);
+    const valid = await fixture.verifier.verifyPhase(fixture.intake, fixture.worktree, fixture.decision, fixture.executorResult, { ...check, args: ["check.mjs"] });
+    assert.equal(valid.verification.bundle.outcome, "passed");
+  } finally { fixture.close(); }
+});
+
+for (const option of ["accept_readiness", "request_corrections", "cancel_readiness"] as const) {
+  test(`real bounded full authority creates immutable release evidence and resolves ${option}`, async () => {
+    const fixture = integratedLoopFixture("success");
+    try {
+      const fullCheck = { level: "full" as const, commandId: "bounded-full", name: "synthetic full content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } };
+      const result = await fixture.run({ fullCheck });
+      assert.equal(result.verdict, "HUMAN_GATE");
+      const model = fixture.store.readModel(fixture.runId)!;
+      assert.equal(model.run.state, "HUMAN_RELEASE_GATE");
+      assert.equal(model.latestValidation!.bundle.level, "full");
+      const gate = model.currentGate!;
+      const bundle = fixture.store.getReleaseBundle(gate.gateId)!;
+      assert.equal(bundle.headOid, fixture.repository.head);
+      assert.match(bundle.candidateFingerprint, /^[a-f0-9]{64}$/);
+      assert.equal(gate.gate.options.some(option => option.target === "REWORK"), false);
+      const core = codexCore(fixture.store, fixture.adapter, fixture.ids);
+      const version = model.run.stateVersion;
+      assert.throws(() => core.resolveReleaseGate(fixture.runId, version - 1, "release:stale", gate.gateId, option), /version/);
+      const resolved = core.resolveReleaseGate(fixture.runId, version, "release:decision", gate.gateId, option, "synthetic human decision");
+      assert.equal(resolved.to, option === "accept_readiness" ? "DONE" : option === "cancel_readiness" ? "CANCELLED" : "HUMAN_RELEASE_GATE");
+      assert.equal(core.resolveReleaseGate(fixture.runId, version, "release:decision", gate.gateId, option, "synthetic human decision").replayed, true);
+      assert.throws(() => core.resolveReleaseGate(fixture.runId, version, "release:decision", gate.gateId, option, "different"), /idempotency/);
+      assert.deepEqual(fixture.store.getReleaseBundle(gate.gateId), bundle);
+      assert.equal(git(fixture.repository.root, ["status", "--porcelain"]), "");
+    } finally { fixture.close(); }
+  });
+}
+
+for (const body of ["", "console.log('WRONG')", "process.exit(1)"]) {
+  test(`bounded full check cannot pass without its positive proof (${body || "empty"})`, async () => {
+    const fixture = integratedLoopFixture("success");
+    try {
+      const result = await fixture.run({ fullCheck: { level: "full", commandId: "bounded-full-negative", name: "synthetic full failure", executable: process.execPath, args: ["-e", body], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "POSITIVE_ASSERTION" } } });
+      assert.equal(result.verdict, "FAILED");
+      assert.equal(fixture.store.readModel(fixture.runId)!.run.state, "FAILED");
+      assert.equal(fixture.store.readModel(fixture.runId)!.currentGate, undefined);
+    } finally { fixture.close(); }
+  });
 }

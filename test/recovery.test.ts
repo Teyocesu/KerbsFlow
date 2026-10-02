@@ -16,7 +16,7 @@ import {
 import { KerbsFlowCore } from "../src/core.js";
 import { KerbsFlowError } from "../src/errors.js";
 import { StateStore } from "../src/persistence.js";
-import { createFixture, executorResultFor, primeExecute, TestFixture, validationFor } from "./helpers.js";
+import { createFixture, executorResultFor, primeExecute, TestFixture, authoritativeFocusedFor } from "./helpers.js";
 
 function reopen(fixture: TestFixture): void {
   fixture.store.close();
@@ -452,7 +452,7 @@ test("REVIEW recovery rejects passed validation from a previous attempt", async 
     fixture.adapter.script(fixture.taskId, "implementation_failure");
     await fixture.core.beginFakeAttempt(fixture.runId, 4, "begin-first");
     await fixture.core.completeFakeAttempt(fixture.runId, 4, "complete-first");
-    fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-first", validationFor(fixture, "passed"));
+    fixture.core.recordFocusedValidation(fixture.runId, 5, "validate-first", await authoritativeFocusedFor(fixture, "passed"));
     fixture.core.review(fixture.runId, 6, "review-first", {
       schemaVersion: CONTRACT_VERSIONS.reviewDecision,
       reviewId: "review_first",
@@ -477,7 +477,7 @@ test("REVIEW recovery rejects passed validation from a previous attempt", async 
   }
 });
 
-test("current-attempt validation boundary is recoverable without duplicate dispatch", () => {
+test("current-attempt validation boundary is recoverable without duplicate dispatch", async () => {
   const fixture = createFixture();
   try {
     primeExecute(fixture);
@@ -486,7 +486,7 @@ test("current-attempt validation boundary is recoverable without duplicate dispa
     stageTerminalRecovery(fixture, "SUCCEEDED", JSON.stringify(executorResultFor(fixture)));
     fixture.core.recover(fixture.runId, 5, "recover-terminal", recoveryDecision(fixture.runId, "VERIFY_FOCUSED"));
 
-    const validation = validationFor(fixture, "passed");
+    const validation = await authoritativeFocusedFor(fixture);
     const validationCommand = parseCommand({
       schemaVersion: CONTRACT_VERSIONS.command,
       commandId: asCommandId("command_validation_boundary"),
@@ -496,10 +496,7 @@ test("current-attempt validation boundary is recoverable without duplicate dispa
       kind: "validation",
       payload: { bundle: validation },
     });
-    fixture.store.executeCommand(validationCommand, ({ tx, now }) => {
-      tx.run("INSERT INTO validations (validation_id, run_id, task_id, attempt_id, level, outcome, bundle_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", validation.validationId, fixture.runId, fixture.taskId, attemptId, validation.level, validation.outcome, JSON.stringify(validation), now);
-      return { details: { persisted: true } };
-    });
+    fixture.store.executeCommand(validationCommand, () => ({ details: { persisted: true } }));
     reopen(fixture);
     assert.equal(fixture.core.readModel(fixture.runId)?.run.state, "RECOVERY");
     const reviewed = fixture.core.recover(fixture.runId, 7, "recover-validation", recoveryDecision(fixture.runId, "REVIEW"));

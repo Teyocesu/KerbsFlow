@@ -1,7 +1,6 @@
 import { VerificationSandbox } from "../src/verification-sandbox.js";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -21,10 +20,9 @@ import { StateStore } from "../src/persistence.js";
 import { GitWorktreeManager } from "../src/git.js";
 import { FocusedVerifier } from "../src/verifier.js";
 import { ProcessSupervisor } from "../src/process.js";
-import { CanonicalIntentGuard } from "../src/canonical.js";
 import type { SemanticReviewAdapter } from "../src/adapter.js";
 import { IndependentSemanticReviewer } from "../src/reviewer.js";
-import { createFixture, primeExecute, reviewFor, validationFor } from "./helpers.js";
+import { createFixture, primeExecute, reviewFor, authoritativeFocusedFor, ownedValidationRepository } from "./helpers.js";
 
 test("trusted phase-close path requires current phase evidence and reaches NEXT_PHASE", async () => {
   const fixture = createFixture();
@@ -101,7 +99,7 @@ test("persisted phase validation from a previous attempt cannot close the curren
     fixture.adapter.script(fixture.taskId, "success");
     await fixture.core.beginFakeAttempt(fixture.runId, command.stateVersion, "phase3:old-attempt-begin");
     command = await fixture.core.completeFakeAttempt(fixture.runId, command.stateVersion, "phase3:old-attempt-complete");
-    const focused = { ...validationFor(fixture, "passed"), validationId: asValidationId("validation_second_attempt") };
+    const focused = await authoritativeFocusedFor(fixture);
     command = fixture.core.recordFocusedValidation(fixture.runId, command.stateVersion, "phase3:old-attempt-focused", focused);
     command = fixture.core.review(fixture.runId, command.stateVersion, "phase3:old-attempt-review", reviewFor(fixture, "verify_phase", "second-attempt"));
     assert.throws(() => fixture.core.completeTrustedPhaseValidation(fixture.runId, command.stateVersion, "phase3:old-attempt-close", { validationId: authority.validationId }), /attempt|scope/i);
@@ -126,7 +124,7 @@ test("persisted phase validation from another task cannot close the current task
     command = await fixture.core.completeFakeAttempt(fixture.runId, command.stateVersion, "phase3:second-task-complete");
     const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
     assert.ok(attemptId);
-    const focused = { ...validationFor(fixture, "passed"), validationId: asValidationId("validation_second_task"), taskId, attemptId };
+    const focused = await authoritativeFocusedFor(fixture);
     command = fixture.core.recordFocusedValidation(fixture.runId, command.stateVersion, "phase3:second-task-focused", focused);
     command = fixture.core.review(fixture.runId, command.stateVersion, "phase3:second-task-review", { ...reviewFor(fixture, "verify_phase", "second-task"), reviewId: asReviewId("review_second_task"), taskId });
     assert.throws(() => fixture.core.completeTrustedPhaseValidation(fixture.runId, command.stateVersion, "phase3:other-task-close", { validationId: authority.validationId }), /task|scope/i);
@@ -214,7 +212,7 @@ test("failure fingerprints, occurrences, route, and one escalation reason persis
     fixture.adapter.script(fixture.taskId, "implementation_failure");
     await fixture.core.beginFakeAttempt(fixture.runId, 4, "failure:begin");
     await fixture.core.completeFakeAttempt(fixture.runId, 4, "failure:complete");
-    fixture.core.recordFocusedValidation(fixture.runId, 5, "failure:validate", validationFor(fixture, "failed"));
+    fixture.core.recordFocusedValidation(fixture.runId, 5, "failure:validate", await authoritativeFocusedFor(fixture, "failed"));
     fixture.core.review(fixture.runId, 6, "failure:review", { ...reviewFor(fixture, "rework", "failure"), failureClass: "implementation_failure" });
     fixture.core.reworkToReady(fixture.runId, 7, "failure:ready");
     fixture.core.prepareExecution(fixture.runId, 8, "failure:prepare-second");
@@ -326,7 +324,7 @@ async function reachVerifyPhase(fixture: ReturnType<typeof createFixture>): Prom
   fixture.adapter.script(fixture.taskId, "success");
   await fixture.core.beginFakeAttempt(fixture.runId, 4, "phase3:begin");
   await fixture.core.completeFakeAttempt(fixture.runId, 4, "phase3:complete");
-  fixture.core.recordFocusedValidation(fixture.runId, 5, "phase3:focused", validationFor(fixture, "passed"));
+  fixture.core.recordFocusedValidation(fixture.runId, 5, "phase3:focused", await authoritativeFocusedFor(fixture, "passed"));
   fixture.core.review(fixture.runId, 6, "phase3:review", reviewFor(fixture, "verify_phase", "phase3"));
 }
 
@@ -336,42 +334,19 @@ async function recordAuthoritativePhase(
 ): Promise<{ validationId: ReturnType<typeof asValidationId>; inspection: ReturnType<GitWorktreeManager["inspect"]>; repository: { root: string }; worktreePath: string; worktree: ReturnType<GitWorktreeManager["create"]>; manager: GitWorktreeManager }> {
   const attemptId = fixture.core.readModel(fixture.runId)?.run.activeAttemptId;
   assert.ok(attemptId);
-  const repositoryPath = join(fixture.root, "canonical-repository");
-  mkdirSync(join(repositoryPath, "docs"), { recursive: true });
-  mkdirSync(join(repositoryPath, "src"), { recursive: true });
-  writeFileSync(join(repositoryPath, "AGENTS.md"), "synthetic agent policy\n", "utf8");
-  writeFileSync(join(repositoryPath, "docs/SPEC-v0.1.0.md"), "synthetic frozen spec\n", "utf8");
-  writeFileSync(join(repositoryPath, "docs/PLAN-v0.1.0.md"), "synthetic plan\n", "utf8");
-  writeFileSync(join(repositoryPath, "docs/HANDOFF.md"), "synthetic handoff\n", "utf8");
-  writeFileSync(join(repositoryPath, "README.md"), "synthetic\n", "utf8");
-  execFileSync("git", ["init", "--quiet"], { cwd: repositoryPath });
-  execFileSync("git", ["config", "user.name", "KerbsFlow Test"], { cwd: repositoryPath });
-  execFileSync("git", ["config", "user.email", "kerbsflow@example.invalid"], { cwd: repositoryPath });
-  execFileSync("git", ["add", "."], { cwd: repositoryPath });
-  execFileSync("git", ["commit", "--quiet", "-m", "initial"], { cwd: repositoryPath });
-  const manager = new GitWorktreeManager(join(fixture.root, "owned"));
-  const intake = manager.intake(repositoryPath);
-  const worktree = manager.create(intake, fixture.runId);
-  fixture.store.recordWorktree({
-    runId: fixture.runId,
-    repositoryPath: worktree.repositoryPath,
-    gitCommonDirectory: worktree.gitCommonDirectory,
-    worktreeGitDirectory: worktree.worktreeGitDirectory,
-    baseOid: worktree.baseOid,
-    branch: worktree.branch,
-    worktreePath: worktree.path,
-    markerPath: worktree.markerPath,
-    createdAt: worktree.createdAt,
-  });
-  new CanonicalIntentGuard(fixture.store).capture(fixture.runId, repositoryPath, intake.baseOid);
+  const { repositoryPath, manager, intake, worktree } = ownedValidationRepository(fixture);
   mutate?.(worktree.path);
   const result = parseExecutorResult(JSON.parse(fixture.store.getAttempt(attemptId)!.outcomeJson!));
-  const phase = await new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), fixture.ids).verifyPhase(
+  const verifier = new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), fixture.ids);
+  const declaredCheck = { level: "phase" as const, commandId: "phase-gate", name: "phase gate", executable: process.execPath, args: ["-e", "console.log('KERBSFLOW_CHECK_PASSED')"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } };
+  fixture.store.recordValidationIntent(fixture.runId, "phase", declaredCheck);
+  verifier.declare(fixture.runId, "phase", declaredCheck);
+  const phase = await verifier.verifyPhase(
     intake,
     worktree,
     fixture.decision,
     result,
-    { level: "phase", commandId: "phase-gate", name: "phase gate", executable: process.execPath, args: ["-e", "process.exit(0)"], timeoutMs: 5000 },
+    { level: "phase", commandId: "phase-gate", name: "phase gate", executable: process.execPath, args: ["-e", "console.log('KERBSFLOW_CHECK_PASSED')"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } },
   );
   fixture.store.recordAuthoritativePhaseValidation(phase.authoritative);
   return { validationId: phase.authoritative.bundle.validationId, inspection: phase.verification.inspection, repository: { root: repositoryPath }, worktreePath: worktree.path, worktree, manager };

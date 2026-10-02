@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readFileSync, readSync, realpathSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, readSync, readlinkSync, realpathSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 
 import { KerbsFlowError } from "./errors.js";
@@ -79,6 +79,7 @@ export interface WorktreeInspection {
   status: GitStatusEntry[];
   changedPaths: string[];
   diff: string;
+  candidateFingerprint: string;
   dirty: boolean;
 }
 
@@ -297,6 +298,7 @@ export class GitWorktreeManager {
       status,
       changedPaths,
       diff: diffBuffer.toString("utf8"),
+      candidateFingerprint: candidateFingerprint(record.path, record.baseOid, headOid, changedPaths, diffBuffer),
       dirty: status.length > 0 || headOid !== record.baseOid,
     };
   }
@@ -365,7 +367,7 @@ function renderUntrackedDiff(worktreePath: string, status: GitStatusEntry[], rem
       if (metadata.size > remainingBytes - used) {
         throw new KerbsFlowError("DIFF_TOO_LARGE", `untracked file ${entry.path} exceeds the remaining diff bound`);
       }
-      const content = readFileSync(candidate);
+      const content = readPrivateFileWithin(worktreePath, entry.path, remainingBytes - used);
       rendered = content.includes(0)
         ? `diff --kerbsflow-untracked ${JSON.stringify(entry.path)}\nnew binary file (${content.byteLength} bytes)\n`
         : `diff --kerbsflow-untracked ${JSON.stringify(entry.path)}\n--- /dev/null\n+++ b/${entry.path}\n${content.toString("utf8").split("\n").map((line) => `+${line}`).join("\n")}\n`;
@@ -378,6 +380,42 @@ function renderUntrackedDiff(worktreePath: string, status: GitStatusEntry[], rem
     chunks.push(chunk);
   }
   return Buffer.concat(chunks);
+}
+
+function candidateFingerprint(root: string, baseOid: string, headOid: string, paths: string[], diff: Buffer): string {
+  const entries = paths.map(path => {
+    const full = resolve(root, path);
+    let parent = dirname(full);
+    while (!existsSync(parent) && parent !== root && pathIsWithin(root, parent)) parent = dirname(parent);
+    if (!pathIsWithin(root, full) || full === root || !pathIsWithin(root, realpathSync(parent))) {
+      throw new KerbsFlowError("CANDIDATE_PATH_UNSAFE", "candidate path escapes its owned worktree");
+    }
+    let metadata;
+    try { metadata = lstatSync(full); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path, type: "deleted" }; throw error; }
+    const mode = metadata.mode & 0o7777;
+    if (metadata.isSymbolicLink()) return { path, type: "symlink", mode, digest: createHash("sha256").update(readlinkSync(full, { encoding: "buffer" })).digest("hex") };
+    if (!metadata.isFile() || metadata.size > 16 * 1024 * 1024) throw new KerbsFlowError("CANDIDATE_UNBOUNDED", "candidate requires a regular file within the 16 MiB evidence ceiling");
+    const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = fstatSync(fd);
+      if (!before.isFile() || before.dev !== metadata.dev || before.ino !== metadata.ino || before.size !== metadata.size) throw new Error("candidate changed before read");
+      const hash = createHash("sha256");
+      const chunk = Buffer.alloc(64 * 1024);
+      let count = 0;
+      while (count <= before.size) {
+        const n = readSync(fd, chunk, 0, Math.min(chunk.length, before.size - count + 1), count);
+        if (n === 0) break;
+        count += n;
+        if (count > before.size) throw new Error("candidate grew while hashing");
+        hash.update(chunk.subarray(0, n));
+      }
+      const after = fstatSync(fd);
+      if (count !== before.size || after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ctimeMs !== before.ctimeMs) throw new Error("candidate changed while hashing");
+      return { path, type: "regular", mode, size: count, digest: hash.digest("hex") };
+    } finally { closeSync(fd); }
+  });
+  return createHash("sha256").update(JSON.stringify({ version: 2, baseOid, headOid, paths, entries, diffHash: createHash("sha256").update(diff).digest("hex") })).digest("hex");
 }
 
 function git(cwd: string, args: string[]): string {

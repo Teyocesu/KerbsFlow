@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -20,6 +20,7 @@ import { createPhase2PlanningDecision } from "../dist/src/planning.js";
 import { StateStore } from "../dist/src/persistence.js";
 import { ProcessSupervisor } from "../dist/src/process.js";
 import { SequenceIdSource } from "../dist/src/runtime.js";
+import { VerificationSandbox } from "../dist/src/verification-sandbox.js";
 import { FocusedVerifier } from "../dist/src/verifier.js";
 
 if (process.env.KERBSFLOW_LIVE_CODEX !== "1") {
@@ -41,7 +42,12 @@ try {
   git(["config", "user.name", "KerbsFlow Live Smoke"]);
   git(["config", "user.email", "kerbsflow@example.invalid"]);
   writeFileSync(join(repository, "README.md"), "Disposable KerbsFlow live smoke repository.\n", "utf8");
-  git(["add", "README.md"]);
+  mkdirSync(join(repository, "docs"));
+  writeFileSync(join(repository, "AGENTS.md"), "Synthetic smoke policy: edit hello.txt only.\n");
+  writeFileSync(join(repository, "docs/SPEC-v0.1.0.md"), "Synthetic smoke: hello.txt contains exactly KerbsFlow live smoke and newline.\n");
+  writeFileSync(join(repository, "docs/PLAN-v0.1.0.md"), "Synthetic smoke: one attempt, focused and phase content checks only.\n");
+  writeFileSync(join(repository, "docs/HANDOFF.md"), "Synthetic smoke: bounded content phase, no release readiness.\n");
+  git(["add", "README.md", "AGENTS.md", "docs"]);
   git(["commit", "--quiet", "-m", "initial"]);
   const baseOid = git(["rev-parse", "HEAD"]);
 
@@ -56,7 +62,7 @@ try {
         schemaVersion: CONTRACT_VERSIONS.config,
         allowedAdapters: ["codex"],
         maxImplementationAttempts: 1,
-        validationLevel: "focused",
+        validationLevel: "phase",
         workloadNetwork: "denied",
         automaticReleaseActions: false,
       },
@@ -78,7 +84,7 @@ try {
     reasoning: "low",
     canonicalContext: "disposable synthetic live smoke",
   });
-  const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new ProcessSupervisor(), ids), ids);
+  const loop = new Phase2Loop(core, store, gitManager, new FocusedVerifier(gitManager, new VerificationSandbox(new ProcessSupervisor()), ids), ids);
   const result = await loop.run({
     runId,
     taskId,
@@ -89,8 +95,15 @@ try {
     focusedCheck: {
       name: "exact hello.txt content",
       executable: process.execPath,
-      args: ["-e", "import {readFileSync} from 'node:fs'; if(readFileSync('hello.txt','utf8') !== 'KerbsFlow live smoke\\n') process.exit(1)"],
+      args: ["-e", "import {readFileSync} from 'node:fs'; if(readFileSync('hello.txt','utf8') !== 'KerbsFlow live smoke\\n') process.exit(1); console.log('KERBSFLOW_HELLO_CONTENT_PASSED')"],
       timeoutMs: 10_000,
+      proof: { kind: "stdout_line", expected: "KERBSFLOW_HELLO_CONTENT_PASSED" },
+    },
+    phaseCheck: {
+      level: "phase", commandId: "hello-content-phase", name: "bounded hello.txt phase content",
+      executable: process.execPath,
+      args: ["-e", "import {readFileSync} from 'node:fs'; if(readFileSync('hello.txt','utf8') !== 'KerbsFlow live smoke\\n') process.exit(1); console.log('KERBSFLOW_HELLO_PHASE_PASSED')"],
+      timeoutMs: 10_000, proof: { kind: "stdout_line", expected: "KERBSFLOW_HELLO_PHASE_PASSED" },
     },
     executionTimeoutMs: 180_000,
   });
@@ -115,6 +128,7 @@ try {
   };
   process.stdout.write(`${JSON.stringify({
     verdict: result.verdict,
+    boundary: "bounded hello.txt content phase; NEXT_PHASE only; no full verification or release readiness",
     adapterVersion: descriptor.adapterVersion,
     isolationProbe: "passed",
     workloadNetwork: descriptor.capabilities.network.workload,
@@ -132,9 +146,13 @@ try {
     process.exitCode = 1;
   }
 } finally {
+  const terminal = store.getRun(asRunId("run_live_smoke"))?.state;
   store.close();
-  rmSync(runtime, { recursive: true, force: true });
-  rmSync(repository, { recursive: true, force: true });
+  // Retain failed or uncertain attempts and their exact provider staging for inspection.
+  if (terminal === "NEXT_PHASE") {
+    rmSync(runtime, { recursive: true, force: true });
+    rmSync(repository, { recursive: true, force: true });
+  }
 }
 
 function git(args) {

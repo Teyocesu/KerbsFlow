@@ -454,3 +454,50 @@ function cleanupAuthorityFor(record: WorktreeRecord, runtime: string, state = "D
   try { return reopened.issueWorktreeCleanupAuthority(runId); }
   finally { reopened.close(); }
 }
+
+test("candidate fingerprint binds same-size binary bytes, symlink target, mode and HEAD", () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-candidate-"));
+  try {
+    const manager = new GitWorktreeManager(runtime);
+    const worktree = manager.create(manager.intake(repository.root), "candidate_identity");
+    const binary = join(worktree.path, "binary.bin");
+    writeFileSync(binary, Buffer.from([0, 1, 2]));
+    symlinkSync("target-a", join(worktree.path, "link"));
+    let fingerprint = manager.inspect(worktree).candidateFingerprint;
+    assert.equal(manager.inspect(worktree).candidateFingerprint, fingerprint);
+    writeFileSync(binary, Buffer.from([0, 2, 1]));
+    let next = manager.inspect(worktree).candidateFingerprint;
+    assert.notEqual(next, fingerprint);
+    fingerprint = next;
+    rmSync(join(worktree.path, "link"));
+    symlinkSync("target-b", join(worktree.path, "link"));
+    next = manager.inspect(worktree).candidateFingerprint;
+    assert.notEqual(next, fingerprint);
+    fingerprint = next;
+    chmodSync(binary, 0o700);
+    next = manager.inspect(worktree).candidateFingerprint;
+    assert.notEqual(next, fingerprint);
+    fingerprint = next;
+    git(worktree.path, ["-c", "user.name=Synthetic", "-c", "user.email=synthetic@example.invalid", "commit", "--allow-empty", "-m", "synthetic candidate HEAD change"]);
+    assert.notEqual(manager.inspect(worktree).candidateFingerprint, fingerprint);
+  } finally { rmSync(runtime, { recursive: true, force: true }); rmSync(repository.root, { recursive: true, force: true }); }
+});
+
+test("candidate fingerprint represents tracked deletion after its entire parent directory disappears", () => {
+  const repository = createGitRepository();
+  const runtime = mkdtempSync(join(tmpdir(), "kerbsflow-deleted-parent-"));
+  try {
+    mkdirSync(join(repository.root, "nested"));
+    writeFileSync(join(repository.root, "nested/file.txt"), "synthetic\n");
+    git(repository.root, ["add", "nested"]);
+    git(repository.root, ["commit", "--quiet", "-m", "nested"]);
+    const manager = new GitWorktreeManager(runtime);
+    const worktree = manager.create(manager.intake(repository.root), "run_deleted_parent");
+    const before = manager.inspect(worktree).candidateFingerprint;
+    rmSync(join(worktree.path, "nested"), { recursive: true });
+    const after = manager.inspect(worktree);
+    assert.deepEqual(after.changedPaths, ["nested/file.txt"]);
+    assert.notEqual(after.candidateFingerprint, before);
+  } finally { rmSync(runtime, { recursive: true, force: true }); rmSync(repository.root, { recursive: true, force: true }); }
+});

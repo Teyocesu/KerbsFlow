@@ -10,6 +10,8 @@ import type { ExecutorAdapter } from "../src/adapter.js";
 import { FileArtifactStore } from "../src/artifacts.js";
 import {
   CONTRACT_VERSIONS,
+  asArtifactId,
+  asValidationId,
   asDecisionId,
   asGateId,
   asRunId,
@@ -1262,5 +1264,33 @@ test("unexpected local API errors return only a sanitized error envelope", async
     assert.doesNotMatch(response.body, /private|Bearer|synthetic-secret|provider diagnostic|token/iu);
   }, {
     core: () => ({ readModel: () => { throw new Error("Bearer synthetic-secret-value in /Users/juan/private/provider diagnostic"); } }),
+  });
+});
+
+test("gate projection bounds hostile evidence, redacts paths and credentials, and filters foreign references", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_gate_projection");
+    const own = await createArtifact(fixture, runId, "gate_projection");
+    const foreign = await createArtifact(fixture, asRunId("run_gate_foreign"), "gate_foreign");
+    fixture.core.gateVerificationSandboxUnavailable(runId, 5, "projection:gate");
+    const stored = fixture.core.readModel(runId)!.currentGate!;
+    const gate = { ...stored.gate, summary: "<img src=x onerror=alert(1)> private /Users/synthetic/private-gate", evidenceRefs: [own, foreign, asArtifactId("artifact_unknown")], evidence: [
+      { schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId("validation_path"), kind: "other", classification: "not_tested", summary: "Private /Users/synthetic/private-evidence", artifactRef: own },
+      { schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId("validation_secret"), kind: "other", classification: "not_tested", summary: "sk-syntheticgatecredential", artifactRef: foreign },
+      { schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId("validation_large"), kind: "other", classification: "inspected", summary: "a".repeat(3500) },
+    ] };
+    const database = new DatabaseSync(join(fixture.root, "state.sqlite"));
+    try { database.prepare("UPDATE human_gates SET gate_json = ? WHERE gate_id = ?").run(JSON.stringify(gate), stored.gateId); } finally { database.close(); }
+    const response = await sendRequest(api, `/v1/runs/${runId}/snapshot`, { token });
+    assert.equal(response.status, 200);
+    const projected = JSON.parse(response.body).currentGate;
+    assert.deepEqual(projected.evidenceRefs, [own]);
+    assert.equal(projected.evidence[0].classification, "not_tested");
+    assert.equal(projected.evidence[0].artifactId, own);
+    assert.equal(projected.evidence[1].summary, "[redacted]");
+    assert.equal(projected.evidence[1].artifactId, undefined);
+    assert.equal(projected.evidence[2].summary.length, 500);
+    assert.doesNotMatch(response.body, /private-gate|private-evidence|syntheticgatecredential/);
+    assert.match(projected.summary, /<img/);
   });
 });

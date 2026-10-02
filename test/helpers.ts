@@ -1,4 +1,11 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { GitWorktreeManager, type WorktreeRecord } from "../src/git.js";
+import { CanonicalIntentGuard } from "../src/canonical.js";
+import { FocusedVerifier } from "../src/verifier.js";
+import { VerificationSandbox } from "../src/verification-sandbox.js";
+import { ProcessSupervisor } from "../src/process.js";
+import { parseExecutorResult } from "../src/contracts.js";
+import { existsSync, mkdirSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -160,4 +167,37 @@ export function executorResultFor(fixture: TestFixture, overrides: Partial<Execu
     exit: { kind: "normal", code: 0 },
     ...overrides,
   };
+}
+
+export function ownedValidationRepository(fixture: TestFixture) {
+  const repositoryPath = join(fixture.root, "canonical-repository");
+  if (!existsSync(repositoryPath)) {
+    mkdirSync(join(repositoryPath, "docs"), { recursive: true });
+    mkdirSync(join(repositoryPath, "src"), { recursive: true });
+    for (const [path, text] of Object.entries({ "AGENTS.md": "synthetic agent policy", "docs/SPEC-v0.1.0.md": "synthetic frozen spec", "docs/PLAN-v0.1.0.md": "synthetic plan", "docs/HANDOFF.md": "synthetic handoff", "README.md": "synthetic" })) writeFileSync(join(repositoryPath, path), text + "\n");
+    for (const args of [["init", "--quiet"], ["config", "user.name", "KerbsFlow Test"], ["config", "user.email", "kerbsflow@example.invalid"], ["add", "."], ["commit", "--quiet", "-m", "initial"]]) execFileSync("git", args, { cwd: repositoryPath });
+  }
+  const manager = new GitWorktreeManager(join(fixture.root, "owned"));
+  const intake = manager.intake(repositoryPath);
+  const stored = fixture.store.getWorktree(fixture.runId);
+  const worktree: WorktreeRecord = stored === undefined ? manager.create(intake, fixture.runId) : { schemaVersion: "kerbsflow.worktree/v1", runKey: fixture.runId, ...stored, path: stored.worktreePath };
+  if (stored === undefined) {
+    fixture.store.recordWorktree({ runId: fixture.runId, ...worktree, worktreePath: worktree.path });
+    new CanonicalIntentGuard(fixture.store).capture(fixture.runId, repositoryPath, intake.baseOid);
+  }
+  return { repositoryPath, manager, intake, worktree };
+}
+
+export async function authoritativeFocusedFor(fixture: TestFixture, outcome: "passed" | "failed" = "passed"): Promise<ValidationBundle> {
+  const { manager, intake, worktree } = ownedValidationRepository(fixture);
+  const run = fixture.store.getRun(fixture.runId)!;
+  const decision = fixture.store.getTask(run.currentTaskId!)!.decision;
+  const result = parseExecutorResult(JSON.parse(fixture.store.getAttempt(run.activeAttemptId!)!.outcomeJson!));
+  const command = { name: "synthetic-focused", executable: process.execPath, args: ["-e", outcome === "passed" ? "require('node:assert/strict').equal(1 + 1, 2); console.log('FOCUSED_ASSERTION_PASS')" : "process.exit(1)"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "FOCUSED_ASSERTION_PASS" } };
+  fixture.store.recordValidationIntent(fixture.runId, "focused", command);
+  const verifier = new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), fixture.ids);
+  verifier.declare(fixture.runId, "focused", command);
+  const verified = await verifier.verify(intake, worktree, decision, result, command);
+  fixture.store.recordAuthoritativePhaseValidation(verified.authoritative);
+  return verified.bundle;
 }
