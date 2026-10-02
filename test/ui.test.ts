@@ -236,46 +236,60 @@ test("dashboard reload restores only the selected run through a snapshot read, n
   assert.equal(node("run-id").value, "run_reload");
   assert.equal(node("connection-status").textContent, "Session invalid");
 
-  const openRequests: string[] = [];
-  const selection = dashboardContext((path) => { openRequests.push(String(path)); return new Promise(() => {}); });
-  void runInContext('loadRun("run_selected")', selection.context);
-  assert.equal(selection.location.hash, "#run=run_selected");
-  assert.deepEqual(openRequests, ["/v1/runs/run_selected/snapshot"]);
-  await runInContext('loadRun("")', selection.context);
-  assert.equal(selection.location.hash, "");
+  for (const runId of ["run_selected", "run_" + "a".repeat(116)]) {
+    for (const entry of ["load", "open", "switch"]) {
+      const openRequests: string[] = [];
+      const selection = dashboardContext((path) => { openRequests.push(String(path)); return new Promise(() => {}); });
+      if (entry === "load") void runInContext(`loadRun(${JSON.stringify(runId)})`, selection.context);
+      else {
+        selection.node(entry === "open" ? "empty-run-id" : "run-id").value = runId;
+        selection.node(entry === "open" ? "empty-run-form" : "run-form").listeners.get("submit")!({ preventDefault() {} });
+      }
+      assert.equal(selection.location.hash, "#run=" + runId);
+      assert.deepEqual(openRequests, ["/v1/runs/" + runId + "/snapshot"]);
+      await runInContext('loadRun("")', selection.context);
+      assert.equal(selection.location.hash, "");
+    }
+  }
 });
 
 test("invalid run selections never change the URL or current selection and never send requests", async () => {
-  const invalidIds = ["/private/pqa/example", "../private", "run with spaces", "<img src=x>", "task_wrong", "run_", "run_" + "a".repeat(117)];
+  const maximumId = "run_" + "a".repeat(116);
+  const invalidIds = ["/private/pqa/example", "../private", "run with spaces", "<img src=x>", "task_wrong", "run_", "run_" + "a".repeat(117), " run_selected ", "run_selected ", " run_selected", " ", "   ", " " + maximumId, maximumId + " "];
   const validationMessages = new Set<string>();
   for (const runId of invalidIds) {
-    for (const entry of ["load", "open", "switch", "start"]) {
-      const requests: string[] = [];
-      const page = dashboardContext((path) => { requests.push(String(path)); return new Promise(() => {}); });
-      page.context.crypto = { getRandomValues: (bytes: Uint8Array) => bytes.fill(1) };
-      void runInContext('loadRun("run_selected")', page.context);
-      requests.length = 0;
-      const previousSession = runInContext("currentSession", page.context);
-      if (entry === "load") void runInContext(`loadRun(${JSON.stringify(runId)})`, page.context);
-      else if (entry === "start") {
-        page.node("start-objective").value = "Synthetic objective";
-        page.node("start-run-id").value = runId;
-        void runInContext("startRun({ preventDefault() {} })", page.context);
-      } else {
-        const field = entry === "open" ? "empty-run-id" : "run-id";
-        const form = entry === "open" ? "empty-run-form" : "run-form";
-        page.node(field).value = runId;
-        page.node(form).listeners.get("submit")!({ preventDefault() {} });
+    for (const selectedId of ["", "run_selected"]) {
+      for (const entry of ["load", "open", "switch", "start"]) {
+        const requests: string[] = [];
+        const page = dashboardContext((path) => { requests.push(String(path)); return new Promise(() => {}); });
+        let generatedIds = 0;
+        page.context.crypto = { getRandomValues: (bytes: Uint8Array) => { generatedIds += 1; return bytes.fill(1); } };
+        if (selectedId !== "") void runInContext(`loadRun(${JSON.stringify(selectedId)})`, page.context);
+        requests.length = 0;
+        const previousSession = runInContext("currentSession", page.context);
+        if (entry === "load") void runInContext(`loadRun(${JSON.stringify(runId)})`, page.context);
+        else if (entry === "start") {
+          page.node("start-objective").value = "Synthetic objective";
+          page.node("start-run-id").value = runId;
+          void runInContext("startRun({ preventDefault() {} })", page.context);
+        } else {
+          const field = entry === "open" ? "empty-run-id" : "run-id";
+          const form = entry === "open" ? "empty-run-form" : "run-form";
+          page.node(field).value = runId;
+          page.node(form).listeners.get("submit")!({ preventDefault() {} });
+        }
+        await new Promise(resolve => setImmediate(resolve));
+        assert.deepEqual(requests, [], entry + " must reject " + runId);
+        assert.equal(page.location.hash, selectedId === "" ? "" : "#run=" + selectedId);
+        assert.equal(runInContext("currentSession", page.context), previousSession);
+        if (previousSession !== undefined) assert.equal(previousSession.controller.signal.aborted, false);
+        assert.equal(generatedIds, 0, "invalid explicit input must not generate an ID");
+        if (entry !== "load") assert.equal(page.node(entry === "start" ? "start-run-id" : entry === "open" ? "empty-run-id" : "run-id").value, runId, "exact input must be preserved");
+        assert.match(page.node("page-status").textContent, /valid run ID/u);
+        assert.equal(page.node("page-status").dataset.state, "error");
+        validationMessages.add(page.node("page-status").textContent);
+        assert.ok(page.node("page-status").textContent.length <= 180);
       }
-      await new Promise(resolve => setImmediate(resolve));
-      assert.deepEqual(requests, [], entry + " must reject " + runId);
-      assert.equal(page.location.hash, "#run=run_selected");
-      assert.equal(runInContext("currentSession", page.context), previousSession);
-      assert.equal(previousSession.controller.signal.aborted, false);
-      assert.match(page.node("page-status").textContent, /valid run ID/u);
-      assert.equal(page.node("page-status").dataset.state, "error");
-      validationMessages.add(page.node("page-status").textContent);
-      assert.ok(page.node("page-status").textContent.length <= 180);
     }
   }
   assert.equal(validationMessages.size, 1, "feedback is fixed text independent of invalid input");
@@ -299,7 +313,7 @@ test("bootstrap clears invalid remembered selections and restores only a bounded
 });
 
 test("valid explicit and generated Start IDs remain remembered even on a rejected response, without retry", async () => {
-  for (const explicitId of ["run_selected", ""]) {
+  for (const explicitId of ["run_selected", "run_" + "a".repeat(116), ""]) {
     const requests: Array<{ path: string; runId: string }> = [];
     const page = dashboardContext(async (path, options) => {
       const body = JSON.parse((options as { body: string }).body);

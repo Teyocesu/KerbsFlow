@@ -864,7 +864,7 @@ async function startRun(event) {
     return;
   }
 
-  let runId = elements.startRunInput.value.trim();
+  let runId = elements.startRunInput.value;
   try {
     if (runId === "") runId = "run_" + randomHex();
   } catch {
@@ -1303,12 +1303,12 @@ elements.form.addEventListener("keydown", (event) => {
 
 elements.form.addEventListener("submit", (event) => {
   event.preventDefault();
-  void loadRun(elements.runInput.value.trim());
+  void loadRun(elements.runInput.value);
 });
 
 elements.emptyForm.addEventListener("submit", (event) => {
   event.preventDefault();
-  void loadRun(elements.emptyRunInput.value.trim());
+  void loadRun(elements.emptyRunInput.value);
 });
 
 elements.startForm.addEventListener("submit", (event) => {
