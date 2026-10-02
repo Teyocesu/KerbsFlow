@@ -871,8 +871,12 @@ async function startRun(event) {
     setPageStatus("Secure random IDs are unavailable, so Start was not sent.", "error");
     return;
   }
+  if (!rememberRunSelection(runId)) {
+    showInvalidRunSelection();
+    elements.startRunInput.focus();
+    return;
+  }
   elements.startRunInput.value = runId;
-  rememberRunSelection(runId);
   startInFlight = true;
   elements.startButton.disabled = true;
   clearPageStatus();
@@ -1190,13 +1194,28 @@ function resetDashboard() {
   elements.activity.replaceChildren();
 }
 
+function isValidRunId(runId) {
+  return typeof runId === "string" && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,115}$/u.test(runId);
+}
+
+function showInvalidRunSelection() {
+  const message = "Enter a valid run ID: run_ followed by a letter or number, then only letters, numbers, underscores or hyphens; at most 120 characters total.";
+  if (currentSession !== undefined) setSessionNotice(currentSession, message, "error");
+  else setPageStatus(message, "error");
+}
+
 function rememberRunSelection(runId) {
+  if (runId !== "" && !isValidRunId(runId)) return false;
   window.history.replaceState(null, "", runId === "" ? window.location.pathname + window.location.search : "#run=" + encodeURIComponent(runId));
+  return true;
 }
 
 async function loadRun(runId, notice) {
   if (pageSessionInvalid) return currentSession;
-  rememberRunSelection(runId);
+  if (!rememberRunSelection(runId)) {
+    showInvalidRunSelection();
+    return currentSession;
+  }
   stopSession();
   resetDashboard();
   elements.runInput.value = runId;
@@ -1344,11 +1363,16 @@ elements.cancelForm.addEventListener("submit", (event) => {
   void submitRunMutation(session, "cancel", { reason }, "cancel");
 });
 
+const selectedRun = new URLSearchParams(window.location.hash.slice(1)).get("run");
+const validRememberedSelection = isValidRunId(selectedRun);
+const invalidRememberedSelection = window.location.hash !== "" && !validRememberedSelection;
+if (window.location.hash !== "") rememberRunSelection(validRememberedSelection ? selectedRun : "");
+
 if (apiToken === "") {
   invalidatePageSession();
 } else {
   setConnection("Not connected", "idle");
   clearPageStatus();
-  const selectedRun = new URLSearchParams(window.location.hash.slice(1)).get("run");
-  if (selectedRun !== null && /^run_[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/u.test(selectedRun)) void loadRun(selectedRun);
+  if (validRememberedSelection) void loadRun(selectedRun);
+  else if (invalidRememberedSelection) showInvalidRunSelection();
 }

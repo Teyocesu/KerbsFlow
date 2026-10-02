@@ -236,11 +236,85 @@ test("dashboard reload restores only the selected run through a snapshot read, n
   assert.equal(node("run-id").value, "run_reload");
   assert.equal(node("connection-status").textContent, "Session invalid");
 
-  const selection = dashboardContext(() => new Promise(() => {}));
+  const openRequests: string[] = [];
+  const selection = dashboardContext((path) => { openRequests.push(String(path)); return new Promise(() => {}); });
   void runInContext('loadRun("run_selected")', selection.context);
   assert.equal(selection.location.hash, "#run=run_selected");
+  assert.deepEqual(openRequests, ["/v1/runs/run_selected/snapshot"]);
   await runInContext('loadRun("")', selection.context);
   assert.equal(selection.location.hash, "");
+});
+
+test("invalid run selections never change the URL or current selection and never send requests", async () => {
+  const invalidIds = ["/private/pqa/example", "../private", "run with spaces", "<img src=x>", "task_wrong", "run_", "run_" + "a".repeat(117)];
+  const validationMessages = new Set<string>();
+  for (const runId of invalidIds) {
+    for (const entry of ["load", "open", "switch", "start"]) {
+      const requests: string[] = [];
+      const page = dashboardContext((path) => { requests.push(String(path)); return new Promise(() => {}); });
+      page.context.crypto = { getRandomValues: (bytes: Uint8Array) => bytes.fill(1) };
+      void runInContext('loadRun("run_selected")', page.context);
+      requests.length = 0;
+      const previousSession = runInContext("currentSession", page.context);
+      if (entry === "load") void runInContext(`loadRun(${JSON.stringify(runId)})`, page.context);
+      else if (entry === "start") {
+        page.node("start-objective").value = "Synthetic objective";
+        page.node("start-run-id").value = runId;
+        void runInContext("startRun({ preventDefault() {} })", page.context);
+      } else {
+        const field = entry === "open" ? "empty-run-id" : "run-id";
+        const form = entry === "open" ? "empty-run-form" : "run-form";
+        page.node(field).value = runId;
+        page.node(form).listeners.get("submit")!({ preventDefault() {} });
+      }
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(requests, [], entry + " must reject " + runId);
+      assert.equal(page.location.hash, "#run=run_selected");
+      assert.equal(runInContext("currentSession", page.context), previousSession);
+      assert.equal(previousSession.controller.signal.aborted, false);
+      assert.match(page.node("page-status").textContent, /valid run ID/u);
+      assert.equal(page.node("page-status").dataset.state, "error");
+      validationMessages.add(page.node("page-status").textContent);
+      assert.ok(page.node("page-status").textContent.length <= 180);
+    }
+  }
+  assert.equal(validationMessages.size, 1, "feedback is fixed text independent of invalid input");
+});
+
+test("bootstrap clears invalid remembered selections and restores only a bounded valid run ID", async () => {
+  for (const hash of ["#run=%2Fprivate%2Fpqa%2Fexample", "#run=run_" + "a".repeat(117), "#arbitrary=private", "#run="]) {
+    const requests: string[] = [];
+    const page = dashboardContext((path) => { requests.push(String(path)); return new Promise(() => {}); }, hash);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.deepEqual(requests, []);
+    assert.equal(page.location.hash, "");
+    assert.equal(runInContext("currentSession", page.context), undefined);
+    assert.match(page.node("page-status").textContent, /valid run ID/u);
+  }
+  const runId = "run_" + "a".repeat(116);
+  const requests: string[] = [];
+  const page = dashboardContext((path) => { requests.push(String(path)); return new Promise(() => {}); }, "#run=" + runId + "&extra=private");
+  assert.deepEqual(requests, ["/v1/runs/" + runId + "/snapshot"]);
+  assert.equal(page.location.hash, "#run=" + runId, "only the valid selection is retained");
+});
+
+test("valid explicit and generated Start IDs remain remembered even on a rejected response, without retry", async () => {
+  for (const explicitId of ["run_selected", ""]) {
+    const requests: Array<{ path: string; runId: string }> = [];
+    const page = dashboardContext(async (path, options) => {
+      const body = JSON.parse((options as { body: string }).body);
+      requests.push({ path: String(path), runId: body.payload.runId });
+      return { status: 400, ok: false, json: async () => ({ error: { code: "INVALID_REQUEST" } }) };
+    });
+    page.context.crypto = { getRandomValues: (bytes: Uint8Array) => bytes.fill(1) };
+    page.node("start-run-id").value = explicitId;
+    page.node("start-objective").value = "Synthetic objective";
+    await runInContext("startRun({ preventDefault() {} })", page.context);
+    const expectedId = explicitId || "run_" + "01".repeat(16);
+    assert.deepEqual(requests, [{ path: "/v1/runs", runId: expectedId }]);
+    assert.equal(page.location.hash, "#run=" + expectedId);
+    assert.equal(runInContext("currentSession", page.context), undefined, "rejected Start does not invent a current run");
+  }
 });
 
 test("pending Pause and Cancel explain the wait without projecting a terminal state or sending twice", () => {
