@@ -389,7 +389,7 @@ export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDoss
   };
   const text = (v: unknown, max = 1024): string => {
     if (typeof v !== "string" || !v.trim() || v !== v.trim() || Buffer.byteLength(v) > max || /[\x00-\x1f\x7f]/u.test(v)
-      || /(?:^|[\s"'=])(?:\/|[A-Za-z]:[\\/]|file:\/\/)/u.test(v) || publicFixtureIssue(v) !== undefined) return fail();
+      || /file:\/\/|(?:^|[^\p{L}\p{N}_.\/\\])(?:\/|\\\\|[A-Za-z]:[\\/])/iu.test(v) || publicFixtureIssue(v) !== undefined) return fail();
     return v;
   };
   const hash = (v: unknown, length = 64): string => { if (typeof v !== "string" || !(new RegExp(`^[a-f0-9]{${length}}$`, "u")).test(v)) return fail(); return v; };
@@ -468,7 +468,8 @@ export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDoss
     || !deterministicGate.integrity.evidenceRefs.some(actualFresh)
     || deterministicGate.commands.some(cmd => !cmd.evidenceRefs.some(ref => actualFresh(ref) && byId.get(ref)!.hash === cmd.outputHash))
     || !deterministicGate.evidenceRefs.some(actualFresh)
-    || !acceptance[14]!.evidenceRefs.some(ref => deterministicGate.evidenceRefs.includes(ref) && actualFresh(ref))) return fail();
+    || !deterministicGate.commands.some(cmd => cmd.command === "npm test" && cmd.evidenceRefs.some(ref =>
+      acceptance[14]!.evidenceRefs.includes(ref) && actualFresh(ref) && byId.get(ref)!.hash === cmd.outputHash))) return fail();
   const scenarios = list(d.scenarios, 26, v => {
     const x = object(v, ["id", "adapter", "outcome", "classification", "boundary", "evidenceRefs", "limitations"]);
     const result = { id: choice(x.id, Array.from({ length: 13 }, (_, i) => `X${i + 1}`)), adapter: choice(x.adapter, ["codex", "opencode"]), outcome: pass(x.outcome), classification: parseEvidenceClass(x.classification, "releaseEvidence.classification"), boundary: choice(x.boundary, ["actual", "synthetic", "physical"]), evidenceRefs: provenRefs(x.evidenceRefs), limitations: notes(x.limitations) };

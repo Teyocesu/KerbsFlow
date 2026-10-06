@@ -7,6 +7,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 
 import { FileArtifactStore } from "../src/artifacts.js";
 import { CodexAdapter } from "../src/codex.js";
@@ -1232,6 +1233,12 @@ async function waitForFile(path: string): Promise<void> {
 
 function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopRequest["failurePolicy"]) {
   const repository = createGitRepository();
+  if (scenario === "committed") {
+    writeFileSync(join(repository.root, "result.txt"), "done\n");
+    git(repository.root, ["add", "result.txt"]);
+    git(repository.root, ["commit", "--quiet", "-m", "synthetic committed release candidate"]);
+    repository.head = git(repository.root, ["rev-parse", "HEAD"]);
+  }
   const runtime = mkdtempSync(join(tmpdir(), `kerbsflow-integrated-${scenario}-`));
   const ids = new SequenceIdSource(`integrated_${scenario}`);
   const store = StateStore.open(join(runtime, "state.sqlite"), { ids });
@@ -1261,7 +1268,7 @@ function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopReque
     runId,
     taskId,
     decision,
-    run: ({ reviewer, sandbox, planningMaster, fullCheck, releaseEvidence }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox; planningMaster?: PlanningMaster; fullCheck?: Phase2LoopRequest["fullCheck"]; releaseEvidence?: Phase2DriveControls["releaseEvidence"] }) => new Phase2Loop(
+    run: ({ reviewer, sandbox, planningMaster, fullCheck, releaseEvidence }: { reviewer?: IndependentSemanticReviewer; sandbox?: VerificationSandbox; planningMaster?: PlanningMaster; fullCheck?: Phase2LoopRequest["fullCheck"]; releaseEvidence?: Phase2DriveControls["releaseEvidence"] }, controls: Phase2DriveControls = {}) => new Phase2Loop(
       codexCore(store, adapter, ids),
       store,
       gitManager,
@@ -1282,7 +1289,7 @@ function integratedLoopFixture(scenario: string, failurePolicy?: Phase2LoopReque
       ...(failurePolicy === undefined ? {} : { failurePolicy }),
       semanticReview: { model: "fixture-review", canonicalContract: "synthetic canonical contract" },
       ...(fullCheck === undefined ? {} : { fullCheck }),
-    }, releaseEvidence === undefined ? {} : { releaseEvidence }),
+    }, { ...controls, ...(releaseEvidence === undefined ? {} : { releaseEvidence }) }),
     close() {
       store.close();
       rmSync(runtime, { recursive: true, force: true });
@@ -1398,7 +1405,7 @@ test("trusted declaration copies arguments and rejects substituted or mutated co
 });
 
 test("full proof without a trusted release dossier cannot create a release gate", async () => {
-  const fixture = integratedLoopFixture("success");
+  const fixture = integratedLoopFixture("committed");
   try {
     await fixture.run({ fullCheck: { level: "full", commandId: "missing-dossier", name: "bounded content proof", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } } });
     assert.notEqual(fixture.store.getRun(fixture.runId)?.state, "HUMAN_RELEASE_GATE");
@@ -1408,7 +1415,7 @@ test("full proof without a trusted release dossier cannot create a release gate"
 
 for (const option of ["accept_readiness", "request_corrections", "cancel_readiness"] as const) {
   test(`real bounded full authority creates immutable release evidence and resolves ${option}`, async () => {
-    const fixture = integratedLoopFixture("success");
+    const fixture = integratedLoopFixture("committed");
     try {
       const fullCheck = { level: "full" as const, commandId: "bounded-full", name: "synthetic full content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "KERBSFLOW_CHECK_PASSED" } };
       const result = await fixture.run({ fullCheck, releaseEvidence: candidate => syntheticReleaseDossier(candidate, { branch: git(fixture.repository.root, ["branch", "--show-current"]), codexVersion: fixture.adapter.probe().adapterVersion }) });
@@ -1416,6 +1423,7 @@ for (const option of ["accept_readiness", "request_corrections", "cancel_readine
       const model = fixture.store.readModel(fixture.runId)!;
       assert.equal(model.run.state, "HUMAN_RELEASE_GATE");
       assert.equal(model.latestValidation!.bundle.level, "full");
+      assert.equal(fixture.gitManager.inspect(result.worktree!).dirty, false);
       const gate = model.currentGate!;
       const bundle = fixture.store.getReleaseBundle(gate.gateId)!;
       assert.equal(bundle.headOid, fixture.repository.head);
@@ -1455,7 +1463,7 @@ for (const body of ["", "console.log('WRONG')", "process.exit(1)"]) {
 }
 
 test("Core rejects release evidence forgery without persisting a release artifact", async () => {
-  const fixture = integratedLoopFixture("success");
+  const fixture = integratedLoopFixture("committed");
   let rejections = 0;
   try {
     await fixture.run({ fullCheck: syntheticFullCheck(), releaseEvidence: candidate => {
@@ -1473,6 +1481,8 @@ test("Core rejects release evidence forgery without persisting a release artifac
         (d: typeof valid) => { d.host.node = "24.0.0"; },
         (d: typeof valid) => { d.adapters[0]!.version = "wrong-adapter"; },
         (d: typeof valid) => { d.acceptance[0]!.summary = "sk-syntheticdossiercredential"; },
+        (d: typeof valid) => { d.acceptance[0]!.summary = "log:/Users/fixture/private-review/raw.log"; },
+        (d: typeof valid) => { d.acceptance[14]!.evidenceRefs = ["evidence_typecheck"]; },
         (d: typeof valid) => { d.acceptance.pop(); },
         (d: typeof valid) => { d.acceptance[1]!.id = "AC1"; },
         (d: typeof valid) => { Object.assign(d.acceptance[0]!, { outcome: "unknown" }); },
@@ -1488,17 +1498,18 @@ test("Core rejects release evidence forgery without persisting a release artifac
         assert.equal(fixture.store.getRun(fixture.runId)!.stateVersion, model.run.stateVersion);
         assert.deepEqual(fixture.store.listArtifactRecords(fixture.runId, 100), before);
         assert.equal(readFileSync(fixture.store.databasePath).includes(Buffer.from("sk-syntheticdossiercredential")), false);
+        assert.equal(readFileSync(fixture.store.databasePath).includes(Buffer.from("log:/Users/fixture/private-review/raw.log")), false);
         rejections++;
       }
       return valid;
     } });
-    assert.equal(rejections, 15);
+    assert.equal(rejections, 17);
     assert.equal(fixture.store.getRun(fixture.runId)!.state, "HUMAN_RELEASE_GATE");
   } finally { fixture.close(); }
 });
 
 test("trusted release capture survives caller mutation and original SQLite restart with the same immutable bundle", async () => {
-  const fixture = integratedLoopFixture("success");
+  const fixture = integratedLoopFixture("committed");
   try {
     await fixture.run({ fullCheck: syntheticFullCheck(), releaseEvidence: candidate => {
       const caller = syntheticReleaseDossier(candidate, { branch: git(fixture.repository.root, ["branch", "--show-current"]), codexVersion: fixture.adapter.probe().adapterVersion });
@@ -1531,7 +1542,7 @@ test("trusted release capture survives caller mutation and original SQLite resta
 });
 
 test("candidate drift after dossier capture rejects release readiness", async () => {
-  const fixture = integratedLoopFixture("success");
+  const fixture = integratedLoopFixture("committed");
   try {
     await fixture.run({ fullCheck: syntheticFullCheck(), releaseEvidence: candidate => {
       const dossier = syntheticReleaseDossier(candidate, { branch: git(fixture.repository.root, ["branch", "--show-current"]), codexVersion: fixture.adapter.probe().adapterVersion });
@@ -1542,6 +1553,47 @@ test("candidate drift after dossier capture rejects release readiness", async ()
     assert.equal(fixture.store.listArtifactRecords(fixture.runId, 100).some(record => record.kind === "release-readiness"), false);
   } finally { fixture.close(); }
 });
+
+for (const status of ["untracked", "modified", "staged", "post-full"] as const) {
+  test(`Core rejects ${status} release candidate before persisting release evidence`, async () => {
+    const fixture = integratedLoopFixture(status === "post-full" ? "committed" : "success");
+    const stop = new DatabaseIntegrityError("stop the synthetic drive at the inspected full boundary");
+    if (status === "modified" || status === "staged") {
+      writeFileSync(join(fixture.repository.root, "result.txt"), "prior committed content\n");
+      git(fixture.repository.root, ["add", "result.txt"]);
+      git(fixture.repository.root, ["commit", "--quiet", "-m", "synthetic tracked baseline"]);
+      fixture.repository.head = git(fixture.repository.root, ["rev-parse", "HEAD"]);
+    }
+    try {
+      await assert.rejects(fixture.run({ fullCheck: syntheticFullCheck(), releaseEvidence: candidate => {
+        const dossier = syntheticReleaseDossier(candidate, { branch: git(fixture.repository.root, ["branch", "--show-current"]), codexVersion: fixture.adapter.probe().adapterVersion });
+        const core = codexCore(fixture.store, fixture.adapter, fixture.ids);
+        const model = fixture.store.readModel(fixture.runId)!;
+        const path = fixture.store.getWorktree(fixture.runId)!.worktreePath;
+        if (status === "post-full") writeFileSync(join(path, "result.txt"), "changed after full authority\n");
+        const before = { status: git(path, ["status", "--porcelain=v1", "--untracked-files=all"]), content: readFileSync(join(path, "result.txt"), "utf8"), artifacts: fixture.store.listArtifactRecords(fixture.runId, 100) };
+        assert.ok(before.status.startsWith(status === "untracked" ? "??" : "M"));
+        assert.equal(git(path, ["diff", "--cached", "--name-only"]), status === "staged" ? "result.txt" : "");
+        assert.throws(() => core.completeTrustedFullValidation(fixture.runId, model.run.stateVersion, `release:dirty:${status}`, model.latestValidation!.bundle.validationId, dossier), error => error instanceof KerbsFlowError && error.code === (status === "post-full" ? "FULL_VALIDATION_STALE" : "RELEASE_EVIDENCE_BINDING_MISMATCH"));
+        assert.equal(fixture.store.getRun(fixture.runId)!.state, "FINAL_VERIFY");
+        assert.equal(fixture.store.getRun(fixture.runId)!.stateVersion, model.run.stateVersion);
+        assert.equal(fixture.store.readModel(fixture.runId)!.currentGate, undefined);
+        const database = new DatabaseSync(fixture.store.databasePath, { readOnly: true });
+        try {
+          assert.equal(database.prepare("SELECT count(*) AS n FROM release_bundles").get()!.n, 0);
+          assert.equal(database.prepare("SELECT count(*) AS n FROM human_gates").get()!.n, 0);
+        } finally { database.close(); }
+        assert.deepEqual(fixture.store.listArtifactRecords(fixture.runId, 100), before.artifacts);
+        assert.equal(git(path, ["status", "--porcelain=v1", "--untracked-files=all"]), before.status);
+        assert.equal(readFileSync(join(path, "result.txt"), "utf8"), before.content);
+        throw stop;
+      } }, { checkpoint: async () => {
+        if (status === "staged" && fixture.store.getRun(fixture.runId)?.state === "FINAL_VERIFY") git(fixture.store.getWorktree(fixture.runId)!.worktreePath, ["add", "result.txt"]);
+      } }), error => error === stop);
+      assert.equal(fixture.store.getRun(fixture.runId)!.state, "FINAL_VERIFY");
+    } finally { fixture.close(); }
+  });
+}
 
 function syntheticFullCheck(): NonNullable<Phase2LoopRequest["fullCheck"]> {
   return { level: "full", commandId: "release-dossier-full", name: "synthetic full content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } };

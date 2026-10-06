@@ -1016,7 +1016,7 @@ export class KerbsFlowCore {
       }
       const storedWorktree = this.store.getWorktree(runId)!;
       const original = new GitWorktreeManager(dirname(dirname(storedWorktree.markerPath))).intake(storedWorktree.repositoryPath);
-      if (original.baseOid !== candidate.headOid || original.branch !== candidate.branch) throw new KerbsFlowError("RELEASE_EVIDENCE_BINDING_MISMATCH", "release dossier differs from the clean original candidate");
+      if (original.baseOid !== candidate.headOid || original.branch !== candidate.branch || binding.changedPaths.length !== 0) throw new KerbsFlowError("RELEASE_EVIDENCE_BINDING_MISMATCH", "release evidence requires the exact clean committed original and owned candidate");
       try {
         execFileSync("git", ["merge-base", "--is-ancestor", candidate.sourceBaseline, candidate.headOid], { cwd: storedWorktree.worktreePath, env: gitEnvironment(), stdio: "ignore", timeout: 5000 });
       } catch {

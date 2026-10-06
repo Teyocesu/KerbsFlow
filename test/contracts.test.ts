@@ -129,6 +129,22 @@ for (const [name, mutate] of [
   ["inferred-only AC", (d: ReleaseEvidenceDossier) => { d.evidence[0]!.classification = "inferred"; }],
   ["untested AC", (d: ReleaseEvidenceDossier) => { d.evidence[0]!.classification = "not_tested"; }],
   ["private path", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.summary = "/private/tmp/raw.log"; }],
+  ...["log:/Users/fixture/private-review/raw.log", "trace(/private/tmp/raw.log)", "source:/tmp/evidence.txt", "file:///Users/fixture/raw.log", "log:C:\\Users\\fixture\\raw.log", "log:\\\\fixture\\private\\raw.log"].map(path =>
+    [`embedded path ${path}`, (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.summary = path; }] as const),
+  ["AC15 typecheck-only", (d: ReleaseEvidenceDossier) => { d.acceptance[14]!.evidenceRefs = ["evidence_typecheck"]; }],
+  ["AC15 unrelated fresh gate evidence", (d: ReleaseEvidenceDossier) => { d.acceptance[14]!.evidenceRefs = ["evidence_gate"]; }],
+  ...["reused", "synthetic", "stale", "wrong hash"].map(variant =>
+    [`AC15 ${variant} npm-test ref`, (d: ReleaseEvidenceDossier) => {
+      const item = { ...d.evidence.find(e => e.id === "evidence_npm_test")!, id: "evidence_invalid_npm_test" };
+      if (variant === "reused") item.origin = "reused";
+      if (variant === "synthetic") item.boundary = "synthetic";
+      if (variant === "stale") { item.origin = "reused"; item.candidateHead = "3".repeat(40); }
+      if (variant === "wrong hash") item.hash = "3".repeat(64);
+      d.evidence.push(item);
+      d.deterministicGate.commands.find(cmd => cmd.command === "npm test")!.evidenceRefs.push(item.id);
+      d.deterministicGate.evidenceRefs.push(item.id);
+      d.acceptance[14]!.evidenceRefs = [item.id];
+    }] as const),
   ["raw log", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.summary = "raw\nlog"; }],
   ["unknown field", (d: ReleaseEvidenceDossier) => { Object.assign(d.host, { environment: {} }); }],
   ["oversized dossier", (d: ReleaseEvidenceDossier) => { d.evidence = Array.from({ length: 200 }, (_, i) => ({ ...d.evidence[0]!, id: `evidence_${i}`, summary: "x".repeat(1000) })); }],
@@ -174,4 +190,13 @@ test("release dossier is copied and frozen; optional live inference remains expl
   assert.ok(Object.isFrozen(accepted));
   assert.ok(Object.isFrozen(accepted.acceptance[0]!.evidenceRefs));
   assert.ok(Object.isFrozen(accepted.deterministicGate.boundaries));
+});
+
+test("release dossier accepts direct fresh npm-test attribution and ordinary colon text", () => {
+  const dossier = syntheticReleaseDossier();
+  dossier.acceptance[14]!.evidenceRefs = ["evidence_npm_test"];
+  dossier.acceptance[14]!.summary = "status:ok AC15:PASS npm:test model:opencode/muse relative:docs/PLAN.md";
+  const accepted = parseReleaseEvidenceDossier(dossier);
+  assert.deepEqual(accepted.acceptance[14]!.evidenceRefs, ["evidence_npm_test"]);
+  assert.equal(accepted.acceptance[14]!.summary, dossier.acceptance[14]!.summary);
 });
