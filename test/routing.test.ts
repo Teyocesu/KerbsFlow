@@ -1,11 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 
 import type { AdapterRoutingReadiness, ExecutorAdapter } from "../src/adapter.js";
+import { CanonicalIntentGuard } from "../src/canonical.js";
 import {
   CONTRACT_VERSIONS,
   DEFAULT_HARD_INVARIANTS,
@@ -18,13 +20,15 @@ import {
   asReviewId,
   asRunId,
   asTaskId,
-  asValidationId,
+  parseExecutorResult,
   parsePlanningDecision,
 } from "../src/contracts.js";
 import { KerbsFlowCore } from "../src/core.js";
 import { FakeArtifactStore } from "../src/fake.js";
+import { GitWorktreeManager } from "../src/git.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { StateStore } from "../src/persistence.js";
+import { ProcessSupervisor } from "../src/process.js";
 import { escalatePlanningRoute } from "../src/phase3.js";
 import {
   PolicyRouter,
@@ -37,6 +41,8 @@ import {
   type TrustedRoutingDecision,
 } from "../src/routing.js";
 import { FixedClock, SequenceIdSource } from "../src/runtime.js";
+import { VerificationSandbox } from "../src/verification-sandbox.js";
+import { FocusedVerifier } from "../src/verifier.js";
 
 test("authoritative live discovery selects Muse and records the capability snapshot", async () => {
   const { discovery, probes, readiness } = await discover();
@@ -297,7 +303,9 @@ test("routing decision and separate provenance for every attempt persist without
     store.recordAttemptRoutingProvenance(createAttemptRoutingProvenance({ routingDecision: routed.routingDecision, planningDecision: routed.planningDecision, attemptId: firstAttempt!, selectionReason: routed.routingDecision.selectionReason }));
     command = await core.beginAttempt(routed.planningDecision.runId, command.stateVersion, "begin-routing-1", root);
     command = await core.completeAttempt(routed.planningDecision.runId, command.stateVersion, "complete-routing-1", executorFailure(routed.planningDecision, firstAttempt!));
-    command = core.recordFocusedValidation(routed.planningDecision.runId, command.stateVersion, "validate-routing-1", failedValidation(routed.planningDecision, firstAttempt!));
+    const failedBundle = await authoritativeFailedFocused(store, routed.planningDecision.runId, ids, root);
+    assert.equal(failedBundle.outcome, "failed", "the first route must fail real independent verification before escalation");
+    command = core.recordFocusedValidation(routed.planningDecision.runId, command.stateVersion, "validate-routing-1", failedBundle);
     command = core.review(routed.planningDecision.runId, command.stateVersion, "review-routing-1", {
       schemaVersion: CONTRACT_VERSIONS.reviewDecision,
       reviewId: asReviewId("review_route_escalation"),
@@ -449,6 +457,30 @@ function executorFailure(decision: ReturnType<typeof baseDecision>, attemptId: R
   return { schemaVersion: CONTRACT_VERSIONS.executorResult, runId: decision.runId, taskId: decision.taskId, attemptId, executor: { adapter: "opencode", adapterVersion: "2.0.13", provider: "opencode", model: "opencode/muse-current" }, outcome: "failed" as const, failureClass: "implementation_failure" as const, scopeClaim: "within_scope" as const, summary: "synthetic first-route failure", filesChanged: [], checks: [], evidence: [], invariantViolations: [], risks: [], warnings: [], artifacts: [], humanGate: null, recommendedNext: "rework" as const, exit: { kind: "normal" as const, code: 1 } };
 }
 
-function failedValidation(decision: ReturnType<typeof baseDecision>, attemptId: ReturnType<typeof import("../src/contracts.js").asAttemptId>) {
-  return { schemaVersion: CONTRACT_VERSIONS.validation, validationId: asValidationId("validation_route_escalation"), runId: decision.runId, taskId: decision.taskId, attemptId, level: "focused" as const, outcome: "failed" as const, summary: "synthetic first-route failure", checks: [{ name: "synthetic", outcome: "failed" as const, evidenceClass: "simulated" as const, evidenceRefs: [] }], evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId("validation_evidence_route_escalation"), kind: "check" as const, classification: "simulated" as const, summary: "synthetic route evidence" }] };
+async function authoritativeFailedFocused(
+  store: StateStore,
+  runId: ReturnType<typeof asRunId>,
+  ids: SequenceIdSource,
+  root: string,
+) {
+  const repositoryPath = join(root, "canonical-repository");
+  mkdirSync(join(repositoryPath, "docs"), { recursive: true });
+  mkdirSync(join(repositoryPath, "src"), { recursive: true });
+  for (const [path, text] of Object.entries({ "AGENTS.md": "synthetic agent policy", "docs/SPEC-v0.1.0.md": "synthetic frozen spec", "docs/PLAN-v0.1.0.md": "synthetic plan", "docs/HANDOFF.md": "synthetic handoff", "README.md": "synthetic" })) writeFileSync(join(repositoryPath, path), text + "\n");
+  for (const args of [["init", "--quiet"], ["config", "user.name", "KerbsFlow Test"], ["config", "user.email", "kerbsflow@example.invalid"], ["add", "."], ["commit", "--quiet", "-m", "initial"]]) execFileSync("git", args, { cwd: repositoryPath });
+  const manager = new GitWorktreeManager(join(root, "owned"));
+  const intake = manager.intake(repositoryPath);
+  const worktree = manager.create(intake, runId);
+  store.recordWorktree({ runId, ...worktree, worktreePath: worktree.path });
+  new CanonicalIntentGuard(store).capture(runId, repositoryPath, intake.baseOid);
+  const run = store.getRun(runId)!;
+  const decision = store.getTask(run.currentTaskId!)!.decision;
+  const result = parseExecutorResult(JSON.parse(store.getAttempt(run.activeAttemptId!)!.outcomeJson!));
+  const command = { name: "synthetic-focused", executable: process.execPath, args: ["-e", "process.exit(1)"], timeoutMs: 5000, proof: { kind: "stdout_line" as const, expected: "FOCUSED_ASSERTION_PASS" } };
+  store.recordValidationIntent(runId, "focused", command);
+  const verifier = new FocusedVerifier(manager, new VerificationSandbox(new ProcessSupervisor()), ids);
+  verifier.declare(runId, "focused", command);
+  const verified = await verifier.verify(intake, worktree, decision, result, command);
+  store.recordAuthoritativePhaseValidation(verified.authoritative);
+  return verified.bundle;
 }

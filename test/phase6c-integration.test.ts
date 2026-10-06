@@ -858,6 +858,7 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.equal(cancelled.to, "CANCELLED");
       assert.equal(stack.store.getRun(runId)?.state, "CANCELLED");
       assert.equal(stack.adapter.requests.length, 1);
+      await waitFor(() => stack.coordinator.activeRunId === undefined ? true : undefined, "terminal Cancel drive settlement releases the reservation");
       assert.equal(stack.coordinator.activeRunId, undefined);
     } finally {
       await stack.close();
