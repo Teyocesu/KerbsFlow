@@ -1141,3 +1141,23 @@ interface Deferred<T> {
   resolve(value: T): void;
   readonly settled: boolean;
 }
+
+test("Coordinator captures the host evidence supplier independently of later caller profile replacement", async () => {
+  const fixture = makeCoordinatorFixture();
+  const original = () => { throw new Error("original trusted host supplier"); };
+  fixture.profile.releaseEvidence = original;
+  let received: Phase2DriveControls["releaseEvidence"];
+  const driver = {
+    async driveStarted(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
+      received = controls.releaseEvidence;
+      return { verdict: "PASS", stateVersion: fixture.store.getRun(request.runId)!.stateVersion };
+    },
+  };
+  const coordinator = fixture.coordinator(driver);
+  fixture.profile.releaseEvidence = () => { throw new Error("replacement must not gain authority"); };
+  try {
+    coordinator.start(startRequest("run_coord_release_supplier"));
+    await Promise.resolve();
+    assert.equal(received, original);
+  } finally { fixture.close(); }
+});

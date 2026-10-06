@@ -1294,3 +1294,21 @@ test("gate projection bounds hostile evidence, redacts paths and credentials, an
     assert.match(projected.summary, /<img/);
   });
 });
+
+test("browser mutations cannot submit or replace trusted release evidence", async () => {
+  await withApi(async ({ fixture, api, token }) => {
+    const runId = asRunId("run_local_api_release_evidence");
+    const injected = { schemaVersion: "kerbsflow.release-evidence/v1" };
+    const response = await postMutation(api, "/v1/runs", token, mutationEnvelope("command_release_injection", "release:injection", 0, {
+      runId, objective: "reject browser evidence authority", releaseEvidence: injected,
+    }));
+    assert.equal(response.status, 400);
+    assert.equal(fixture.store.getRun(runId), undefined);
+    fixture.core.startRun(runId, "synthetic run for forbidden route", "release:no-browser:start");
+    for (const route of ["release-evidence", "release-dossier", "recovery-result"]) {
+      assert.equal((await postMutation(api, `/v1/runs/${runId}/${route}`, token, mutationEnvelope(`command_no_${route}`, `release:no:${route}`, 1, injected))).status, 404);
+    }
+    assert.equal(fixture.store.getRun(runId)!.state, "INTAKE");
+    assert.deepEqual(fixture.store.listArtifactRecords(runId, 100), []);
+  });
+});

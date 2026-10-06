@@ -1,3 +1,5 @@
+import { containsLikelySecret, publicFixtureIssue } from "./secrets.js";
+
 import { createHash } from "node:crypto";
 
 export const CONTRACT_VERSIONS = {
@@ -323,6 +325,187 @@ export function isFailureClassification(value: unknown): value is FailureClassif
 
 export type EvidenceClassification = "automatically_tested" | "manually_validated" | "inspected" | "inferred" | "simulated" | "not_tested";
 export type EvidenceKind = "command" | "diff" | "check" | "review" | "event" | "result" | "other";
+
+export interface ReleaseEvidenceCandidate {
+  headOid: string;
+  baseOid: string;
+  fingerprint: string;
+}
+
+export interface ReleaseEvidenceCheck {
+  outcome: "PASS";
+  summary: string;
+  evidenceRefs: string[];
+}
+
+export interface ReleaseEvidenceDossier {
+  schemaVersion: "kerbsflow.release-evidence/v1";
+  candidate: ReleaseEvidenceCandidate & {
+    sourceBaseline: string; branch: string; clean: true;
+    hashes: { source: string; contracts: string; profile: string; migrations: string; package: string; lock: string };
+  };
+  host: { platform: "darwin"; macOSVersion: string; macOSBuild: string; arch: string; node: string; npm: string; typescript: string; nodeTypes: string; sqlite: string; git: string };
+  support: { macOS: "official"; linux: "unsupported_preview"; windows: "unsupported"; license: "Apache-2.0"; copyright: "Teyocesu 2026"; licenseNotice: ReleaseEvidenceCheck };
+  adapters: { adapter: "codex" | "opencode"; version: string; provider: string; model: string; identityHash: string; capabilityHash: string; workload: "os_enforced" | "tool_policy_only"; readiness: "tested" | "unavailable" | "not_tested"; summary: string; evidenceRefs: string[] }[];
+  evidence: { id: string; classification: EvidenceClassification; boundary: "actual" | "synthetic" | "physical"; origin: "fresh" | "reused"; candidateHead: string; hash: string; summary: string }[];
+  acceptance: { id: string; outcome: "PASS"; summary: string; evidenceRefs: string[]; limitations: string[] }[];
+  deterministicGate: ReleaseEvidenceCheck & {
+    candidateHead: string;
+    commands: { command: string; exitCode: 0; outputHash: string; evidenceRefs: string[] }[];
+    suites: { discovered: number; executed: number; failures: 0; cancellations: 0; skips: 0; todos: 0; inventoryHash: string };
+    boundaries: { sandbox: ReleaseEvidenceCheck; processes: ReleaseEvidenceCheck; worktrees: ReleaseEvidenceCheck; migrations: ReleaseEvidenceCheck; recovery: ReleaseEvidenceCheck };
+    integrity: ReleaseEvidenceCheck;
+  };
+  scenarios: { id: string; adapter: "codex" | "opencode"; outcome: "PASS"; classification: EvidenceClassification; boundary: "actual" | "synthetic" | "physical"; evidenceRefs: string[]; limitations: string[] }[];
+  dependencies: ReleaseEvidenceCheck & {
+    audit: { status: "complete" | "unavailable"; advisories: number | null; evidenceRefs: string[]; riskDispositionRefs: string[] };
+    licenses: ReleaseEvidenceCheck; provenance: ReleaseEvidenceCheck; packageSurface: ReleaseEvidenceCheck;
+  };
+  secrets: { scan: ReleaseEvidenceCheck; provenanceInspection: ReleaseEvidenceCheck };
+  reviewHistory: { broad: ReleaseEvidenceCheck; remediation: ReleaseEvidenceCheck; postFix: ReleaseEvidenceCheck; knownBlockers: 0 };
+  liveProvider: { status: "not_tested" | "tested" | "unavailable"; reason: string; evidenceRefs: string[] };
+  limitations: string[];
+  prohibitedActions: string[];
+}
+
+export const RELEASE_EVIDENCE_MAX_BYTES = 96 * 1024;
+export const RELEASE_PROHIBITED_ACTIONS = ["commit", "push", "merge", "tag", "release", "publish", "deploy", "production"] as const;
+export const RELEASE_REQUIRED_LIMITATIONS = [
+  "Same-user filesystem path swaps remain a residual risk",
+  "macOS Seatbelt is deprecated and required; unavailable enforcement fails closed",
+  "OpenCode workload isolation is tool_policy_only, not OS enforcement",
+  "Linux is unsupported preview; Windows is unsupported",
+] as const;
+
+// Only trusted host composition calls this parser; API/model contracts do not carry a dossier.
+export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDossier {
+  const fail = (): never => { throw new ContractValidationError("releaseEvidence", "invalid, incomplete, unsafe or oversized release dossier"); };
+  let encoded: string;
+  try { encoded = JSON.stringify(value); } catch { return fail(); }
+  if (typeof encoded !== "string" || Buffer.byteLength(encoded) > RELEASE_EVIDENCE_MAX_BYTES || containsLikelySecret(value)) return fail();
+  const object = (v: unknown, keys: string[]): Record<string, unknown> => {
+    if (!isRecord(v) || Object.keys(v).length !== keys.length || Object.keys(v).some(k => !keys.includes(k))) return fail();
+    return v;
+  };
+  const text = (v: unknown, max = 1024): string => {
+    if (typeof v !== "string" || !v.trim() || v !== v.trim() || Buffer.byteLength(v) > max || /[\x00-\x1f\x7f]/u.test(v)
+      || /(?:^|[\s"'=])(?:\/|[A-Za-z]:[\\/]|file:\/\/)/u.test(v) || publicFixtureIssue(v) !== undefined) return fail();
+    return v;
+  };
+  const hash = (v: unknown, length = 64): string => { if (typeof v !== "string" || !(new RegExp(`^[a-f0-9]{${length}}$`, "u")).test(v)) return fail(); return v; };
+  const choice = <T extends string>(v: unknown, allowed: readonly T[]): T => { if (typeof v !== "string" || !allowed.includes(v as T)) return fail(); return v as T; };
+  const list = <T>(v: unknown, max: number, parse: (entry: unknown) => T, min = 0): T[] => {
+    if (!Array.isArray(v) || v.length < min || v.length > max) return fail();
+    return Array.from(v, parse);
+  };
+  const unique = (values: string[]): string[] => { if (new Set(values).size !== values.length) return fail(); return values; };
+  const notes = (v: unknown): string[] => list(v, 24, entry => text(entry));
+  const count = (v: unknown, minimum = 0): number => { if (!Number.isSafeInteger(v) || typeof v !== "number" || v < minimum || v > 100000) return fail(); return v; };
+  const zero = (v: unknown): 0 => { if (v !== 0) return fail(); return 0; };
+  const pass = (v: unknown): "PASS" => choice(v, ["PASS"]);
+  const id = (v: unknown): string => { const s = text(v, 80); if (!/^evidence_[A-Za-z0-9_-]+$/u.test(s)) return fail(); return s; };
+  const d = object(value, ["schemaVersion", "candidate", "host", "support", "adapters", "evidence", "acceptance", "deterministicGate", "scenarios", "dependencies", "secrets", "reviewHistory", "liveProvider", "limitations", "prohibitedActions"]);
+  const c = object(d.candidate, ["headOid", "baseOid", "fingerprint", "sourceBaseline", "branch", "clean", "hashes"]);
+  const h = object(c.hashes, ["source", "contracts", "profile", "migrations", "package", "lock"]);
+  if (c.clean !== true) return fail();
+  const candidate: ReleaseEvidenceDossier["candidate"] = { headOid: hash(c.headOid, 40), baseOid: hash(c.baseOid, 40), fingerprint: hash(c.fingerprint), sourceBaseline: hash(c.sourceBaseline, 40), branch: text(c.branch, 256), clean: true,
+    hashes: { source: hash(h.source), contracts: hash(h.contracts), profile: hash(h.profile), migrations: hash(h.migrations), package: hash(h.package), lock: hash(h.lock) } };
+  const evidence = list(d.evidence, 256, v => {
+    const e = object(v, ["id", "classification", "boundary", "origin", "candidateHead", "hash", "summary"]);
+    const item = { id: id(e.id), classification: parseEvidenceClass(e.classification, "releaseEvidence.classification"), boundary: choice(e.boundary, ["actual", "synthetic", "physical"]), origin: choice(e.origin, ["fresh", "reused"]), candidateHead: hash(e.candidateHead, 40), hash: hash(e.hash), summary: text(e.summary) };
+    if (item.origin === "fresh" && item.candidateHead !== candidate.headOid) return fail();
+    return item;
+  }, 1);
+  unique(evidence.map(e => e.id));
+  evidence.sort((a, b) => a.id.localeCompare(b.id));
+  const byId = new Map(evidence.map(e => [e.id, e]));
+  const refs = (v: unknown, min = 1): string[] => {
+    const result = unique(list(v, 32, id, min));
+    if (result.some(ref => !byId.has(ref))) return fail();
+    return result.sort();
+  };
+  const provenRefs = (v: unknown): string[] => {
+    const result = refs(v);
+    if (result.some(ref => byId.get(ref)!.classification === "not_tested") || result.every(ref => byId.get(ref)!.classification === "inferred")) return fail();
+    return result;
+  };
+  const check = (v: unknown): ReleaseEvidenceCheck => {
+    const o = object(v, ["outcome", "summary", "evidenceRefs"]);
+    return { outcome: pass(o.outcome), summary: text(o.summary), evidenceRefs: provenRefs(o.evidenceRefs) };
+  };
+  const hostObject = object(d.host, ["platform", "macOSVersion", "macOSBuild", "arch", "node", "npm", "typescript", "nodeTypes", "sqlite", "git"]);
+  const host: ReleaseEvidenceDossier["host"] = { platform: choice(hostObject.platform, ["darwin"]), macOSVersion: text(hostObject.macOSVersion, 80), macOSBuild: text(hostObject.macOSBuild, 80), arch: text(hostObject.arch, 80), node: text(hostObject.node, 80), npm: text(hostObject.npm, 80), typescript: text(hostObject.typescript, 80), nodeTypes: text(hostObject.nodeTypes, 80), sqlite: text(hostObject.sqlite, 80), git: text(hostObject.git, 128) };
+  const s = object(d.support, ["macOS", "linux", "windows", "license", "copyright", "licenseNotice"]);
+  const support: ReleaseEvidenceDossier["support"] = { macOS: choice(s.macOS, ["official"]), linux: choice(s.linux, ["unsupported_preview"]), windows: choice(s.windows, ["unsupported"]), license: choice(s.license, ["Apache-2.0"]), copyright: choice(s.copyright, ["Teyocesu 2026"]), licenseNotice: check(s.licenseNotice) };
+  const adapters = list(d.adapters, 2, v => {
+    const a = object(v, ["adapter", "version", "provider", "model", "identityHash", "capabilityHash", "workload", "readiness", "summary", "evidenceRefs"]);
+    const result = { adapter: choice(a.adapter, ["codex", "opencode"]), version: text(a.version, 128), provider: text(a.provider, 128), model: text(a.model, 128), identityHash: hash(a.identityHash), capabilityHash: hash(a.capabilityHash), workload: choice(a.workload, ["os_enforced", "tool_policy_only"]), readiness: choice(a.readiness, ["tested", "unavailable", "not_tested"]), summary: text(a.summary), evidenceRefs: refs(a.evidenceRefs) };
+    if (result.adapter === "opencode" && result.workload !== "tool_policy_only") return fail();
+    if (result.readiness === "tested") provenRefs(result.evidenceRefs);
+    return result;
+  }, 2);
+  unique(adapters.map(a => a.adapter));
+  adapters.sort((a, b) => a.adapter.localeCompare(b.adapter));
+  const acceptance = list(d.acceptance, 15, v => {
+    const a = object(v, ["id", "outcome", "summary", "evidenceRefs", "limitations"]);
+    return { id: choice(a.id, Array.from({ length: 15 }, (_, i) => `AC${i + 1}`)), outcome: pass(a.outcome), summary: text(a.summary), evidenceRefs: provenRefs(a.evidenceRefs), limitations: notes(a.limitations) };
+  }, 15);
+  unique(acceptance.map(a => a.id));
+  acceptance.sort((a, b) => Number(a.id.slice(2)) - Number(b.id.slice(2)));
+  const g = object(d.deterministicGate, ["outcome", "summary", "evidenceRefs", "candidateHead", "commands", "suites", "boundaries", "integrity"]);
+  const suite = object(g.suites, ["discovered", "executed", "failures", "cancellations", "skips", "todos", "inventoryHash"]);
+  const boundaries = object(g.boundaries, ["sandbox", "processes", "worktrees", "migrations", "recovery"]);
+  const deterministicGate: ReleaseEvidenceDossier["deterministicGate"] = {
+    outcome: pass(g.outcome), summary: text(g.summary), evidenceRefs: provenRefs(g.evidenceRefs), candidateHead: hash(g.candidateHead, 40),
+    commands: list(g.commands, 16, v => { const o = object(v, ["command", "exitCode", "outputHash", "evidenceRefs"]); return { command: text(o.command, 256), exitCode: zero(o.exitCode), outputHash: hash(o.outputHash), evidenceRefs: provenRefs(o.evidenceRefs) }; }, 1),
+    suites: { discovered: count(suite.discovered, 1), executed: count(suite.executed, 1), failures: zero(suite.failures), cancellations: zero(suite.cancellations), skips: zero(suite.skips), todos: zero(suite.todos), inventoryHash: hash(suite.inventoryHash) },
+    boundaries: { sandbox: check(boundaries.sandbox), processes: check(boundaries.processes), worktrees: check(boundaries.worktrees), migrations: check(boundaries.migrations), recovery: check(boundaries.recovery) }, integrity: check(g.integrity),
+  };
+  const actualFresh = (ref: string): boolean => { const item = byId.get(ref)!; return item.classification === "automatically_tested" && item.boundary === "actual" && item.origin === "fresh" && item.candidateHead === candidate.headOid; };
+  if (deterministicGate.candidateHead !== candidate.headOid || deterministicGate.suites.discovered !== deterministicGate.suites.executed
+    || !deterministicGate.commands.some(cmd => cmd.command === "npm test") || !deterministicGate.commands.some(cmd => cmd.command === "npm run typecheck")
+    || Object.values(deterministicGate.boundaries).some(boundary => !boundary.evidenceRefs.some(actualFresh))
+    || !deterministicGate.integrity.evidenceRefs.some(actualFresh)
+    || deterministicGate.commands.some(cmd => !cmd.evidenceRefs.some(ref => actualFresh(ref) && byId.get(ref)!.hash === cmd.outputHash))
+    || !deterministicGate.evidenceRefs.some(actualFresh)
+    || !acceptance[14]!.evidenceRefs.some(ref => deterministicGate.evidenceRefs.includes(ref) && actualFresh(ref))) return fail();
+  const scenarios = list(d.scenarios, 26, v => {
+    const x = object(v, ["id", "adapter", "outcome", "classification", "boundary", "evidenceRefs", "limitations"]);
+    const result = { id: choice(x.id, Array.from({ length: 13 }, (_, i) => `X${i + 1}`)), adapter: choice(x.adapter, ["codex", "opencode"]), outcome: pass(x.outcome), classification: parseEvidenceClass(x.classification, "releaseEvidence.classification"), boundary: choice(x.boundary, ["actual", "synthetic", "physical"]), evidenceRefs: provenRefs(x.evidenceRefs), limitations: notes(x.limitations) };
+    if (result.classification === "not_tested" || result.classification === "inferred" || !result.evidenceRefs.some(ref => byId.get(ref)!.classification === result.classification && byId.get(ref)!.boundary === result.boundary)) return fail();
+    return result;
+  }, 26);
+  unique(scenarios.map(x => `${x.id}:${x.adapter}`));
+  scenarios.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)) || a.adapter.localeCompare(b.adapter));
+  const dep = object(d.dependencies, ["outcome", "summary", "evidenceRefs", "audit", "licenses", "provenance", "packageSurface"]);
+  const au = object(dep.audit, ["status", "advisories", "evidenceRefs", "riskDispositionRefs"]);
+  const audit: ReleaseEvidenceDossier["dependencies"]["audit"] = { status: choice(au.status, ["complete", "unavailable"]), advisories: au.advisories === null ? null : count(au.advisories), evidenceRefs: refs(au.evidenceRefs), riskDispositionRefs: refs(au.riskDispositionRefs, 0) };
+  if ((audit.status === "unavailable" && audit.advisories !== null) || (audit.status === "complete" && audit.advisories === null)
+    || ((audit.status === "unavailable" || audit.advisories !== 0) && !audit.riskDispositionRefs.some(ref => byId.get(ref)!.classification === "manually_validated"))) return fail();
+  if (audit.status === "complete") provenRefs(audit.evidenceRefs);
+  const secret = object(d.secrets, ["scan", "provenanceInspection"]);
+  const review = object(d.reviewHistory, ["broad", "remediation", "postFix", "knownBlockers"]);
+  const live = object(d.liveProvider, ["status", "reason", "evidenceRefs"]);
+  const limitations = notes(d.limitations);
+  if (RELEASE_REQUIRED_LIMITATIONS.some(note => !limitations.includes(note))) return fail();
+  const prohibitedActions = unique(list(d.prohibitedActions, 8, v => choice(v, RELEASE_PROHIBITED_ACTIONS), 8)).sort();
+  const parsed: ReleaseEvidenceDossier = {
+    schemaVersion: choice(d.schemaVersion, ["kerbsflow.release-evidence/v1"]), candidate, host, support, adapters, evidence, acceptance, deterministicGate, scenarios,
+    dependencies: { outcome: pass(dep.outcome), summary: text(dep.summary), evidenceRefs: provenRefs(dep.evidenceRefs), audit, licenses: check(dep.licenses), provenance: check(dep.provenance), packageSurface: check(dep.packageSurface) },
+    secrets: { scan: check(secret.scan), provenanceInspection: check(secret.provenanceInspection) },
+    reviewHistory: { broad: check(review.broad), remediation: check(review.remediation), postFix: check(review.postFix), knownBlockers: zero(review.knownBlockers) },
+    liveProvider: { status: choice(live.status, ["not_tested", "tested", "unavailable"]), reason: text(live.reason), evidenceRefs: live.status === "tested" ? provenRefs(live.evidenceRefs) : refs(live.evidenceRefs, 0) }, limitations, prohibitedActions,
+  };
+  return freezeReleaseEvidence(parsed);
+}
+
+function freezeReleaseEvidence<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const nested of Object.values(value)) freezeReleaseEvidence(nested);
+    Object.freeze(value);
+  }
+  return value;
+}
 
 export interface ValidationEvidence {
   schemaVersion: typeof CONTRACT_VERSIONS.validation;

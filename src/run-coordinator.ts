@@ -21,7 +21,7 @@ import {
 } from "./contracts.js";
 import { KerbsFlowCore } from "./core.js";
 import { KerbsFlowError, StateVersionConflictError } from "./errors.js";
-import { Phase2Loop, type ExecutionDispatchBoundary, type FailureDispositionBoundary, type Phase2LoopRequest, type Phase2LoopResult } from "./phase2.js";
+import { Phase2Loop, type ExecutionDispatchBoundary, type FailureDispositionBoundary, type Phase2LoopRequest, type Phase2LoopResult, type Phase2DriveControls } from "./phase2.js";
 import type { PlanningMaster } from "./planning.js";
 import { StateStore, type RunLaunchBinding, type StoredGate } from "./persistence.js";
 import { RandomIdSource, type IdSource } from "./runtime.js";
@@ -36,6 +36,7 @@ export interface TrustedLaunchProfile {
   focusedCheck: FocusedCheckCommand;
   phaseCheck?: PhaseCheckCommand;
   fullCheck?: FullCheckCommand;
+  releaseEvidence?: Phase2DriveControls["releaseEvidence"];
   executionTimeoutMs: number;
   failurePolicy?: Phase2LoopRequest["failurePolicy"];
   semanticReview?: Phase2LoopRequest["semanticReview"];
@@ -226,6 +227,7 @@ export class RunCoordinator {
         const driveRequest = this.driveRequest(request.runId, attempt.taskId, this.store.getRun(request.runId)!.objective);
         reservation.drivePromise = Promise.resolve().then(() => this.phase2.continueRecovered!(driveRequest, {
           planningMaster: this.profile.planningMaster,
+          ...(this.profile.releaseEvidence === undefined ? {} : { releaseEvidence: this.profile.releaseEvidence }),
           checkpoint: () => this.checkpoint(reservation),
           claimFailureDisposition: () => this.claimFailureDisposition(reservation),
           claimExecutionDispatch: () => this.claimExecutionDispatch(reservation),
@@ -335,6 +337,7 @@ export class RunCoordinator {
       reservation.launchBinding = binding;
       reservation.drivePromise = Promise.resolve().then(() => this.phase2.driveStarted(driveRequest, {
         planningMaster: this.profile.planningMaster,
+        ...(this.profile.releaseEvidence === undefined ? {} : { releaseEvidence: this.profile.releaseEvidence }),
         checkpoint: () => this.checkpoint(reservation),
         claimFailureDisposition: () => this.claimFailureDisposition(reservation),
         claimExecutionDispatch: () => this.claimExecutionDispatch(reservation),
@@ -1078,6 +1081,7 @@ function canonicalTrustedLaunchProfile(value: TrustedLaunchProfile): TrustedLaun
   } catch {
     throw new KerbsFlowError("LAUNCH_PROFILE_INVALID", "trusted repository path must resolve to an existing directory");
   }
+  if (value.releaseEvidence !== undefined && typeof value.releaseEvidence !== "function") throw new KerbsFlowError("LAUNCH_PROFILE_INVALID", "release evidence must be supplied by a trusted host function");
   const focusedCheck = checkIntent("focused", value.focusedCheck);
   const phaseCheck = value.phaseCheck === undefined
     ? undefined
@@ -1099,6 +1103,7 @@ function canonicalTrustedLaunchProfile(value: TrustedLaunchProfile): TrustedLaun
     focusedCheck,
     ...(phaseCheck === undefined ? {} : { phaseCheck }),
     ...(fullCheck === undefined ? {} : { fullCheck }),
+    ...(value.releaseEvidence === undefined ? {} : { releaseEvidence: value.releaseEvidence }),
     executionTimeoutMs: value.executionTimeoutMs,
     ...(failurePolicy === undefined ? {} : { failurePolicy }),
     ...(semanticReview === undefined ? {} : { semanticReview }),

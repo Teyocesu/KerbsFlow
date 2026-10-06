@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { dirname } from "node:path";
 
@@ -44,6 +45,7 @@ import {
   parseSteerText,
   parseValidationBundle,
   parseCommand,
+  parseReleaseEvidenceDossier,
   canonicalJson,
 } from "./contracts.js";
 import type { ExecutorAdapter } from "./adapter.js";
@@ -66,7 +68,7 @@ import { assertLegalTransition, assertResumeTarget, choosePauseContract, isLegal
 import { detectAntiGreenwashing } from "./anti-greenwashing.js";
 import { decideTrustedReview } from "./phase3.js";
 import { hashCanonicalDocuments } from "./canonical.js";
-import { GitWorktreeManager, type WorktreeRecord } from "./git.js";
+import { GitWorktreeManager, gitEnvironment, type WorktreeRecord } from "./git.js";
 import { bindingFor, checkIntentHash } from "./verifier.js";
 import {
   PHASE4_ROUTING_POLICY,
@@ -991,7 +993,7 @@ export class KerbsFlowCore {
     });
   }
 
-  completeTrustedFullValidation(runId: RunId, expectedStateVersion: number, idempotencyKey: string, validationId: ValidationId): CommandResult {
+  completeTrustedFullValidation(runId: RunId, expectedStateVersion: number, idempotencyKey: string, validationId: ValidationId, dossierValue?: unknown): CommandResult {
     const persisted = this.store.getValidation(validationId);
     const authority = this.store.getPhaseValidationAuthority(validationId);
     const declaration = this.store.getValidationIntent(runId, "full");
@@ -1003,6 +1005,23 @@ export class KerbsFlowCore {
       const validation = persisted.bundle;
       if (run.state !== "FINAL_VERIFY" || validation.taskId !== run.currentTaskId || validation.attemptId !== run.activeAttemptId) throw new KerbsFlowError("VALIDATION_SCOPE_MISMATCH", "full evidence differs from current FINAL_VERIFY context");
       if (validation.outcome !== "passed" || validation.checks.length === 0 || validation.checks.some(check => check.outcome !== "passed") || !validation.evidence.some(e => e.kind === "command" && e.classification === "automatically_tested")) return { transition: { to: "FAILED", actor: "verifier", reasonCode: "full_validation_failed", taskId: validation.taskId, attemptId: validation.attemptId, payload: { validationId } }, details: { validationId, outcome: "failed" } } satisfies CommandMutation;
+      const dossier = parseReleaseEvidenceDossier(dossierValue);
+      const candidate = dossier.candidate;
+      const launch = this.store.getRunLaunchBinding(runId);
+      if (candidate.headOid !== authority.headOid || candidate.baseOid !== authority.baseOid || candidate.fingerprint !== authority.candidateFingerprint
+        || (launch !== undefined && candidate.hashes.profile !== launch.launchProfileHash)
+        || dossier.host.node !== process.versions.node || dossier.host.sqlite !== process.versions.sqlite
+        || dossier.host.platform !== process.platform || dossier.host.arch !== process.arch) {
+        throw new KerbsFlowError("RELEASE_EVIDENCE_BINDING_MISMATCH", "release dossier differs from current full authority, launch or runtime identity");
+      }
+      const storedWorktree = this.store.getWorktree(runId)!;
+      const original = new GitWorktreeManager(dirname(dirname(storedWorktree.markerPath))).intake(storedWorktree.repositoryPath);
+      if (original.baseOid !== candidate.headOid || original.branch !== candidate.branch) throw new KerbsFlowError("RELEASE_EVIDENCE_BINDING_MISMATCH", "release dossier differs from the clean original candidate");
+      try {
+        execFileSync("git", ["merge-base", "--is-ancestor", candidate.sourceBaseline, candidate.headOid], { cwd: storedWorktree.worktreePath, env: gitEnvironment(), stdio: "ignore", timeout: 5000 });
+      } catch {
+        throw new KerbsFlowError("RELEASE_EVIDENCE_BASELINE_INVALID", "release source baseline must be an ancestor of the current candidate");
+      }
       const phaseRows = tx.all("SELECT validation_id, level, outcome, bundle_json FROM validations WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND level = 'phase' ORDER BY created_at DESC LIMIT 20", runId, validation.taskId, validation.attemptId!);
       const acceptedPhaseIds = new Set(tx.all("SELECT payload_json FROM transitions WHERE run_id = ? AND task_id = ? AND attempt_id = ? AND from_state = 'VERIFY_PHASE' AND to_state = 'NEXT_PHASE' AND reason_code = 'trusted_phase_close'", runId, validation.taskId, validation.attemptId!).map(row => (JSON.parse(String(row.payload_json)) as { validationId?: string }).validationId));
       const matchingPhase = phaseRows.filter(row => {
@@ -1013,22 +1032,25 @@ export class KerbsFlowCore {
       const reviews = tx.all("SELECT review_id, outcome FROM reviews WHERE run_id = ? AND task_id = ? ORDER BY created_at DESC LIMIT 20", runId, validation.taskId);
       const descriptor = this.store.getAttempt(validation.attemptId!)?.adapterDescriptorJson;
       const adapter = descriptor === null || descriptor === undefined ? null : parseAdapterDescriptor(JSON.parse(descriptor));
+      const actualAdapter = dossier.adapters.find(item => item.adapter === adapter?.adapter);
+      const executor = this.validatePersistedExecutorResultForRecovery(runId, run.currentTaskId, run.activeAttemptId, this.store.getAttempt(validation.attemptId!)!).executor;
+      if (actualAdapter === undefined || actualAdapter.version !== adapter?.adapterVersion || actualAdapter.provider !== executor.provider || actualAdapter.model !== executor.model) throw new KerbsFlowError("RELEASE_EVIDENCE_BINDING_MISMATCH", "release dossier differs from the actual executor identity");
       const bundle = {
         schemaVersion: "kerbsflow.release-bundle/v1", runId, taskId: validation.taskId, attemptId: validation.attemptId,
         candidate: { headOid: authority.headOid, baseOid: authority.baseOid, fingerprint: authority.candidateFingerprint, diffHash: authority.diffHash, changedPathsHash: authority.changedPathsHash },
         fullValidation: { validationId, commandId: authority.commandId, declarationHash: authority.commandHash, positiveProof: "matched", classification: "automatically_tested", evidence: validation.evidence.map(e => ({ id: e.id, kind: e.kind, classification: e.classification, summary: e.kind === "command" ? "Trusted full check executed with matching positive proof" : "Independent full-validation evidence; consult the validation record" })) },
         phaseValidations: matchingPhase.map(row => ({ validationId: String(row.validation_id), outcome: String(row.outcome), classification: "automatically_tested" })),
         reviews: reviews.map(row => ({ reviewId: String(row.review_id), outcome: String(row.outcome), classification: "not_tested", summary: "Persisted review decision; acceptance-specific review proof is not inferred" })),
-        acceptanceEvidence: Array.from({ length: 15 }, (_, index) => ({ acceptanceId: `AC${index + 1}`, classification: "not_tested", summary: "No acceptance-specific evidence was declared; full check success does not independently prove this acceptance criterion", references: [] })),
+        releaseEvidence: dossier,
         facts: { runtime: process.version, platform: process.platform, officialSupport: "macOS only; Linux unsupported preview; Windows unsupported", license: "Apache-2.0", copyright: "Teyocesu 2026", adapter: adapter?.adapter ?? "unknown", adapterVersion: adapter?.adapterVersion ?? "unknown" },
-        limitations: ["Human readiness decision only; no commit, push, merge, tag, release, publish, deployment or production action", ...(adapter?.adapter === "opencode" ? ["OpenCode workload isolation is tool_policy_only; no OS enforcement claim"] : []), "Acceptance-specific missing evidence remains not_tested"],
+        limitations: ["Human readiness decision only; no commit, push, merge, tag, release, publish, deployment or production action"],
       };
       const json = JSON.stringify(bundle);
       if (Buffer.byteLength(json) > 128 * 1024 || containsLikelySecret(json)) throw new KerbsFlowError("RELEASE_BUNDLE_UNSAFE", "release bundle exceeds its bound or contains sensitive material");
       const artifact = this.artifacts.put(runId, "release-readiness", json, validation.attemptId);
       this.insertArtifact(tx, artifact, now);
       const gateId = asGateId(nextId("gate"));
-      const gate: HumanGate = { schemaVersion: CONTRACT_VERSIONS.humanGate, gateId, runId, taskId: validation.taskId, ...(validation.attemptId === undefined ? {} : { attemptId: validation.attemptId }), reasonCode: "release_readiness_decision", summary: `Candidate ${authority.headOid}; fingerprint ${authority.candidateFingerprint}; full ${validationId} passed. AC1–AC15 acceptance-specific support is not_tested. Human readiness decision has no remote side effect.`, evidenceRefs: [artifact.artifactId], evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(nextId("validation")), kind: "command", classification: "automatically_tested", summary: `Trusted full check ${declaration.commandId} passed for the exact candidate`, artifactRef: artifact.artifactId }, { schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(nextId("validation")), kind: "other", classification: "not_tested", summary: "AC1–AC15 acceptance-specific support missing; inspect the immutable bundle and known limitations" }], options: [{ id: "accept_readiness", label: "Accept release readiness", consequence: "Record the human readiness decision as DONE. No release action occurs.", target: "DONE" }, { id: "request_corrections", label: "Request corrections", consequence: "Persist a corrections request for a separately approved remediation run; this gate remains open.", target: "HUMAN_RELEASE_GATE" }, { id: "cancel_readiness", label: "Cancel readiness", consequence: "Cancel this readiness run and preserve the evidence.", target: "CANCELLED" }], status: "open" };
+      const gate: HumanGate = { schemaVersion: CONTRACT_VERSIONS.humanGate, gateId, runId, taskId: validation.taskId, ...(validation.attemptId === undefined ? {} : { attemptId: validation.attemptId }), reasonCode: "release_readiness_decision", summary: `Candidate ${authority.headOid}; fingerprint ${authority.candidateFingerprint}; full ${validationId} passed. Complete trusted AC1–AC15 release evidence is bound to this candidate. Human readiness decision has no remote side effect.`, evidenceRefs: [artifact.artifactId], evidence: [{ schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(nextId("validation")), kind: "command", classification: "automatically_tested", summary: `Trusted full check ${declaration.commandId} passed for the exact candidate`, artifactRef: artifact.artifactId }, { schemaVersion: CONTRACT_VERSIONS.validation, id: asValidationId(nextId("validation")), kind: "other", classification: "inspected", summary: "Trusted host dossier supplies complete acceptance, final gate, scenario and release review evidence; inspect the immutable bundle" }], options: [{ id: "accept_readiness", label: "Accept release readiness", consequence: "Record the human readiness decision as DONE. No release action occurs.", target: "DONE" }, { id: "request_corrections", label: "Request corrections", consequence: "Persist a corrections request for a separately approved remediation run; this gate remains open.", target: "HUMAN_RELEASE_GATE" }, { id: "cancel_readiness", label: "Cancel readiness", consequence: "Cancel this readiness run and preserve the evidence.", target: "CANCELLED" }], status: "open" };
       this.insertGate(tx, gate, now);
       tx.run("INSERT INTO release_bundles (gate_id, run_id, full_validation_id, candidate_fingerprint, head_oid, bundle_json, bundle_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", gateId, runId, validationId, authority.candidateFingerprint, authority.headOid, json, createHash("sha256").update(json).digest("hex"), now);
       return { transition: { to: "HUMAN_RELEASE_GATE", actor: "verifier", reasonCode: "full_validation_accepted", taskId: validation.taskId, attemptId: validation.attemptId, gateId, payload: { validationId, candidateFingerprint: authority.candidateFingerprint } }, runPatch: { currentGateId: gateId }, details: { gateId, validationId } } satisfies CommandMutation;

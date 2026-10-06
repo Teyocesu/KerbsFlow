@@ -14,6 +14,9 @@ import {
   asReviewId,
   parsePlanningDecision,
   parseExecutorResult,
+  parseReleaseEvidenceDossier,
+  type ReleaseEvidenceDossier,
+  type ReleaseEvidenceCandidate,
 } from "./contracts.js";
 import { CanonicalIntentGuard } from "./canonical.js";
 import { KerbsFlowCore } from "./core.js";
@@ -82,6 +85,7 @@ export interface ExecutionDispatchBoundary {
 }
 
 export interface Phase2DriveControls {
+  releaseEvidence?: (candidate: Readonly<ReleaseEvidenceCandidate>) => ReleaseEvidenceDossier;
   checkpoint?: () => Promise<number | void>;
   claimFailureDisposition?: () => Promise<FailureDispositionBoundary>;
   claimExecutionDispatch?: () => Promise<ExecutionDispatchBoundary>;
@@ -100,10 +104,10 @@ export class Phase2Loop {
     private readonly planningMaster?: PlanningMaster,
   ) {}
 
-  async run(request: Phase2LoopRequest): Promise<Phase2LoopResult> {
+  async run(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
     this.assertRequest(request, this.planningMaster);
     this.core.startRun(request.runId, request.objective, `${request.runId}:start`);
-    return this.driveStarted(request);
+    return this.driveStarted(request, controls);
   }
 
   async driveStarted(request: Phase2LoopRequest, controls: Phase2DriveControls = {}): Promise<Phase2LoopResult> {
@@ -167,6 +171,7 @@ export class Phase2Loop {
 
   private async drive(request: Phase2LoopRequest, controls: Phase2DriveControls, recovered?: { intake: RepositoryIntake; worktree: WorktreeRecord; decision: PlanningDecision }): Promise<Phase2LoopResult> {
     const planningMaster = controls.planningMaster ?? this.planningMaster;
+    const releaseEvidence = controls.releaseEvidence;
     const started = this.store.getRun(request.runId)!;
     let command: Pick<CommandResult, "to" | "stateVersion"> = { to: started.state, stateVersion: started.stateVersion };
     const checkpoint = async (): Promise<void> => {
@@ -518,7 +523,10 @@ export class Phase2Loop {
         }
         await checkpoint();
         this.store.recordAuthoritativePhaseValidation(full.authoritative);
-        command = await atDisposition(version => this.core.completeTrustedFullValidation(request.runId, version, `${request.runId}:full-close:${attempts}`, full.authoritative.bundle.validationId));
+        const dossier = full.authoritative.bundle.outcome === "passed"
+          ? parseReleaseEvidenceDossier(releaseEvidence?.(Object.freeze({ headOid: full.authoritative.binding.headOid, baseOid: full.authoritative.binding.baseOid, fingerprint: full.authoritative.binding.candidateFingerprint })))
+          : undefined;
+        command = await atDisposition(version => this.core.completeTrustedFullValidation(request.runId, version, `${request.runId}:full-close:${attempts}`, full.authoritative.bundle.validationId, dossier));
         return { verdict: command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: full.verification, attempts, stateVersion: command.stateVersion };
       }
       return { verdict: command.to === "NEXT_PHASE" ? "PASS" : command.to === "FAILED" ? "FAILED" : "HUMAN_GATE", intake, worktree, executorResult, verification: phase.verification, attempts, stateVersion: command.stateVersion };

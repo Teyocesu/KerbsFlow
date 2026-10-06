@@ -1,3 +1,5 @@
+import { syntheticReleaseDossier } from "./release-evidence-helpers.js";
+import { parseReleaseEvidenceDossier, type ReleaseEvidenceDossier } from "../src/contracts.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -114,4 +116,62 @@ test("configuration precedence permits only a policy-approved narrowing", () => 
   assert.equal(configuration.effectiveAdapter, "fake");
   assert.equal(configuration.effectiveMaxImplementationAttempts, 2);
   assert.equal(asRunId("run_contracts"), "run_contracts");
+});
+
+for (const [name, mutate] of [
+  ["14 ACs", (d: ReleaseEvidenceDossier) => { d.acceptance.pop(); }],
+  ["sparse AC array", (d: ReleaseEvidenceDossier) => { delete d.acceptance[7]; }],
+  ["duplicate AC", (d: ReleaseEvidenceDossier) => { d.acceptance[1]!.id = "AC1"; }],
+  ["non-PASS AC", (d: ReleaseEvidenceDossier) => { Object.assign(d.acceptance[0]!, { outcome: "unknown" }); }],
+  ["empty AC refs", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.evidenceRefs = []; }],
+  ["dangling ref", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.evidenceRefs = ["evidence_missing"]; }],
+  ["duplicate evidence", (d: ReleaseEvidenceDossier) => { d.evidence.push({ ...d.evidence[0]! }); }],
+  ["inferred-only AC", (d: ReleaseEvidenceDossier) => { d.evidence[0]!.classification = "inferred"; }],
+  ["untested AC", (d: ReleaseEvidenceDossier) => { d.evidence[0]!.classification = "not_tested"; }],
+  ["private path", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.summary = "/private/tmp/raw.log"; }],
+  ["raw log", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.summary = "raw\nlog"; }],
+  ["unknown field", (d: ReleaseEvidenceDossier) => { Object.assign(d.host, { environment: {} }); }],
+  ["oversized dossier", (d: ReleaseEvidenceDossier) => { d.evidence = Array.from({ length: 200 }, (_, i) => ({ ...d.evidence[0]!, id: `evidence_${i}`, summary: "x".repeat(1000) })); }],
+  ["secret dossier", (d: ReleaseEvidenceDossier) => { d.acceptance[0]!.summary = "sk-syntheticdossiercredential"; }],
+  ["missing paired scenario", (d: ReleaseEvidenceDossier) => { d.scenarios.pop(); }],
+  ["sparse scenario array", (d: ReleaseEvidenceDossier) => { delete d.scenarios[7]; }],
+  ["duplicate scenario", (d: ReleaseEvidenceDossier) => { d.scenarios[1] = { ...d.scenarios[0]! }; }],
+  ["incomplete discovery", (d: ReleaseEvidenceDossier) => { d.deterministicGate.suites.executed--; }],
+  ["suite failures", (d: ReleaseEvidenceDossier) => { Object.assign(d.deterministicGate.suites, { failures: 1 }); }],
+  ["no complete suite command", (d: ReleaseEvidenceDossier) => { d.deterministicGate.commands.pop(); }],
+  ["reused final gate", (d: ReleaseEvidenceDossier) => { d.evidence[0]!.origin = "reused"; }],
+  ["unavailable audit without decision", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.status = "unavailable"; d.dependencies.audit.advisories = null; }],
+  ["untested evidence promoted by a tested section", (d: ReleaseEvidenceDossier) => {
+    d.evidence.push({ ...d.evidence[0]!, id: "evidence_untested", classification: "not_tested" });
+    d.liveProvider = { status: "tested", reason: "fixture claim", evidenceRefs: ["evidence_untested"] };
+  }],
+  ["untested completed audit", (d: ReleaseEvidenceDossier) => {
+    d.evidence.push({ ...d.evidence[0]!, id: "evidence_untested", classification: "not_tested" });
+    d.dependencies.audit.evidenceRefs = ["evidence_untested"];
+  }],
+  ["untested adapter readiness", (d: ReleaseEvidenceDossier) => {
+    d.evidence.push({ ...d.evidence[0]!, id: "evidence_untested", classification: "not_tested" });
+    d.adapters[0]!.evidenceRefs = ["evidence_untested"];
+  }],
+  ["known review blocker", (d: ReleaseEvidenceDossier) => { Object.assign(d.reviewHistory, { knownBlockers: 1 }); }],
+  ["OpenCode OS claim", (d: ReleaseEvidenceDossier) => { d.adapters[1]!.workload = "os_enforced"; }],
+  ["automatic release allowed", (d: ReleaseEvidenceDossier) => { d.prohibitedActions.pop(); }],
+] as const) {
+  test(`release dossier rejects ${name}`, () => {
+    const dossier = syntheticReleaseDossier();
+    mutate(dossier);
+    assert.throws(() => parseReleaseEvidenceDossier(dossier), ContractValidationError);
+  });
+}
+
+test("release dossier is copied and frozen; optional live inference remains explicitly untested", () => {
+  const caller = syntheticReleaseDossier();
+  const accepted = parseReleaseEvidenceDossier(caller);
+  caller.acceptance[0]!.evidenceRefs.length = 0;
+  caller.liveProvider.reason = "caller changed";
+  assert.deepEqual(accepted.acceptance[0]!.evidenceRefs, ["evidence_gate"]);
+  assert.deepEqual(accepted.liveProvider, { status: "not_tested", reason: "not opted in", evidenceRefs: [] });
+  assert.ok(Object.isFrozen(accepted));
+  assert.ok(Object.isFrozen(accepted.acceptance[0]!.evidenceRefs));
+  assert.ok(Object.isFrozen(accepted.deterministicGate.boundaries));
 });
