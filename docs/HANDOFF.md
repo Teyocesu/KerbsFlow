@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- Phase 7 OPEN; Phase 7D NOT PASSED. Independent review of `a0c72a40b17287597a8b296e8d669dc40b6a1d6b`: T1/T2 independently FIX VERIFIED; test-remediation diff accepted; no production defect/change required; zero known focused blockers. Failed prior 7D remains historical; PLAN §7D.7.
-- Fresh Node 24.15.0 / npm 11.12.1: routing 15/15, Phase6C 18/18 PASS, zero failures/cancellations/skips/TODOs; build/typecheck/diff-check PASS; parent defects reproduced outside candidate. No final AC1–AC15 PASS or ReleaseEvidenceDossier/HUMAN_RELEASE_GATE. Live provider NOT TESTED — not opted in.
-- Exact next action: NEW complete Phase 7D deterministic macOS gate FROM SCRATCH on published `phase7/v0.1-release-gate`. No release action.
+- Phase 7 OPEN; Phase 7D NOT PASSED. The failed 7D.10 Effect factory WIP was preserved outside Git and the three files restored to committed `eebaa4d`; baseline typecheck/build/diff-check PASS. PLAN §7D.9–7D.10B; no production, package, test, compiler, or SPEC change remains.
+- Supported 7D.9 runtime composition is unimplemented: inherited plugin/MCP extension authority persists. Public SDK 2.0.13 and 2.0.24 Effect declarations fail strict NodeNext; no compatible 2.0.13–2.0.24 release established. `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain open; no risk acceptance, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE, or full 7D rerun.
+- Exact next action: human review of the unpublished upstream issue draft; then verify any official declaration fix under unchanged compiler/security contracts before separately authorizing production implementation. No release action.
