@@ -5,6 +5,7 @@ import { Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { createOpenCodeHost } from "../src/opencode-compat.js";
 import type { ExecutorAdapter } from "../src/adapter.js";
 
 import {
@@ -40,10 +41,8 @@ test("the official OpenCode V2 SDK is pinned and its embedded API enforces the t
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-opencode-sdk-"));
   const packageJson = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")) as { dependencies: Record<string, string> };
   assert.equal(packageJson.dependencies["@opencode/sdk"], OPENCODE_SDK_VERSION);
-  const packageName: string = "@opencode/sdk";
-  const sdk = await import(packageName) as unknown as { OpenCode: { create(options: unknown): Promise<OpenCodeHostBoundary> } };
   const before = activeServers();
-  const host = await sdk.OpenCode.create({
+  const host = await createOpenCodeHost({
     app: { name: "kerbsflow-test", version: OPENCODE_SDK_VERSION },
     database: { path: join(root, "sessions.sqlite") },
     events: { persist: true },

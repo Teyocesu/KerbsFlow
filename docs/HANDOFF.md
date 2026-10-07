@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- Phase 7 OPEN; Phase 7D NOT PASSED. The failed 7D.10 Effect factory WIP was preserved outside Git and the three files restored to committed `eebaa4d`; baseline typecheck/build/diff-check PASS. PLAN §7D.9–7D.10B; no production, package, test, compiler, or SPEC change remains.
-- Supported 7D.9 runtime composition is unimplemented: inherited plugin/MCP extension authority persists. Public SDK 2.0.13 and 2.0.24 Effect declarations fail strict NodeNext; no compatible 2.0.13–2.0.24 release established. `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain open; no risk acceptance, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE, or full 7D rerun.
-- Exact next action: human review of the unpublished upstream issue draft; then verify any official declaration fix under unchanged compiler/security contracts before separately authorizing production implementation. No release action.
+- Phase 7 OPEN; Phase 7D NOT PASSED. 7D.10C autonomous embedded boundary implemented/validated, READY FOR REVIEW; upstream fix/publication not required. PLAN §7D.10C; typecheck/build PASS, focused 59/59, full tests 512/512. Evidence: `$HOME/.codex/evidence/kerbsflow-phase7d10c-20261007/`.
+- Independent review pending. `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain separate/open. No live provider claim, risk acceptance, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE or full 7D gate.
+- Exact next action: independent focused review of published 7D.10C; then separately resolve remaining advisory scope before any authorized new full Phase 7D gate. No release action.

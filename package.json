@@ -14,7 +14,9 @@
     "test:live-codex": "npm run build && node scripts/live-codex-smoke.mjs"
   },
   "dependencies": {
-    "@opencode/sdk": "2.0.13"
+    "@opencode/core": "2.0.13",
+    "@opencode/sdk": "2.0.13",
+    "effect": "4.0.0-rc.112"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

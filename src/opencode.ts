@@ -20,6 +20,7 @@ import {
 import { KerbsFlowError } from "./errors.js";
 import { containsLikelySecret, redactDiagnostic } from "./secrets.js";
 import { ensurePrivateDirectory } from "./paths.js";
+import { createOpenCodeHost } from "./opencode-compat.js";
 
 export const OPENCODE_SDK_VERSION = "2.0.13";
 export const OPENCODE_AGENT = "kerbsflow";
@@ -156,14 +157,6 @@ interface OpenCodeAttempt {
   deadline?: NodeJS.Timeout;
 }
 
-const OPENCODE_SDK_PACKAGE: string = "@opencode/sdk";
-const DEFAULT_HOST_FACTORY: OpenCodeHostFactory = async (options) => {
-  const sdk = await import(OPENCODE_SDK_PACKAGE) as unknown as {
-    OpenCode: { create(value: OpenCodeHostCreateOptions): Promise<OpenCodeHostBoundary> };
-  };
-  return sdk.OpenCode.create(options);
-};
-
 export function openCodeHostConfiguration(): Record<string, unknown> {
   const policies = [
     "external_directory:*",
@@ -212,7 +205,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
   private generation = 0;
 
   constructor(options: OpenCodeAdapterOptions) {
-    this.createHost = options.createHost ?? DEFAULT_HOST_FACTORY;
+    this.createHost = options.createHost ?? createOpenCodeHost;
     this.hostIdentity = options.hostIdentity ?? randomUUID();
     this.now = options.now ?? (() => new Date().toISOString());
     this.closePreparationTimeoutMs = options.closePreparationTimeoutMs ?? 1000;
