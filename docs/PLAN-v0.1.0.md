@@ -1,10 +1,10 @@
 # KerbsFlow v0.1.0 implementation plan
 
-Status: **Phase 6 / 6E CLOSED / PASS; Phase 7 OPEN; Phase 7D NOT PASSED. Phase 7D.10C autonomous embedded boundary implemented and validated; READY FOR REVIEW. Upstream publication/fixes are not required. No risk acceptance, ReleaseEvidenceDossier or HUMAN_RELEASE_GATE.**
+Status: **Phase 6 / 6E CLOSED / PASS; Phase 7 OPEN; Phase 7D NOT PASSED. Phase 7D.10C autonomous embedded boundary implemented and validated; 7D.10E finalizer-cause fix implemented and validated; independent re-review pending. Upstream publication/fixes are not required. No risk acceptance, ReleaseEvidenceDossier or HUMAN_RELEASE_GATE.**
 
 Contract: [`SPEC-v0.1.0.md`](./SPEC-v0.1.0.md)
 
-Checkpoint statuses below are historical; the current status and final Phase 6/6E closure record supersede their earlier pending/open continuation statements.
+Checkpoint statuses below are historical; the current status and latest remediation record supersede their earlier pending/open continuation statements.
 
 This is the single mutable implementation plan for v0.1. Complete phases sequentially. A phase may split work internally, but may not weaken its exit condition or create parallel plans. Update this file and `HANDOFF.md` at meaningful phase boundaries only.
 
@@ -917,9 +917,20 @@ Historical checkpoint; its upstream-dependent next action is superseded by §7D.
 
 **Phase 7 OPEN; Phase 7D NOT PASSED.** `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain separate/open. No risk acceptance, final advisory R3, ReleaseEvidenceDossier or HUMAN_RELEASE_GATE. Commit/push is authorized only for this complete implementation PASS, exclusively to `phase7/v0.1-release-gate`. **Exact next action: independent focused review of the published 7D.10C boundary; then separately resolve remaining advisory scope before any authorized new full Phase 7D gate.** No main/merge/tag/release/deploy action.
 
+## Phase 7D.10E — Focused finalizer-cause preservation (2026-10-07)
+
+**FIX VALIDATED; INDEPENDENT RE-REVIEW PENDING.** The independent 7D.10D review found one P1 in `src/opencode-compat.ts`: `Pull.isDoneCause` is true when any Done reason is present, so a mixed Done + finalizer failure could become clean iterator completion and clean host close.
+
+- The bridge now uses pinned public `effect@4.0.0-rc.112` `Pull.filterDone` to distinguish clean Done (including permitted interruption reasons) from a remaining non-Done failure. It surfaces the filtered cause, records mixed Done + failure in the existing `streamCloseFailed` flag, and still closes the child Scope. Ordinary failures without Done retain their prior behavior.
+- One regression through the existing production bridge uses `Stream.ensuring(Stream.empty, failingFinalizer)` without request abort. It failed against `44dd5141963e0070f0310d6cd74263c06ef5837c`: `iterator.next()` fulfilled `{ done: true }` and `host.close()` fulfilled. After the fix, `next()` rejects with the finalizer failure, child and host Scopes release, and repeated `host.close()` returns the same rejected `OPENCODE_STREAM_CLOSE_FAILED` promise. The existing interruption/finalizer regression remains.
+- Fresh validation: `npm run typecheck`, `npm run build`, and `git diff --check` PASS; complete OpenCode boundary/adapter/routing group **60/60 PASS**; full `npm test` **513/513 PASS**, zero failures/cancellations/skips/TODOs. Initial build attempts hit host `ENOSPC`; clearing only ignored generated `dist/` output allowed the final clean build and full suite to pass.
+- Cause review: Done only and Done + Interrupt complete cleanly unless request/host-lifetime cancellation requires rejection; Done + Die/Fail rejects and remains sticky for close; Interrupt only retains cancellation behavior; Die/Fail without Done retains ordinary error behavior and existing abort-related sticky handling; request/host abort remains rejection; iterator return still treats pure interruption as return while preserving a mixed finalizer failure for `next()` and host close.
+
+**Phase 7 OPEN; Phase 7D NOT PASSED.** `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain separate/open. No risk acceptance, final advisory R3, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE, or release claim. Exact next action: independent focused re-review of the published 7D.10E finalizer fix; then separately resolve remaining advisory scope before any authorized new full Phase 7D gate.
+
 ## Current gate
 
-- **Phase 6 / 6E CLOSED / PASS; Phase 7 OPEN; Phase 7D NOT PASSED.** The autonomous embedded OpenCode boundary is implemented and validated, ready for independent focused review (§7D.10C); no upstream fix/publication is required. `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain separate/open. No final AC1–AC15 PASS, risk acceptance, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE or release readiness. macOS remains the official v0.1 host; Linux preview and Windows are unsupported. Exact next action: independent focused review of published 7D.10C; remaining advisory work precedes any authorized new full Phase 7D gate.
+- **Phase 6 / 6E CLOSED / PASS; Phase 7 OPEN; Phase 7D NOT PASSED.** The autonomous embedded OpenCode boundary and 7D.10E finalizer-cause fix are implemented and validated; independent re-review is pending. `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain separate/open. No final AC1–AC15 PASS, risk acceptance, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE or release readiness. macOS remains the official v0.1 host; Linux preview and Windows are unsupported. Exact next action: independent focused re-review of published 7D.10E; remaining advisory work precedes any authorized new full Phase 7D gate.
 
 - Phase 5 is independently confirmed **PASS** at approved baseline `16359e9a37e62bc37da8b2c480fca88fe855a2dd`; macOS is the only officially supported v0.1 host, Linux is unsupported preview/non-blocking, and Windows is deferred/unsupported.
 - Phase 6A is complete at approved HEAD `5f017cff55fbf81a137a8163fdb42e47249f2328`; Phase 6B is CLOSED at approved implementation baseline `d2c9a638c6e692ff516f4b7bf7c9fb92752207c4` after physical macOS QA **PASS**; Phase 6C.1 is CLOSED / **PASS** at approved implementation baseline `c5a4a683af63f988b06ded852a9462e05f9e92c8`.

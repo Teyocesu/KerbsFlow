@@ -4,7 +4,7 @@ import * as Runtime from "effect";
 import { KerbsFlowError } from "./errors.js";
 import type { OpenCodeHostBoundary, OpenCodeHostFactory } from "./opencode.js";
 
-const { Cause, Context, Effect, Exit, Layer, Pull, Scope, Stream } = Runtime;
+const { Cause, Context, Effect, Exit, Layer, Pull, Result, Scope, Stream } = Runtime;
 
 // These are public runtime exports. Non-literal imports keep the pinned SDK's
 // incompatible declarations inside this runtime-validated compatibility boundary.
@@ -17,14 +17,15 @@ type RuntimeCall = (...args: unknown[]) => unknown;
 type Session = Awaited<ReturnType<OpenCodeHostBoundary["sessions"]["get"]>>;
 
 export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
-  for (const name of ["Cause", "Context", "Effect", "Exit", "Layer", "Pull", "Scope", "Stream"] as const) record(Runtime[name], `effect.${name}`);
+  for (const name of ["Cause", "Context", "Effect", "Exit", "Layer", "Pull", "Result", "Scope", "Stream"] as const) record(Runtime[name], `effect.${name}`);
   for (const [name, operation] of Object.entries({
     "Layer.succeed": Layer.succeed, "Scope.make": Scope.make, "Scope.close": Scope.close, "Scope.fork": Scope.fork,
     "Context.isKey": Context.isKey, "Effect.isEffect": Effect.isEffect, "Effect.succeed": Effect.succeed,
     "Effect.runSync": Effect.runSync, "Effect.runPromise": Effect.runPromise, "Effect.runPromiseExit": Effect.runPromiseExit,
     "Effect.provideService": Effect.provideService, "Stream.isStream": Stream.isStream, "Stream.toPull": Stream.toPull,
     "Cause.hasInterruptsOnly": Cause.hasInterruptsOnly, "Cause.squash": Cause.squash,
-    "Pull.isDoneCause": Pull.isDoneCause, "Exit.isFailure": Exit.isFailure, "Exit.isExit": Exit.isExit,
+    "Pull.filterDone": Pull.filterDone, "Pull.isDoneCause": Pull.isDoneCause, "Result.isFailure": Result.isFailure,
+    "Exit.isFailure": Exit.isFailure, "Exit.isExit": Exit.isExit,
   })) callable(operation, name);
   if (!Exit.isExit(Exit.void)) throw drift("Exit.void");
   if (!Stream.isStream(Stream.never)) throw drift("Stream.never");
@@ -135,12 +136,19 @@ export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
           let returned: Promise<IteratorResult<unknown>> | undefined;
           const done: IteratorResult<unknown> = { done: true, value: undefined };
           const failure = (cause: Runtime.Cause.Cause<unknown>): IteratorResult<unknown> => {
-            const interrupted = Cause.hasInterruptsOnly(cause);
-            if (signal.aborted && !interrupted && !Pull.isDoneCause(cause)) streamCloseFailed = true;
+            const completion = Pull.filterDone(cause);
+            if (Result.isFailure(completion)) {
+              const interrupted = Cause.hasInterruptsOnly(cause);
+              if (Pull.isDoneCause(cause)) streamCloseFailed = true;
+              else if (signal.aborted && !interrupted) streamCloseFailed = true;
+              lifetime.signal.throwIfAborted();
+              request?.signal?.throwIfAborted();
+              if (stop.signal.aborted && interrupted) return done;
+              throw Cause.squash(completion.failure);
+            }
             lifetime.signal.throwIfAborted();
             request?.signal?.throwIfAborted();
-            if (Pull.isDoneCause(cause) || (stop.signal.aborted && interrupted)) return done;
-            throw Cause.squash(cause);
+            return done;
           };
           const read = async (): Promise<IteratorResult<unknown>> => {
             lifetime.signal.throwIfAborted();

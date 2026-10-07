@@ -35,6 +35,20 @@ test("production OpenCode bridge owns stream abort, iterator return, host close 
   finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test("production OpenCode bridge preserves a normal-completion finalizer failure without abort", { timeout: 40_000 }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "kerbsflow-opencode-finalizer-"));
+  try {
+    const result = JSON.parse(await fixture("failed-normal-stream-finalizer", root));
+    assert.equal(result.next.status, "rejected", JSON.stringify(result));
+    assert.match(result.next.message, /synthetic normal-completion finalizer failure/);
+    assert.equal(result.streamScopeReleased, 1);
+    assert.equal(result.close.status, "rejected", JSON.stringify(result));
+    assert.equal(result.close.code, "OPENCODE_STREAM_CLOSE_FAILED");
+    assert.equal(result.closeSame, true);
+    assert.equal(result.hostScopeReleased, 1);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 for (const mode of ["failed-create", "stalled-close", "failed-stream-close", "drift:create", "drift:effect", "drift:source", "drift:mcp", "drift:host", "drift:result"]) {
   test(`production OpenCode bridge fails closed and releases resources: ${mode}`, { timeout: 40_000 }, async () => {
     const root = mkdtempSync(join(tmpdir(), "kerbsflow-opencode-drift-"));

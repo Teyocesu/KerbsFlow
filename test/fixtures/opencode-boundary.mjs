@@ -21,7 +21,7 @@ async function main() {
   let inferenceMode = 'complete';
   let inferenceStarted;
   let inferenceCancelled = 0;
-  const observed = { listeners: 0, clients: 0, children: 0, inference: 0, acquired: 0, released: 0 };
+  const observed = { listeners: 0, clients: 0, children: 0, inference: 0, acquired: 0, released: 0, streamScopeReleased: 0 };
   const originalListen = net.Server.prototype.listen;
   net.Server.prototype.listen = function (...args) { observed.listeners++; return originalListen.apply(this, args); };
   const originalSpawn = childProcess.spawn;
@@ -127,6 +127,10 @@ async function main() {
             yield* Effect.addFinalizer(() => Effect.sync(() => state.observed.released++));
             state.host = host;
             if (state.mode === 'failed-stream-close') host.sessions.log = () => Stream.ensuring(Stream.never, Effect.die(new Error('synthetic stream finalizer failure')));
+            if (state.mode === 'failed-normal-stream-finalizer') host.sessions.log = () => Stream.ensuring(Stream.empty, Effect.gen(function* () {
+              yield* Effect.addFinalizer(() => Effect.sync(() => state.observed.streamScopeReleased++));
+              return yield* Effect.die(new Error('synthetic normal-completion finalizer failure'));
+            }));
             if (state.driftMode === 'host') host.sessions.wait = undefined;
             if (state.driftMode === 'result') host.provider.list = () => Effect.succeed({ data: [{ id: 'fixture', activation: 'bad' }] });
           }));
@@ -141,7 +145,7 @@ async function main() {
   const hostOptions = { app: { name: 'kerbsflow-fixture', version: '2.0.13' }, database: { path: database }, events: { persist: true }, config: { project: false, content: JSON.stringify({ ...openCodeHostConfiguration(), ...(mode === 'lifecycle' ? { providers: customProvider('synthetic') } : {}), models: { fetch: false } }) }, fs: { filewatcher: false } };
   const effectCall = (group, name, input) => Effect.runPromise(globalThis.__opencodeObservation.host[group][name](input));
 
-  if (mode === 'failed-create' || mode === 'stalled-close' || mode === 'failed-stream-close' || driftMode) {
+  if (mode === 'failed-create' || mode === 'stalled-close' || mode === 'failed-stream-close' || mode === 'failed-normal-stream-finalizer' || driftMode) {
     if (mode === 'failed-stream-close') {
       const host = await createOpenCodeHost(hostOptions);
       const abort = new AbortController();
@@ -151,6 +155,20 @@ async function main() {
       abort.abort(); await pull;
       await assert.rejects(host.close(), { code: 'OPENCODE_STREAM_CLOSE_FAILED' });
       assert.equal(observed.released, 1);
+    } else if (mode === 'failed-normal-stream-finalizer') {
+      const host = await createOpenCodeHost(hostOptions);
+      const iterator = host.sessions.log({ sessionID: 'synthetic' })[Symbol.asyncIterator]();
+      const capture = async (operation) => {
+        try { return { status: 'fulfilled', value: await operation }; }
+        catch (error) { return { status: 'rejected', code: error?.code, message: error?.message }; }
+      };
+      const next = await capture(iterator.next());
+      const streamScopeReleased = observed.streamScopeReleased;
+      const closing = host.close();
+      const closeSame = host.close() === closing;
+      const close = await capture(closing);
+      console.log(JSON.stringify({ mode, next, streamScopeReleased, close, closeSame, hostScopeReleased: observed.released }));
+      return;
     } else if (mode === 'stalled-close') {
       const host = await createOpenCodeHost(hostOptions);
       const closing = host.close();
