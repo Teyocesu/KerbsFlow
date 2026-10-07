@@ -44,6 +44,7 @@ import { RunCoordinator } from "../src/run-coordinator.js";
 import { CanonicalIntentGuard } from "../src/canonical.js";
 import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery, type TrustedRoutingDecision } from "../src/routing.js";
 import { createFakeCodex, createGitRepository, git } from "./phase2-helpers.js";
+import { awaitDrive } from "./drive-helpers.js";
 import { createFixture, primeExecute } from "./helpers.js";
 
 test("Phase 4 planning cannot execute without a runtime-trusted routing decision", async () => {
@@ -1124,8 +1125,7 @@ for (const dirtyOriginal of [true, false]) {
       assert.ok("to" in settled);
       assert.equal(settled.to, "VERIFY_FOCUSED");
       const drive = (coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown } }).reservation;
-      await drive.drivePromise;
-      assert.equal(drive.driveError, undefined);
+      await awaitDrive(drive);
       assert.equal(store.getRun(runId)?.state, dirtyOriginal ? "HUMAN_GATE" : "NEXT_PHASE");
       assert.equal(store.countTaskAttempts(runId, taskId), 1);
       assert.equal(store.getAttempt(attemptId)?.lifecycle, "SUCCEEDED");

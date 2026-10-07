@@ -299,6 +299,8 @@ reconcile(PersistedAttemptIdentity) -> ReconcileOutcome
 - authentication owner/mode without credential material; and
 - health/version probing.
 
+For OpenCode v0.1, model availability includes effective implementation provenance: only native implementations bundled in the pinned `@opencode/ai` runtime and recognized by its public pinned native mapping are executable. The existing model readiness list includes only those implementations; opaque, legacy AI-SDK, npm, arbitrary local/file and Git/external implementations are unsupported. Provider/model names remain configuration values, not core enums.
+
 Routing fails closed when a required capability is absent. Optional operations such as provider session continuation are exposed only when the descriptor declares them. Core behavior never infers a capability from provider name alone.
 
 ### 7.3 Codex adapter decision
@@ -329,6 +331,7 @@ The adapter:
 - creates and explicitly closes one owned embedded host at the adapter-defined lifecycle boundary, recording the SDK/host version and probed capabilities without leaking embedded details into core state semantics;
 - creates a session rooted at the assigned worktree, subscribes to its asynchronous event stream before dispatch, sends a schema-constrained prompt when the pinned version supports it, and reconciles completion with session/status/message snapshots;
 - selects OpenCode model in `provider/model` form and an explicit agent when policy requires it;
+- supports only effective native provider/model implementations bundled in pinned `@opencode/ai` and identifiable through supported public pinned APIs. It excludes legacy AI-SDK adapters and arbitrary installed/npm, local/file and Git/external modules; package installation is unavailable. It filters readiness by that implementation class and enforces the same restriction at the host resolver before module loading or inference, including direct session APIs and inherited/configured model sources. OpenCode availability does not imply every OpenCode provider is a supported KerbsFlow route;
 - applies an explicit deny-by-default permission object instead of OpenCode's permissive defaults, allowing only approved worktree operations and commands;
 - uses request `AbortSignal` and any probed session-abort capability; host closure is the final owned-resource stop, while uncertain remote/provider effects enter `RECOVERY` rather than being replayed;
 - reuses OpenCode-owned provider credentials. It never calls the auth-setting API with copied credentials;
@@ -515,6 +518,8 @@ Routing is versioned typed configuration evaluated against capabilities. Initial
 | Difficult integration or complex debugging | Codex / Sol Medium | Codex / Sol High |
 | Architecture, protocols, storage, concurrency, security, licensing, high-impact decisions, difficult root cause, critical final review | Codex / Sol High | Human gate if unresolved |
 
+For OpenCode, “available and suitable” also requires that the selected effective model implementation passes the native-only contract in §7.4; Muse is retained only when its actual pinned implementation passes. An unsupported selection uses the next eligible route under existing policy or gates, never silently substitutes another OpenCode provider.
+
 Luna Medium is prohibited by current policy. Model/provider names are configuration values, not core enums; availability is probed. Future cheap/local routers may advise task/executor/validation/escalation classifications but can never override SPEC, invariants, security gates, or deterministic policy.
 
 Routing decisions persist non-sensitive metadata: classification, considered capabilities/routes, selected route, actual route, retry/escalation reason, validation result, and final outcome. They do not retain source code or large prompts for hypothetical training.
@@ -645,6 +650,8 @@ KerbsFlow distinguishes two network planes and never reports a single ambiguous 
 
 Capability records describe each plane and distinguish workload enforcement as `enforced`, `tool_policy_only`, or `unavailable`. Denying web tools does not prove shell/repository network isolation, while required provider inference traffic does not imply workload permission. If strict workload no-network execution is required but cannot be enforced, KerbsFlow chooses another route/environment or gates; it does not claim “no network.”
 
+OpenCode native-only provider resolution is a control-plane implementation boundary: configuration, model catalogs and direct session APIs cannot authorize legacy or arbitrary provider module execution or runtime package installation. Provider-owned authentication remains available for supported native implementations; it does not authorize arbitrary module loading.
+
 Codex sandbox configuration and OpenCode permissions/host capabilities are mechanisms, not the policy itself. v0.1 does not introduce a proxy, firewall, or custom network-isolation subsystem.
 
 ### 16.3 Secrets and environment
@@ -751,18 +758,18 @@ v0.1 is acceptable only when:
 1. A user can register a Git repository, submit an objective, and see validated canonical context.
 2. Planning Master produces one bounded action and the core rejects stale/illegal/out-of-policy decisions.
 3. A KerbsFlow-owned worktree is created from an exact base without modifying the original checkout.
-4. Codex and OpenCode adapters probe capabilities, run one task, stream normalized progress, validate a structured result, cancel, and classify terminal failures.
+4. Codex and OpenCode adapters probe capabilities, run one task, stream normalized progress, validate a structured result, cancel, and classify terminal failures. OpenCode probing exposes only supported native model implementations and rejects unsupported implementation classes before dispatch, including direct host calls; absence of an eligible model follows the existing fallback/gate policy.
 5. Exactly one implementation executor can be active.
-6. Independent diff/scope/invariant and focused validation occur before review can pass.
+6. Independent diff/scope/invariant and focused validation occur before review can pass, including provider implementation-class enforcement when affected.
 7. Review can deterministically continue, rework, escalate, gate, close a phase, or begin final verification.
 8. Human gates contain evidence/options/consequences and cannot be bypassed by model output.
 9. Crash/restart never silently duplicates an ambiguous attempt and preserves enough state to reconcile or gate.
 10. Pause/resume/cancel are observable, idempotent, and do not auto-delete dirty work.
 11. Current run state is available headlessly and through a secured thin local UI.
-12. No success is declared from exit code alone or through weakened validation.
+12. No success is declared from exit code alone or through weakened validation; a provider support reduction cannot replace enforcement evidence or weaken required supported flows.
 13. Secrets/credentials are tool-owned by default and absent from SQLite, committed files, logs, and public fixtures.
 14. Push/merge/tag/release/deploy/production remain human-controlled and unimplemented as automatic actions.
-15. Full deterministic v0.1 validation passes on the officially supported macOS host with evidence classifications intact.
+15. Full deterministic v0.1 validation passes on the officially supported macOS host with evidence classifications intact, including native-provider positive controls and excluded-implementation pre-dispatch negative controls.
 
 ## 22. Phase 0 acceptance
 

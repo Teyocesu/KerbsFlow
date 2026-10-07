@@ -249,7 +249,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       ready: enabled.length > 0,
       providers: providers.data.map(safeProviderMetadata),
       models: enabled.map(safeModelMetadata),
-      reason: enabled.length > 0 ? "OpenCode reports at least one enabled provider model" : "OpenCode reports no enabled provider model",
+      reason: enabled.length > 0 ? "OpenCode reports at least one enabled native provider model" : "OpenCode reports no enabled native provider model; legacy and arbitrary provider implementations are unsupported in v0.1",
     };
   }
 
@@ -592,7 +592,7 @@ export class OpenCodeAdapter implements ExecutorAdapter {
       && (model.id === requestedModel || model.modelID === requestedModel || model.name === requestedModel),
     );
     if (matches.length !== 1) {
-      throw new KerbsFlowError("OPENCODE_MODEL_UNAVAILABLE", `requested OpenCode model ${requested} did not resolve uniquely among enabled provider models`);
+      throw new KerbsFlowError("OPENCODE_MODEL_UNAVAILABLE", `requested OpenCode model ${requested} did not resolve uniquely among supported native provider models`);
     }
     const model = matches[0]!;
     const variant = reasoning === undefined ? undefined : model.variants.find((candidate) => candidate.id === reasoning)?.id;

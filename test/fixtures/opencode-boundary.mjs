@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { registerHooks, syncBuiltinESMExports } from 'node:module';
 import net from 'node:net';
 import childProcess from 'node:child_process';
-import { Effect } from 'effect';
+import { Effect, Scope, Exit } from 'effect';
 
 async function main() {
   process.umask(0o077);
@@ -21,7 +21,7 @@ async function main() {
   let inferenceMode = 'complete';
   let inferenceStarted;
   let inferenceCancelled = 0;
-  const observed = { listeners: 0, clients: 0, children: 0, inference: 0, acquired: 0, released: 0, streamScopeReleased: 0 };
+  const observed = { listeners: 0, clients: 0, children: 0, inference: 0, acquired: 0, released: 0, streamScopeReleased: 0, npmCalls: 0, pacoteLoads: 0, pacoteCalls: 0, fetchLoads: 0, fetchCalls: 0, cacheLoads: 0, cacheConstructs: 0, legacyHandlers: 0, externalModules: 0 };
   const originalListen = net.Server.prototype.listen;
   net.Server.prototype.listen = function (...args) { observed.listeners++; return originalListen.apply(this, args); };
   const originalSpawn = childProcess.spawn;
@@ -50,6 +50,19 @@ async function main() {
     }), { headers: { 'content-type': 'application/json' } });
     if (url.startsWith('https://inference.synthetic.invalid/')) {
       observed.inference++;
+      if (mode === 'provider-runtime:cohere' || mode === 'provider-runtime:perplexity') return new Response(JSON.stringify({ message: 'SYNTHETIC error' }), { status: 400, headers: { 'content-type': 'application/json' } });
+      if (mode === 'provider-runtime:muse') {
+        assert.equal(new Headers(init?.headers ?? input?.headers).get('authorization'), 'Bearer SYNTHETIC-NONSECRET-OPENCODE');
+        const item = { id: 'synthetic-message', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Synthetic Muse response', annotations: [] }] };
+        const events = [
+          { type: 'response.created', response: { id: 'synthetic-response', status: 'in_progress' } },
+          { type: 'response.output_item.added', output_index: 0, item: { ...item, status: 'in_progress', content: [] } },
+          { type: 'response.output_text.delta', item_id: item.id, output_index: 0, content_index: 0, delta: 'Synthetic Muse response' },
+          { type: 'response.output_item.done', output_index: 0, item },
+          { type: 'response.completed', response: { id: 'synthetic-response', status: 'completed', output: [item], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } } },
+        ];
+        return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+      }
       if (inferenceMode === 'pending') {
         inferenceStarted();
         return new Response(new ReadableStream({ cancel() { inferenceCancelled++; } }), { headers: { 'content-type': 'text/event-stream' } });
@@ -63,7 +76,8 @@ async function main() {
     throw new Error('Synthetic fixture denies external network');
   };
 
-  if (mode === 'provision') {
+  if (mode === 'provider-runtime:inherited') wellKnownConfig.providers['wellknown-legacy'] = { ...customProvider('wellknown-legacy')['wellknown-legacy'], package: 'aisdk:@ai-sdk/cohere' };
+  if (mode === 'provision' || mode === 'provider-runtime:inherited') {
     const { OpenCode } = await import('@opencode/sdk');
     const host = await OpenCode.create({ database: { path: database }, models: { fetch: false }, config: { directory: join(root, 'owned-config'), project: false, content: '{}' }, fs: { filewatcher: false } });
     try {
@@ -80,8 +94,7 @@ async function main() {
       }
       assert.equal(status.data.status, 'complete');
     } finally { await host.close(); }
-    console.log(JSON.stringify({ provisioned: true, synthetic: true }));
-    return;
+    if (mode === 'provision') { console.log(JSON.stringify({ provisioned: true, synthetic: true })); return; }
   }
 
   const driftMode = mode.startsWith('drift:') ? mode.slice(6) : undefined;
@@ -93,6 +106,7 @@ async function main() {
     resolve(specifier, context, next) {
       if (driftMode === 'effect' && specifier === 'effect' && context.parentURL?.endsWith('/dist/src/opencode-compat.js')) return { url: 'kerbsflow:missing-effect', shortCircuit: true };
       if (specifier === '@opencode/sdk/effect' && context.parentURL !== 'kerbsflow:observe-sdk') return { url: 'kerbsflow:observe-sdk', shortCircuit: true };
+      for (const name of ['model', 'model-resolver']) if (specifier === `@opencode/core/${name}` && context.parentURL !== `kerbsflow:observe-${name}`) return { url: `kerbsflow:observe-${name}`, shortCircuit: true };
       if (specifier === '@modelcontextprotocol/client' && context.parentURL !== 'kerbsflow:observe-mcp') return { url: 'kerbsflow:observe-mcp', shortCircuit: true };
       if (driftMode === 'source' && specifier === '@opencode/core/config/plugin/source') return { url: 'kerbsflow:missing-source', shortCircuit: true };
       if (driftMode === 'mcp' && specifier === '@opencode/core/config/plugin/mcp') return { url: 'kerbsflow:missing-mcp', shortCircuit: true };
@@ -102,6 +116,20 @@ async function main() {
       if (url === 'kerbsflow:missing-effect') return { format: 'module', source: "export { Effect, Context, Scope, Stream, Exit, Cause, Pull } from 'effect';", shortCircuit: true };
       if (url === 'kerbsflow:missing-source') return { format: 'module', source: 'export const ConfigPluginSource = { node: {} };', shortCircuit: true };
       if (url === 'kerbsflow:missing-mcp') return { format: 'module', source: 'export const ConfigMcpPlugin = { Plugin: {} };', shortCircuit: true };
+      if (url === 'kerbsflow:observe-model' || url === 'kerbsflow:observe-model-resolver') {
+        const name = url.slice('kerbsflow:observe-'.length);
+        return { format: 'module', shortCircuit: true, source: `
+          export * from '@opencode/core/${name}';
+          import { node as original, Service } from '@opencode/core/${name}';
+          import { Context, Effect, Layer } from 'effect';
+          export const node = {
+            replace: replacement => original.replace(replacement),
+            mapLayer: decorate => original.mapLayer(layer => Layer.tap(decorate(layer), context => Effect.sync(() => {
+              globalThis.__opencodeObservation[${JSON.stringify(name)}] = Context.get(context, Service);
+            }))),
+          };
+        ` };
+      }
       if (url === 'kerbsflow:observe-mcp') return { format: 'module', shortCircuit: true, source: `
         export * from '@modelcontextprotocol/client';
         import { Client as Original } from '@modelcontextprotocol/client';
@@ -136,7 +164,35 @@ async function main() {
           }));
         } };
       ` };
-      return next(url, context);
+      const loaded = next(url, context);
+      let source = String(loaded.source);
+      if (/\/@ai-sdk\/provider-utils\/dist\/index\.(mjs|js)$/.test(url)) source = source.replaceAll('const responseBody = await response.text();', 'globalThis.__opencodeObservation.observed.legacyHandlers++; const responseBody = await response.text();');
+      if (url === pathToFileURL(join(root, 'arbitrary-provider.mjs')).href) source = 'globalThis.__opencodeObservation.observed.externalModules++;' + source;
+      if (url.endsWith('/@opencode/util/dist/npm.js')) {
+        for (const name of ['add', 'resolve', 'check', 'update', 'which']) {
+          const start = source.indexOf(`const ${name} = Effect.fn("Npm.${name}")(function* (`);
+          assert.ok(start >= 0, `missing pinned Npm.${name} observer point`);
+          const brace = source.indexOf('{', start);
+          source = source.slice(0, brace + 1) + 'globalThis.__opencodeObservation.observed.npmCalls++;' + source.slice(brace + 1);
+        }
+      }
+      if (url.endsWith('/pacote/lib/index.js')) {
+        source = 'globalThis.__opencodeObservation.observed.pacoteLoads++;' + source;
+        source += `; for (const key of ['resolve', 'extract', 'manifest', 'packument']) {
+          const original = module.exports[key];
+          module.exports[key] = (...args) => { globalThis.__opencodeObservation.observed.pacoteCalls++; return original(...args); };
+        }`;
+      }
+      if (url.endsWith('/make-fetch-happen/lib/index.js')) {
+        source = 'globalThis.__opencodeObservation.observed.fetchLoads++;' + source;
+        assert.ok(source.includes('const makeFetchHappen = (url, opts) => {'), 'missing pinned fetch observer point');
+        source = source.replace('const makeFetchHappen = (url, opts) => {', 'const makeFetchHappen = (url, opts) => { globalThis.__opencodeObservation.observed.fetchCalls++;');
+      }
+      if (url.endsWith('/http-cache-semantics/index.js')) {
+        source = 'globalThis.__opencodeObservation.observed.cacheLoads++;' + source;
+        source += '; module.exports = new Proxy(module.exports, { construct(target, args) { globalThis.__opencodeObservation.observed.cacheConstructs++; return Reflect.construct(target, args); } });';
+      }
+      return source === String(loaded.source) ? loaded : { ...loaded, source };
     },
   });
 
@@ -144,6 +200,130 @@ async function main() {
   const { OpenCodeAdapter, openCodeHostConfiguration, OPENCODE_EXECUTOR_PERMISSIONS, OPENCODE_AGENT } = await import('../../dist/src/opencode.js');
   const hostOptions = { app: { name: 'kerbsflow-fixture', version: '2.0.13' }, database: { path: database }, events: { persist: true }, config: { project: false, content: JSON.stringify({ ...openCodeHostConfiguration(), ...(mode === 'lifecycle' ? { providers: customProvider('synthetic') } : {}), models: { fetch: false } }) }, fs: { filewatcher: false } };
   const effectCall = (group, name, input) => Effect.runPromise(globalThis.__opencodeObservation.host[group][name](input));
+
+  if (mode.startsWith('provider-runtime:')) {
+    const kind = mode.slice('provider-runtime:'.length);
+    const providers = customProvider('synthetic');
+    if (kind === 'muse') providers.opencode = { activation: 'enabled', settings: { baseURL: 'https://inference.synthetic.invalid/v1' } };
+    const selectedRef = kind === 'muse' ? { providerID: 'opencode', id: 'muse-spark-1.3-contributor-free' } : { providerID: 'synthetic', id: 'fixture' };
+    if (kind === 'inherited') {
+      providers.synthetic.package = 'aisdk:@ai-sdk/cohere';
+      const hostile = name => ({ ...customProvider(name)[name], package: 'aisdk:@ai-sdk/cohere' });
+      writeFileSync(join(configDir, 'opencode.json'), JSON.stringify({ providers: { 'global-legacy': hostile('global-legacy') } }));
+      writeFileSync(join(worktree, 'opencode.json'), JSON.stringify({ providers: { 'project-legacy': hostile('project-legacy') } }));
+      wellKnownConfig.providers['wellknown-legacy'] = hostile('wellknown-legacy');
+    }
+    if (kind === 'cohere' || kind === 'perplexity') providers.synthetic.package = `aisdk:@ai-sdk/${kind}`;
+    if (kind.startsWith('legacy:')) providers.synthetic.package = `aisdk:${kind.slice(7)}`;
+    if (kind === 'installed') providers.synthetic.package = '@ai-sdk/cohere';
+    if (kind === 'git') providers.synthetic.package = 'aisdk:git+https://git.synthetic.invalid/provider.git';
+    if (kind === 'unknown') providers.synthetic.package = '@opencode/ai/providers/openai-options';
+    if (kind === 'file') {
+      const file = join(root, 'arbitrary-provider.mjs');
+      writeFileSync(file, 'throw new Error("Arbitrary synthetic module executed"); export function model() {}');
+      providers.synthetic.package = pathToFileURL(file).href;
+    }
+    if (kind === 'custom') providers.synthetic.package = '@kerbsflow/synthetic-uninstalled-provider';
+    if (kind === 'model') providers.synthetic.models.fixture.package = '@kerbsflow/synthetic-uninstalled-model';
+    if (kind === 'catalog') {
+      const file = join(root, 'hostile-models.json');
+      writeFileSync(file, JSON.stringify({ synthetic: {
+        id: 'synthetic', name: 'Synthetic catalog', env: [], npm: '@kerbsflow/synthetic-uninstalled-catalog',
+        models: { fixture: { id: 'fixture', name: 'Synthetic model', tool_call: true, modalities: { input: ['text'], output: ['text'] }, limit: { context: 1000000, output: 1024 } } },
+      } }));
+      hostOptions.models = { file, fetch: false };
+      delete providers.synthetic.package;
+    }
+    hostOptions.config.content = JSON.stringify({ ...openCodeHostConfiguration(), models: { fetch: false }, providers });
+    const host = await createOpenCodeHost(hostOptions);
+    let result;
+    const mutationScope = Effect.runSync(Scope.make());
+    try {
+      await effectCall('integration', 'list', { location });
+      if (kind === 'changed') {
+        assert.ok((await host.model.list({ location })).data.some(model => model.providerID === 'synthetic' && model.id === 'fixture'));
+        await Effect.runPromise(Effect.provideService(globalThis.__opencodeObservation.model.transform(editor => editor.update('synthetic', 'fixture', model => { model.package = 'aisdk:@ai-sdk/cohere'; })), Scope.Scope, mutationScope));
+        providers.synthetic.package = 'aisdk:@ai-sdk/cohere';
+      }
+      if (kind === 'muse') {
+        await Effect.runPromise(globalThis.__opencodeObservation.host.integration.connect.key({ integrationID: 'opencode', key: 'SYNTHETIC-NONSECRET-OPENCODE', location }));
+        const integration = await effectCall('integration', 'get', { integrationID: 'opencode', location });
+        assert.ok(integration.data.connections.some(connection => connection.type === 'credential' && connection.method === 'key'));
+      }
+      const providerList = await host.provider.list({ location });
+      const modelList = await host.model.list({ location });
+      const effectiveModels = await Effect.runPromise(globalThis.__opencodeObservation.model.all());
+      if (kind === 'inherited') {
+        assert.ok(providerList.data.some(provider => provider.id === 'global-legacy'));
+        assert.ok(providerList.data.some(provider => provider.id === 'wellknown-legacy'));
+        assert.ok(!modelList.data.some(model => ['global-legacy', 'wellknown-legacy', 'project-legacy'].includes(model.providerID)));
+        const resolver = globalThis.__opencodeObservation['model-resolver'];
+        for (const providerID of ['global-legacy', 'wellknown-legacy']) await assert.rejects(Effect.runPromise(resolver.resolve({ providerID, id: 'fixture' })), { code: 'OPENCODE_PROVIDER_RUNTIME_UNSUPPORTED' });
+        assert.equal(await Effect.runPromise(resolver.resolve({ providerID: 'project-legacy', id: 'fixture' })), undefined);
+      }
+      if (kind !== 'normal' && kind !== 'muse') {
+        const resolver = globalThis.__opencodeObservation['model-resolver'];
+        assert.ok(resolver, 'actual protected public resolver was observed');
+        const selected = { ...providers.synthetic.models.fixture, id: 'fixture', providerID: 'synthetic', package: providers.synthetic.package ?? '@kerbsflow/synthetic-uninstalled-catalog' };
+        if (kind === 'model') selected.package = providers.synthetic.models.fixture.package;
+        if (kind === 'changed') {
+          const mutable = { ...selected, package: '@opencode/ai/providers/openai-compatible' };
+          const deferred = resolver.resolveModel(mutable);
+          mutable.package = 'aisdk:@ai-sdk/cohere';
+          await assert.rejects(Effect.runPromise(deferred), { code: 'OPENCODE_PROVIDER_RUNTIME_UNSUPPORTED' });
+        }
+        await assert.rejects(Effect.runPromise(resolver.resolveModel(selected)), { code: 'OPENCODE_PROVIDER_RUNTIME_UNSUPPORTED' });
+        await assert.rejects(Effect.runPromise(resolver.resolve({ providerID: 'synthetic', id: 'fixture' })), { code: 'OPENCODE_PROVIDER_RUNTIME_UNSUPPORTED' });
+      }
+      const session = await host.sessions.create({ title: 'runtime-install boundary', agent: OPENCODE_AGENT, location, model: selectedRef, metadata: {}, permissions: OPENCODE_EXECUTOR_PERMISSIONS });
+      await host.sessions.prompt({ sessionID: session.id, text: 'Return one synthetic response' });
+      await host.sessions.wait({ sessionID: session.id });
+      const snapshot = await host.sessions.get({ sessionID: session.id });
+      const events = await Array.fromAsync(host.sessions.log({ sessionID: session.id, follow: false }));
+      result = { mode, providerIDs: providerList.data.map(item => item.id), modelIDs: modelList.data.map(item => item.id), outcome: snapshot.outcome, implementations: effectiveModels.map(({providerID,id,package:implementation}) => ({providerID,id,implementation})), events };
+      if (kind === 'normal' || kind === 'muse') {
+        assert.equal(snapshot.outcome, 'succeeded', JSON.stringify(events.filter(event => event.data?.error).map(event => event.data.error)));
+        assert.ok(providerList.data.some(item => item.id === 'opencode'));
+        assert.ok(modelList.data.some(item => item.id === 'muse-spark-1.3-contributor-free'));
+        assert.equal(observed.inference, 1);
+        assert.ok(effectiveModels.find(model => model.providerID === selectedRef.providerID && model.id === selectedRef.id)?.package.startsWith('@opencode/ai/providers/'));
+      } else {
+        assert.equal(snapshot.outcome, 'failed');
+        const failure = events.find(event => event.type === 'session.execution.failed');
+        assert.equal(failure?.data.error.type, 'provider.no-route');
+        assert.equal(failure?.data.error.message, 'Model unavailable: synthetic/fixture');
+        assert.ok(!modelList.data.some(item => item.providerID === 'synthetic' && item.id === 'fixture'));
+        assert.equal(observed.inference, 0);
+      }
+      if (kind === 'cohere') {
+        const input = { title: 'direct generated API', agent: OPENCODE_AGENT, location, model: selectedRef, metadata: {}, permissions: OPENCODE_EXECUTOR_PERMISSIONS };
+        const direct = await effectCall('session', 'create', input);
+        await effectCall('session', 'prompt', { sessionID: direct.id, text: 'Reject this unsupported model' });
+        await host.sessions.wait({ sessionID: direct.id });
+        assert.equal((await host.sessions.get({ sessionID: direct.id })).outcome, 'failed');
+        const { RoutingDiscovery, PolicyRouter } = await import('../../dist/src/routing.js');
+        const { createPhase2PlanningDecision } = await import('../../dist/src/planning.js');
+        const adapter = new OpenCodeAdapter({ runtimeRoot: join(root, 'routing-runtime'), createHost: async () => host });
+        const codex = { probe: () => ({ schemaVersion: 'kerbsflow.adapter-descriptor/v1', adapter: 'codex', provider: 'openai', adapterVersion: 'synthetic', capabilities: { eventTransport: 'jsonl', finalJsonSchema: true, modelSelection: true, reasoningEffort: ['max'], agentSelection: false, filesystemEnforcement: 'enforced', network: { providerControlPlane: 'provider_owned', workload: 'enforced' }, cancellation: 'process_only', resumableSession: true, authentication: { owner: 'provider', mode: 'synthetic' }, healthProbe: true } }) };
+        const planningDecision = createPhase2PlanningDecision({ decisionId: 'decision_native_scope', runId: 'run_native_scope', taskId: 'task_native_scope', objective: 'synthetic native scope route', acceptance: ['unsupported route cannot execute'], positiveScope: ['src/example.ts'], negativeScope: ['secrets'], model: 'placeholder', canonicalContext: 'synthetic native scope' });
+        const models = [{ adapter: 'opencode', provider: 'synthetic', model: 'synthetic/fixture', family: 'muse' }, { adapter: 'codex', provider: 'openai', model: 'openai/luna-synthetic', family: 'luna', reasoning: 'max' }];
+        const registered = [{ adapter: 'opencode', implementation: adapter }, { adapter: 'codex', implementation: codex }];
+        const discovery = await new RoutingDiscovery(registered).discover({ workingDirectory: worktree, models });
+        const routed = new PolicyRouter().route({ planningDecision, classification: 'normal', discovery });
+        assert.equal(routed.planningDecision.route.adapter, 'codex');
+        assert.match(routed.routingDecision.fallbackReason, /not discovered/i);
+        const unavailable = await new RoutingDiscovery(registered.slice(0, 1)).discover({ workingDirectory: worktree, models });
+        assert.throws(() => new PolicyRouter().route({ planningDecision, classification: 'normal', discovery: unavailable }), /no Phase 4 route/i);
+        result.routing = { selected: routed.planningDecision.route, unavailable: 'gate', codex: 'synthetic descriptor only; no execution' };
+        await adapter.close();
+      }
+      assert.equal(existsSync(join(root, 'cache/opencode/npm')), false);
+    } finally { await Effect.runPromise(Scope.close(mutationScope, Exit.void)); await host.close(); }
+    for (const key of ['npmCalls', 'pacoteLoads', 'pacoteCalls', 'fetchLoads', 'fetchCalls', 'cacheLoads', 'cacheConstructs', 'clients', 'listeners', 'legacyHandlers', 'externalModules']) assert.equal(observed[key], 0, key);
+    assert.equal(observed.released, 1);
+    console.log(JSON.stringify({ ...result, ...observed }));
+    return;
+  }
 
   if (mode === 'failed-create' || mode === 'stalled-close' || mode === 'failed-stream-close' || mode === 'failed-normal-stream-finalizer' || driftMode) {
     if (mode === 'failed-stream-close') {

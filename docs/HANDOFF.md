@@ -1,5 +1,5 @@
 # KerbsFlow handoff
 
-- Phase 7 OPEN; Phase 7D NOT PASSED. 7D.10E fixes mixed Pull Done + finalizer failure with pinned `Pull.filterDone`; PLAN §7D.10E, typecheck/build PASS, OpenCode focused 60/60, full tests 513/513.
-- Independent 7D.10D review found one P1; independent re-review pending. `http-cache-semantics` HIGH R5 and provider-runtime advisory scope remain separate/open. No live provider claim, risk acceptance, ReleaseEvidenceDossier, HUMAN_RELEASE_GATE or full 7D gate.
-- Exact next action: independent focused re-review of published 7D.10E; then separately resolve remaining advisory scope before any authorized new full Phase 7D gate. No release action.
+- Phase 7 OPEN; 7D NOT PASSED; 7D.10C/E/F CLOSED / ACCEPTED. Combined 7D.12 native-only + 7D.14 test-only causal waits locally validated: harness 163/163, security 73/73, twelve legacy, three exact canonical 528/528; production budgets/runner unchanged. Candidate branch `phase7/v0.1-release-gate`; exact published identity from `git rev-parse HEAD` and remote.
+- Pending: independent exact-candidate review; audit six roots / 31 nodes, no risk acceptance. Historical incident is HOST-RESOURCE-CORRELATED / FULL ATTRIBUTION UNAVAILABLE, not proven common ENOSPC causation. Details: PLAN §§7D.12–14; private evidence `/Users/juanvanore/.codex/evidence/kerbsflow-phase7d14-20261007-t_s8zi5h/`.
+- Exact next action after authorized commit/push: independent focused review of published native-only boundary/twelve exclusions, advisories, causal waits/original errors/watchdog, incident/resource evidence, anti-greenwashing and remote identity. Only after PASS accept the remediation set and authorize ONE NEW full 7D gate.

@@ -11,6 +11,7 @@ import { GitWorktreeManager } from "../src/git.js";
 import { createPhase2PlanningDecision } from "../src/planning.js";
 import { createPhase6CStack, deferred, waitFor, type Phase6CStack } from "./phase6c-harness.js";
 import { git } from "./phase2-helpers.js";
+import { awaitDrive, ownedDrive } from "./drive-helpers.js";
 
 interface HttpResponse {
   status: number;
@@ -99,7 +100,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const resumed = await post(stack.api, token, `/v1/runs/${runId}/resume`, envelope("command_6c_resume", "idem_6c_resume", paused.run.stateVersion, {}));
       assert.equal(resumed.status, 200);
       assert.equal(json(resumed).to, "VERIFY_FOCUSED");
-      await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "same Phase2 drive to complete focused and phase verification");
+      await awaitDrive(ownedDrive(stack.coordinator, runId));
+      assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
       assert.equal(stack.adapter.requests.length, 1, "resume must continue the existing drive without replaying execution");
       assert.equal((await snapshot(stack.api, token, runId)).pendingSteer, null);
       const instructionId = String(pending.pendingSteer?.instructionId);
@@ -271,7 +273,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.equal(stack.planningInputs.rework.length, 1);
 
       stack.adapter.finishNext("succeeded");
-      await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "same drive completes after one bounded REWORK attempt");
+      await awaitDrive(ownedDrive(stack.coordinator, runId));
+      assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
       assert.equal(stack.adapter.requests.length, 2, "the resolution creates exactly one next attempt");
     } finally {
       hold.release();
@@ -323,7 +326,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
         const nextRequest = await waitFor(() => stack.adapter.requests[1], `next Start drive after ${target}`);
         assert.equal(nextRequest.runId, nextRunId);
         stack.adapter.finishNext("succeeded");
-        await waitFor(() => stack.store.getRun(nextRunId)?.state === "NEXT_PHASE" ? true : undefined, `next Start completes after ${target}`);
+        await awaitDrive(ownedDrive(stack.coordinator, nextRunId));
+        assert.equal(stack.store.getRun(nextRunId)?.state, "NEXT_PHASE");
       } finally {
         hold.release();
         await stack.close();
@@ -417,7 +421,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const nextRequest = await waitFor(() => stack.adapter.requests[0], "the next run reaches its executor after worktree setup failure");
       assert.equal(nextRequest.runId, nextRunId);
       stack.adapter.finishNext("succeeded");
-      await waitFor(() => stack.store.getRun(nextRunId)?.state === "HUMAN_GATE" ? true : undefined, "next run reaches its default phase validation gate after worktree setup failure");
+      await awaitDrive(ownedDrive(stack.coordinator, nextRunId));
+      assert.equal(stack.store.getRun(nextRunId)?.state, "HUMAN_GATE");
     } finally {
       await stack.close();
     }
@@ -441,7 +446,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
         assert.equal(start.status, 200);
         assert.equal(json(start).to, "INTAKE");
 
-        await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "durable Human Gate after post-intent worktree failure");
+        await awaitDrive(ownedDrive(stack.coordinator, runId));
+        assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
         const pending = await snapshot(stack.api, token, runId);
         assert.equal(pending.run.state, "HUMAN_GATE");
         assert.equal(pending.currentGate?.status, "open");
@@ -571,11 +577,13 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       const nextStart = await post(stack.api, restartedToken, "/v1/runs", envelope("command_restart_next_start", "idem_restart_next_start", 0, { runId: nextRunId, objective: "claim the released coordinator slot" }));
       assert.equal(nextStart.status, 200);
       assert.equal(json(nextStart).to, "INTAKE");
-      const reservation = (stack.coordinator as unknown as { reservation?: { driveError?: unknown; driveSettled: boolean } }).reservation;
+      const reservation = ownedDrive(stack.coordinator, nextRunId) as ReturnType<typeof ownedDrive> & { driveSettled: boolean };
       await waitFor(() => stack.adapter.requests.length === 2 || reservation?.driveSettled ? true : undefined, "next Start drive after restart gate resolution");
+      if (reservation.driveSettled) await awaitDrive(reservation);
       assert.equal(stack.adapter.requests.length, 2, `the next drive must reach its executor: ${String(reservation?.driveError)}; state=${stack.store.getRun(nextRunId)?.state}`);
       stack.adapter.finishNext("succeeded");
-      await waitFor(() => stack.store.getRun(nextRunId)?.state === "NEXT_PHASE" ? true : undefined, "next run completes through its owned drive");
+      await awaitDrive(ownedDrive(stack.coordinator, nextRunId));
+      assert.equal(stack.store.getRun(nextRunId)?.state, "NEXT_PHASE");
     } finally {
       await stack.close();
     }
@@ -592,7 +600,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
         assert.equal((await post(stack.api, token, "/v1/runs", envelope(`command_missing_start_${target}`, `idem_missing_start_${target}`, 0, { runId, objective: "complete synthetic work without a trusted phase check" }))).status, 200);
         const handle = await stack.adapter.started.promise;
         stack.adapter.finish(handle, "succeeded");
-        await waitFor(() => stack.store.getRun(runId)?.state === "HUMAN_GATE" ? true : undefined, "missing phase validation gate");
+        await awaitDrive(ownedDrive(stack.coordinator, runId));
+        assert.equal(stack.store.getRun(runId)?.state, "HUMAN_GATE");
         const before = await snapshot(stack.api, token, runId);
         const gate = before.currentGate;
         assert.ok(gate);
@@ -662,7 +671,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.equal(stack.store.getRun(nextRun)?.stateVersion, nextVersion, "old replay cannot wake or mutate the next drive");
 
       stack.adapter.finishNext("succeeded");
-      await waitFor(() => stack.store.getRun(nextRun)?.state === "NEXT_PHASE" ? true : undefined, "the next Start's one owned drive");
+      await awaitDrive(ownedDrive(stack.coordinator, nextRun));
+      assert.equal(stack.store.getRun(nextRun)?.state, "NEXT_PHASE");
       assert.equal(stack.planningInputs.initial.length, 2);
       assert.equal(stack.adapter.requests.length, 2, "old gate replay must not install or duplicate a drive");
     } finally {
@@ -740,7 +750,8 @@ test("Phase 6C controls run through LocalApiServer, RunCoordinator, Phase2Loop a
       assert.equal(stack.store.countTaskAttempts(runId, firstHandle.taskId), 2, "gate resolution starts exactly one bounded next attempt");
 
       stack.adapter.finishNext("succeeded");
-      await waitFor(() => stack.store.getRun(runId)?.state === "NEXT_PHASE" ? true : undefined, "focused and phase verification after REWORK");
+      await awaitDrive(ownedDrive(stack.coordinator, runId));
+      assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
       const transitions = stack.store.listTransitions(runId);
       assert.equal(transitions.filter((transition) => transition.reasonCode === "intake_validated").length, 1);
       assert.ok(transitions.some((transition) => transition.to === "VERIFY_FOCUSED"));

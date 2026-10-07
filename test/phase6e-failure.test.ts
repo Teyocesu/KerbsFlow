@@ -12,6 +12,9 @@ import { Phase2DriveControlStop, RunCoordinator } from "../src/run-coordinator.j
 import { PHASE4_ROUTING_POLICY } from "../src/routing.js";
 import { createPhase6CStack, deferred, waitFor, type Phase6CStack } from "./phase6c-harness.js";
 import { git } from "./phase2-helpers.js";
+import { awaitDrive, DRIVE_SETTLEMENT_WATCHDOG_MS, ownedDrive, type OwnedDrive } from "./drive-helpers.js";
+import type { ProcessResult } from "../src/process.js";
+import type { VerificationCommandSandbox } from "../src/verification-sandbox.js";
 
 async function client(stack: Phase6CStack) {
   await stack.api.start();
@@ -44,14 +47,58 @@ async function client(stack: Phase6CStack) {
   };
 }
 
-async function nextRunStarts(stack: Phase6CStack, api: Awaited<ReturnType<typeof client>>, runId: string) {
+async function nextRunStarts(stack: Phase6CStack, api: Awaited<ReturnType<typeof client>>, runId: string, signal?: AbortSignal) {
   assert.equal(stack.coordinator.activeRunId, undefined);
   assert.equal((await api.post("/v1/runs", 0, { runId, objective: "start after the previous drive failed safely" })).status, 200);
   const handle = await stack.adapter.started.promise;
   assert.equal(handle.runId, runId);
+  const drive = ownedDrive(stack.coordinator, asRunId(runId));
   stack.adapter.finish(handle, "succeeded");
-  await waitFor(() => stack.store.getRun(asRunId(runId))?.state === "NEXT_PHASE" ? true : undefined, "next run completes through its own drive");
+  await awaitDrive(drive, signal);
+  assert.equal(stack.store.getRun(asRunId(runId))?.state, "NEXT_PHASE");
 }
+
+test("owned drive completion permits two real checks within their individual budgets", { timeout: DRIVE_SETTLEMENT_WATCHDOG_MS }, async (t) => {
+  const stack = createPhase6CStack({ phaseCheck: true, checkWorkMs: 2_700 });
+  const runId = asRunId("run_two_check_budgets");
+  const checks: Array<{ state: string | undefined; timeoutMs: number; result: ProcessResult }> = [];
+  const sandbox = (stack.phase2 as unknown as { verifier: { sandbox: VerificationCommandSandbox } }).verifier.sandbox;
+  const run = sandbox.run.bind(sandbox);
+  sandbox.run = async (command, worktree) => {
+    const state = stack.store.getRun(runId)?.state;
+    const result = await run(command, worktree);
+    checks.push({ state, timeoutMs: command.timeoutMs, result: result.result });
+    return result;
+  };
+  let drive: OwnedDrive | undefined;
+  const start = stack.coordinator.start.bind(stack.coordinator);
+  stack.coordinator.start = request => {
+    const result = start(request);
+    drive = ownedDrive(stack.coordinator, runId);
+    return result;
+  };
+  try {
+    const api = await client(stack);
+    const started = performance.now();
+    await nextRunStarts(stack, api, runId, t.signal);
+    const combinedMs = performance.now() - started;
+    assert.ok(combinedMs > 5_000, "the completed drive exceeds the obsolete aggregate poll budget");
+    assert.deepEqual(checks.map(check => check.state), ["VERIFY_FOCUSED", "VERIFY_PHASE"]);
+    for (const check of checks) {
+      assert.equal(check.timeoutMs, 5_000);
+      const elapsed = Date.parse(check.result.endedAt) - Date.parse(check.result.identity.startedAt);
+      assert.ok(elapsed >= 2_700 && elapsed < 5_000, `real check duration ${elapsed} ms stays within its own budget`);
+      assert.equal(check.result.exitKind, "normal");
+      assert.equal(check.result.exitCode, 0);
+      assert.ok(check.result.stdout.split(/\r?\n/u).includes("KERBSFLOW_CHECK_PASSED"));
+    }
+    assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
+    t.diagnostic(JSON.stringify({ combinedMs, checks: checks.map(check => ({ state: check.state, timeoutMs: check.timeoutMs, elapsedMs: Date.parse(check.result.endedAt) - Date.parse(check.result.identity.startedAt), exitKind: check.result.exitKind, exitCode: check.result.exitCode })) }));
+  } finally {
+    await drive?.drivePromise;
+    await stack.close();
+  }
+});
 
 test("foreign or malformed cancellation proof cannot terminate or release the owned run", async () => {
   for (const proof of ["foreign", "malformed"] as const) {
@@ -318,7 +365,7 @@ for (const boundary of ["focused-sandbox", "phase-sandbox", "focused-policy"] as
 }
 
 for (const control of ["pause", "cancel"] as const) {
-  test(`READY dispatch yields to late ${control} from the production free checkpoint`, { timeout: 15_000 }, async () => {
+  test(`READY dispatch yields to late ${control} from the production free checkpoint`, { timeout: 15_000 }, async (t) => {
     const stack = createPhase6CStack({ phaseCheck: true });
     const runId = asRunId(`run_ready_late_${control}`);
     const claimed = deferred<void>();
@@ -362,14 +409,14 @@ for (const control of ["pause", "cancel"] as const) {
         assert.equal(stack.adapter.requests.length, 1);
         assert.equal(stack.planningInputs.initial.length, 1, "Resume must continue the existing plan");
         stack.adapter.finish(handle, "succeeded");
-        await reservation.drivePromise;
+        await awaitDrive(reservation, t.signal);
         assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
       } else {
         await reservation.drivePromise;
         assert.equal(stack.store.getRun(runId)?.state, "CANCELLED");
         assert.equal(stack.coordinator.activeRunId, undefined);
         const api = await client(stack);
-        await nextRunStarts(stack, api, "run_after_ready_cancel");
+        await nextRunStarts(stack, api, "run_after_ready_cancel", t.signal);
       }
     } finally {
       if (stack.store.getRun(runId)?.state === "PAUSED") {
@@ -389,7 +436,7 @@ for (const control of ["pause", "cancel"] as const) {
 
 
 for (const control of ["pause", "cancel"] as const) {
-  test(`execution dispatch owns preparation and handle persistence before later ${control}`, { timeout: 15_000 }, async () => {
+  test(`execution dispatch owns preparation and handle persistence before later ${control}`, { timeout: 15_000 }, async (t) => {
     const stack = createPhase6CStack({ phaseCheck: true });
     const runId = asRunId(`run_dispatch_first_${control}`);
     const begun = deferred<void>();
@@ -447,7 +494,7 @@ for (const control of ["pause", "cancel"] as const) {
         assert.equal(result.to, "PAUSED");
         assert.equal(stack.store.getRun(runId)?.pauseContract?.resumeTarget, "VERIFY_FOCUSED");
         await stack.coordinator.resume({ runId, commandId: asCommandId("command_dispatch_fresh_resume"), idempotencyKey: "dispatch:fresh:resume", expectedStateVersion: result.stateVersion });
-        await reservation.drivePromise;
+        await awaitDrive(reservation, t.signal);
         assert.equal(stack.store.getRun(runId)?.state, "NEXT_PHASE");
       } else {
         const result = await stack.coordinator.cancel({ ...fresh, reason: "Cancel now sees the active executor" });
@@ -694,8 +741,10 @@ for (const control of ["pause", "cancel"] as const) {
         assert.equal(stack.store.listTransitions(runId).some((transition) => transition.to === "FAILED"), false);
         assert.equal(stack.coordinator.activeRunId, runId);
         assert.equal((await api.post("/v1/runs", 0, { runId: `run_paused_competing_${control}`, objective: "Pause retains ownership" })).status, 409);
+        const drive = ownedDrive(stack.coordinator, runId);
         assert.equal((await api.post(`/v1/runs/${runId}/resume`, paused.stateVersion, {})).status, 200);
-        await waitFor(() => stack.store.getRun(runId)?.state === "FAILED" ? true : undefined, "failed planning disposition after Resume");
+        await awaitDrive(drive);
+        assert.equal(stack.store.getRun(runId)?.state, "FAILED");
       } else {
         assert.equal(result.body.to, "CANCELLED");
         assert.equal(stack.store.getRun(runId)?.state, "CANCELLED");
@@ -774,7 +823,7 @@ for (const control of ["pause", "cancel"] as const) {
 
 for (const boundary of ["setup", "planner"] as const) {
   for (const control of ["pause", "cancel"] as const) {
-    test(`${boundary} failure yields to late ${control} after a free checkpoint`, { timeout: 15_000 }, async () => {
+    test(`${boundary} failure yields to late ${control} after a free checkpoint`, { timeout: 15_000 }, async (t) => {
       const stack = createPhase6CStack({ phaseCheck: true });
       const runId = asRunId(`run_late_${boundary}_${control}`);
       const owned = join(stack.root, "runtime", "owned");
@@ -855,7 +904,7 @@ for (const boundary of ["setup", "planner"] as const) {
         assert.deepEqual(manager.snapshot(stack.repository.root), original);
         chmodSync(owned, 0o700);
         stack.planningMaster.planInitial = planInitial;
-        await nextRunStarts(stack, api, `run_after_late_${boundary}_${control}`);
+        await nextRunStarts(stack, api, `run_after_late_${boundary}_${control}`, t.signal);
       } finally {
         chmodSync(owned, 0o700);
         const run = stack.store.getRun(runId);
@@ -868,7 +917,7 @@ for (const boundary of ["setup", "planner"] as const) {
 }
 
 for (const resumeBeforeCancel of [false, true]) {
-  test(`Cancel retires a ${resumeBeforeCancel ? "resuming" : "paused"} failure-disposition boundary`, { timeout: 10_000 }, async () => {
+  test(`Cancel retires a ${resumeBeforeCancel ? "resuming" : "paused"} failure-disposition boundary`, { timeout: 10_000 }, async (t) => {
     const stack = createPhase6CStack({ phaseCheck: true });
     const runId = asRunId("run_paused_disposition_cancel");
     const started = deferred<void>();
@@ -913,7 +962,7 @@ for (const resumeBeforeCancel of [false, true]) {
       assert.equal(reservation.pauseClaim, undefined);
       assert.equal(reservation.failureDispositionClaim, undefined);
       assert.equal(stack.adapter.requests.length, 0);
-      await nextRunStarts(stack, api, "run_after_paused_disposition_cancel");
+      await nextRunStarts(stack, api, "run_after_paused_disposition_cancel", t.signal);
     } finally {
       release.resolve();
       await stack.close();
@@ -1005,8 +1054,7 @@ for (const boundary of ["result", "identity", "routing", "core"] as const) {
     };
     try {
       const reservation = startDrive(stack, runId);
-      await reservation.drivePromise;
-      assert.equal(reservation.driveError, undefined);
+      await awaitDrive(reservation);
       assert.deepEqual(stack.store.listTransitions(runId).map(t => t.to), ["INTAKE", "PLAN", "HUMAN_GATE"]);
       assert.equal(stack.core.readModel(runId)?.currentGate?.gate.reasonCode, boundary === "result" ? "drive_failure_unclassified" : "drive_trust_violation");
       assert.equal(stack.store.getRun(runId)?.currentTaskId, null);
@@ -1074,8 +1122,7 @@ test("unexpected setup programmer error fails durably without claiming ordinary 
   manager.create = () => { throw error; };
   try {
     const reservation = startDrive(stack, runId);
-    await reservation.drivePromise;
-    assert.equal(reservation.driveError, undefined);
+    await awaitDrive(reservation);
     assert.deepEqual(stack.store.listTransitions(runId).map(t => t.to), ["INTAKE", "PLAN", "FAILED"]);
     assert.equal(stack.store.listTransitions(runId).at(-1)?.reasonCode, "drive_operation_failed");
     assert.equal(stack.store.listTransitions(runId).some(t => t.reasonCode === "worktree_setup_failed"), false);

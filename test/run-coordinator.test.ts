@@ -27,6 +27,23 @@ import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { RunCoordinator, type CoordinatorCancelRequest, type CoordinatorControlRequest, type CoordinatorStartRequest, type TrustedLaunchProfile } from "../src/run-coordinator.js";
 import type { AdapterDescriptor, AttemptHandle, AttemptId, GateId, ReconcileOutcome, TaskId } from "../src/contracts.js";
 import { PolicyRouter, RoutedExecutorAdapter, RoutingDiscovery, createAttemptRoutingProvenance, type RouteModelPolicy } from "../src/routing.js";
+import { awaitDrive, ownedDrive } from "./drive-helpers.js";
+
+test("causal drive await preserves the original rejected drive error", { timeout: 5_000 }, async (t) => {
+  const fixture = makeCoordinatorFixture();
+  const error = new Error("synthetic owned drive failed before final state");
+  const coordinator = fixture.coordinator({ async driveStarted() { throw error; } });
+  const request = startRequest("run_original_drive_error");
+  try {
+    coordinator.start(request);
+    const drive = ownedDrive(coordinator, request.runId);
+    await assert.rejects(awaitDrive(drive, t.signal), (actual: unknown) => actual === error);
+    assert.strictEqual(drive.driveError, error);
+    assert.equal(fixture.store.getRun(request.runId)?.state, "INTAKE");
+  } finally {
+    fixture.close();
+  }
+});
 
 test("RunCoordinator binds Start atomically and owns only one drive across retries", async () => {
   const fixture = makeCoordinatorFixture();
@@ -287,11 +304,11 @@ for (const control of ["pause", "cancel"] as const) {
       const rejected = assert.rejects(operation, (error: unknown) => error instanceof KerbsFlowError
         && error.code === (control === "pause" ? "RUN_DRIVE_NOT_PAUSABLE" : "CANCEL_NOT_ALLOWED"));
       release.resolve();
-      await Promise.all([observed, rejected, reservation.drivePromise]);
+      await Promise.all([observed, rejected, awaitDrive(reservation)]);
       assert.equal(coordinator.activeRunId, undefined);
       assert.equal(coordinator.start(startRequest(`run_coord_terminal_after_${control}`)).to, "INTAKE");
       const next = (coordinator as unknown as { reservation: { drivePromise: Promise<void> } }).reservation;
-      await next.drivePromise;
+      await awaitDrive(next);
     } finally {
       release.resolve();
       await operation?.catch(() => undefined);
@@ -301,7 +318,7 @@ for (const control of ["pause", "cancel"] as const) {
 }
 
 for (const control of ["pause", "cancel"] as const) {
-  test(`failure disposition claims before its continuation and excludes later ${control}`, { timeout: 5_000 }, async () => {
+  test(`failure disposition claims before its continuation and excludes later ${control}`, { timeout: 5_000 }, async (t) => {
     const fixture = makeCoordinatorFixture();
     const runId = asRunId(`run_disposition_first_${control}`);
     const driver = {
@@ -337,8 +354,7 @@ for (const control of ["pause", "cancel"] as const) {
     try {
       coordinator.start(startRequest(runId));
       const reservation = (coordinator as unknown as { reservation: { drivePromise: Promise<void>; driveError?: unknown; failureDispositionClaim?: unknown } }).reservation;
-      await reservation.drivePromise;
-      assert.equal(reservation.driveError, undefined);
+      await awaitDrive(reservation, t.signal);
       assert.equal(reservation.failureDispositionClaim, undefined);
       assert.equal(fixture.store.getRun(runId)?.state, "FAILED");
       assert.equal(fixture.store.getRun(runId)?.stateVersion, 3);
@@ -346,7 +362,7 @@ for (const control of ["pause", "cancel"] as const) {
       assert.equal(coordinator.activeRunId, undefined);
       assert.equal(coordinator.start(startRequest(`run_after_disposition_${control}`)).to, "INTAKE");
       const next = (coordinator as unknown as { reservation: { drivePromise: Promise<void> } }).reservation;
-      await next.drivePromise;
+      await awaitDrive(next, t.signal);
       assert.equal(coordinator.activeRunId, undefined);
     } finally {
       fixture.close();

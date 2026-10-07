@@ -16,6 +16,7 @@
   "dependencies": {
     "@opencode/core": "2.0.13",
     "@opencode/sdk": "2.0.13",
+    "@opencode/util": "2.0.13",
     "effect": "4.0.0-rc.112"
   },
   "devDependencies": {

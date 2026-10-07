@@ -11,6 +11,10 @@ const { Cause, Context, Effect, Exit, Layer, Pull, Result, Scope, Stream } = Run
 const SDK = "@opencode/sdk/effect";
 const SOURCE = "@opencode/core/config/plugin/source";
 const MCP = "@opencode/core/config/plugin/mcp";
+const NPM = "@opencode/util/npm";
+const MODEL = "@opencode/core/model";
+const RESOLVER = "@opencode/core/model-resolver";
+const NATIVE = "@opencode/core/aisdk-native";
 const LIFECYCLE_TIMEOUT_MS = 10_000;
 
 type RuntimeCall = (...args: unknown[]) => unknown;
@@ -19,9 +23,10 @@ type Session = Awaited<ReturnType<OpenCodeHostBoundary["sessions"]["get"]>>;
 export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
   for (const name of ["Cause", "Context", "Effect", "Exit", "Layer", "Pull", "Result", "Scope", "Stream"] as const) record(Runtime[name], `effect.${name}`);
   for (const [name, operation] of Object.entries({
-    "Layer.succeed": Layer.succeed, "Scope.make": Scope.make, "Scope.close": Scope.close, "Scope.fork": Scope.fork,
+    "Layer.succeed": Layer.succeed, "Layer.effect": Layer.effect, "Layer.provide": Layer.provide, "Layer.isLayer": Layer.isLayer,
+    "Effect.map": Effect.map, "Effect.flatMap": Effect.flatMap, "Effect.suspend": Effect.suspend, "Scope.make": Scope.make, "Scope.close": Scope.close, "Scope.fork": Scope.fork,
     "Context.isKey": Context.isKey, "Effect.isEffect": Effect.isEffect, "Effect.succeed": Effect.succeed,
-    "Effect.runSync": Effect.runSync, "Effect.runPromise": Effect.runPromise, "Effect.runPromiseExit": Effect.runPromiseExit,
+    "Effect.runSync": Effect.runSync, "Effect.runPromise": Effect.runPromise, "Effect.runPromiseExit": Effect.runPromiseExit, "Effect.fail": Effect.fail,
     "Effect.provideService": Effect.provideService, "Stream.isStream": Stream.isStream, "Stream.toPull": Stream.toPull,
     "Cause.hasInterruptsOnly": Cause.hasInterruptsOnly, "Cause.squash": Cause.squash,
     "Pull.filterDone": Pull.filterDone, "Pull.isDoneCause": Pull.isDoneCause, "Result.isFailure": Result.isFailure,
@@ -29,7 +34,7 @@ export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
   })) callable(operation, name);
   if (!Exit.isExit(Exit.void)) throw drift("Exit.void");
   if (!Stream.isStream(Stream.never)) throw drift("Stream.never");
-  const [sdk, sourceModule, mcpModule]: unknown[] = await Promise.all([import(SDK), import(SOURCE), import(MCP)]).catch(() => {
+  const [sdk, sourceModule, mcpModule, npmModule, modelModule, resolverModule, nativeModule]: unknown[] = await Promise.all([import(SDK), import(SOURCE), import(MCP), import(NPM), import(MODEL), import(RESOLVER), import(NATIVE)]).catch(() => {
     throw new KerbsFlowError("OPENCODE_RUNTIME_UNAVAILABLE", "Pinned OpenCode public runtime exports could not be loaded");
   });
   const create = callable(record(record(sdk, SDK).OpenCode, "OpenCode").create, "OpenCode.create");
@@ -46,6 +51,65 @@ export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
     changes: () => Stream.never,
   }));
   if (typeof replacement !== "object" || replacement === null) throw drift("ConfigPluginSource replacement");
+  const npm = record(npmModule, NPM);
+  if (!Context.isKey(npm.Service)) throw drift("Npm.Service");
+  const npmService: Runtime.Context.Key<unknown, unknown> = npm.Service;
+  const npmNode = record(npm.node, "Npm.node");
+  const replaceNpm = callable(npmNode.replace, "Npm.node.replace");
+  const denyPackageManagement = () => Effect.fail(new KerbsFlowError("OPENCODE_RUNTIME_INSTALL_DENIED", "OpenCode runtime package management is unavailable; use a bundled native provider"));
+  const npmReplacement = replaceNpm.call(npmNode, Layer.succeed(npmService, {
+    add: denyPackageManagement, resolve: denyPackageManagement, check: denyPackageManagement,
+    update: denyPackageManagement, which: denyPackageManagement,
+  }));
+  if (typeof npmReplacement !== "object" || npmReplacement === null) throw drift("Npm replacement");
+
+  const rewriteNative = callable(record(nativeModule, NATIVE).rewrite, "AISDKNative.rewrite");
+  const isNative = (value: unknown): boolean => {
+    if (value === undefined) return false;
+    const model = record(value, "model provenance");
+    if (typeof model.package !== "string" || !model.package.startsWith("@opencode/ai/providers/")) return false;
+    // Public rewrite leaves unknown packages untouched; a blank target distinguishes them.
+    const target = { package: "" };
+    rewriteNative(target, { specifier: model.package, providerID: model.providerID, modelID: model.modelID ?? model.id });
+    return target.package.startsWith("@opencode/ai/providers/");
+  };
+  const model = record(modelModule, MODEL);
+  if (!Context.isKey(model.Service)) throw drift("Model.Service");
+  const modelService: Runtime.Context.Key<unknown, unknown> = model.Service;
+  const modelReplacement = constrainNode(model, "Model", original => {
+    const result = { ...original };
+    for (const name of ["all", "available", "default", "small"]) {
+      const operation = callable(original[name], `Model.${name}`);
+      result[name] = (...args: unknown[]) => Effect.map(runtimeEffect(operation(...args)), value =>
+        name === "all" || name === "available" ? array(value, "model catalog").filter(isNative) : isNative(value) ? value : undefined);
+    }
+    return Effect.succeed(result);
+  });
+  const resolverReplacement = constrainNode(record(resolverModule, RESOLVER), "ModelResolver", original => Effect.map(modelService, value => {
+    const models = record(value, "Model service");
+    const get = callable(models.get, "Model.get");
+    const defaultModel = callable(models.default, "Model.default");
+    const available = callable(models.available, "Model.available");
+    const resolveOriginal = callable(original.resolveModel, "ModelResolver.resolveModel");
+    const resolveModel = (selected: unknown, variant?: unknown) => Effect.suspend(() => {
+      const snapshot = { ...record(selected, "model provenance") };
+      return isNative(snapshot)
+        ? runtimeEffect(resolveOriginal(snapshot, variant))
+        : Effect.fail(new KerbsFlowError("OPENCODE_PROVIDER_RUNTIME_UNSUPPORTED", "OpenCode v0.1 supports only bundled native provider implementations"));
+    });
+    return {
+      resolveModel,
+      resolve: (requested?: unknown) => {
+        const ref = requested === undefined ? undefined : record(requested, "model reference");
+        const selection = ref === undefined
+          ? Effect.flatMap(runtimeEffect(defaultModel()), selected => selected === undefined
+            ? Effect.map(runtimeEffect(available()), value => array(value, "available models")[0]) : Effect.succeed(selected))
+          : runtimeEffect(get(ref.providerID, ref.id));
+        return Effect.flatMap(selection, selected =>
+          selected === undefined ? Effect.succeed(undefined) : resolveModel(selected, ref?.variant));
+      },
+    };
+  }));
 
   const scope = Effect.runSync(Scope.make());
   const lifetime = new AbortController();
@@ -84,7 +148,7 @@ export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
 
   try {
     const creationSignal = AbortSignal.timeout(LIFECYCLE_TIMEOUT_MS);
-    const raw = record(await run(create(options, { overrides: [replacement] }), creationSignal), "OpenCode host");
+    const raw = record(await run(create(options, { overrides: [replacement, npmReplacement, modelReplacement, resolverReplacement] }), creationSignal), "OpenCode host");
     const methods = new Map<string, RuntimeCall>();
     for (const [group, names] of Object.entries({
       server: ["info"], sessions: ["create", "prompt", "wait", "get", "list", "context", "log", "interrupt"],
@@ -241,6 +305,21 @@ export const createOpenCodeHost: OpenCodeHostFactory = async (options) => {
     throw error;
   }
 };
+
+function constrainNode(module: Record<string, unknown>, label: string, adapt: (original: Record<string, unknown>) => Runtime.Effect.Effect<unknown, unknown, unknown>): unknown {
+  if (!Context.isKey(module.Service)) throw drift(`${label}.Service`);
+  const service: Runtime.Context.Key<unknown, unknown> = module.Service;
+  const node = record(module.node, `${label}.node`);
+  const mapLayer = callable(node.mapLayer, `${label}.node.mapLayer`);
+  const replace = callable(node.replace, `${label}.node.replace`);
+  const mapped = mapLayer.call(node, (layer: unknown) => {
+    if (!Layer.isLayer(layer)) throw drift(`${label} layer`);
+    return Layer.provide(Layer.effect(service, Effect.flatMap(service, original => adapt(record(original, `${label} service`)))), layer);
+  });
+  const replacement = replace.call(node, mapped);
+  if (typeof replacement !== "object" || replacement === null) throw drift(`${label} replacement`);
+  return replacement;
+}
 
 function runtimeEffect(value: unknown): Runtime.Effect.Effect<unknown, unknown, Runtime.Scope.Scope> {
   if (!Effect.isEffect(value)) throw drift("Effect result");

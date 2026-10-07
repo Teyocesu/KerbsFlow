@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -36,7 +36,7 @@ import { FixedClock, SequenceIdSource } from "../src/runtime.js";
 import { ProcessSupervisor } from "../src/process.js";
 import { VerificationSandbox } from "../src/verification-sandbox.js";
 import { FocusedVerifier } from "../src/verifier.js";
-import { createGitRepository } from "./phase2-helpers.js";
+import { createGitRepository, git } from "./phase2-helpers.js";
 
 export type SyntheticFinish = "succeeded" | "success_without_change" | "blocked" | "cancelled";
 
@@ -237,8 +237,15 @@ export async function waitFor<T>(read: () => T | undefined, description: string,
   assert.fail(`timed out waiting for ${description}`);
 }
 
-export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState; reworkOptionId?: string; reworkProposalCount?: number } = {}): Phase6CStack {
+export function createPhase6CStack(options: { holdFirstInitialPlan?: boolean; phaseCheck?: boolean; checkWorkMs?: number; maxImplementationAttempts?: 1 | 2; extraGateTarget?: RunState; reworkOptionId?: string; reworkProposalCount?: number } = {}): Phase6CStack {
   const repository = createGitRepository();
+  if (options.checkWorkMs !== undefined) {
+    const check = join(repository.root, "check.mjs");
+    writeFileSync(check, `const workStarted = performance.now();\nlet checksum = 0;\nwhile (performance.now() - workStarted < ${options.checkWorkMs}) checksum = Math.imul(checksum + 1, 2654435761);\nif (!Number.isInteger(checksum)) process.exit(1);\n` + readFileSync(check, "utf8"));
+    git(repository.root, ["add", "check.mjs"]);
+    git(repository.root, ["commit", "--quiet", "-m", "synthetic bounded verification work"]);
+    repository.head = git(repository.root, ["rev-parse", "HEAD"]);
+  }
   const root = mkdtempSync(join(tmpdir(), "kerbsflow-phase6c-controls-"));
   mkdirSync(join(root, "runtime"), { mode: 0o700 });
   const runtime = join(root, "runtime");
