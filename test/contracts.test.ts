@@ -1,4 +1,4 @@
-import { syntheticReleaseDossier } from "./release-evidence-helpers.js";
+import { syntheticReleaseDossier, withSyntheticTechnicalExclusion } from "./release-evidence-helpers.js";
 import { parseReleaseEvidenceDossier, type ReleaseEvidenceDossier } from "../src/contracts.js";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -199,4 +199,63 @@ test("release dossier accepts direct fresh npm-test attribution and ordinary col
   const accepted = parseReleaseEvidenceDossier(dossier);
   assert.deepEqual(accepted.acceptance[14]!.evidenceRefs, ["evidence_npm_test"]);
   assert.equal(accepted.acceptance[14]!.summary, dossier.acceptance[14]!.summary);
+});
+
+for (const [name, mutate] of [
+  ["nonzero audit without dispositions", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions = []; }],
+  ["unreviewed assertion", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.riskDispositionRefs = []; }],
+  ["inferred-only source", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_source")!.classification = "inferred"; }],
+  ["dangling verification reference", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions[0]!.verificationRefs = ["evidence_missing"]; }],
+  ["stale candidate proof even when reused", (d: ReleaseEvidenceDossier) => { Object.assign(d.evidence.find(e => e.id === "evidence_advisory_source")!, { origin: "reused", candidateHead: "7".repeat(40) }); }],
+  ["stale fingerprint binding", (d: ReleaseEvidenceDossier) => { d.candidate.fingerprint = "7".repeat(64); }],
+  ["stale lock binding", (d: ReleaseEvidenceDossier) => { d.candidate.hashes.lock = "7".repeat(64); }],
+  ["stale launch profile binding", (d: ReleaseEvidenceDossier) => { d.candidate.hashes.profile = "7".repeat(64); }],
+  ["changed runtime assumptions", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions[0]!.assumptions = ["Different host configuration"]; }],
+  ["changed runtime identity", (d: ReleaseEvidenceDossier) => { d.host.node = "24.0.1"; }],
+  ["changed adapter capability", (d: ReleaseEvidenceDossier) => { d.adapters[1]!.capabilityHash = "7".repeat(64); }],
+  ["wrong dependency attribution", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions[0]!.packageName = "other-package"; }],
+  ["wrong advisory attribution", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions[0]!.advisoryId = "GHSA-5555-6666-7777"; }],
+  ["version range instead of exact installed version", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.roots[0]!.versions = ["^1.2.3"]; }],
+  ["unknown advisory identifier", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.roots[0]!.advisoryId = "UNKNOWN"; }],
+  ["missing boundary evidence", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions[0]!.verificationRefs = []; }],
+  ["missing reviewer session", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_review")!.dependencyProof!.sessionId = ""; }],
+  ["changed exact affected version", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.roots[0]!.versions = ["9.9.9"]; }],
+  ["wrong vulnerable entry point", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.roots[0]!.entryPoint = "unrelatedFunction"; }],
+  ["contradictory referenced evidence", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_source")!.dependencyProof!.conclusion = "contradicted"; }],
+  ["installed reachable vulnerability claimed excluded", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_boundary")!.dependencyProof!.conclusion = "contradicted"; }],
+  ["uncertain exclusion", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_boundary")!.dependencyProof!.conclusion = "uncertain"; }],
+  ["contradictory evidence omitted from selected refs", (d: ReleaseEvidenceDossier) => { const e = structuredClone(d.evidence.find(e => e.id === "evidence_advisory_boundary")!); e.id = "evidence_counterexample"; e.dependencyProof!.conclusion = "contradicted"; d.evidence.push(e); }],
+  ["unsupported extra advisory root", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.roots.push({ ...d.dependencies.audit.roots[0]!, advisoryId: "GHSA-5555-6666-7777" }); }],
+  ["unknown advisory root disposition", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions.push({ ...d.dependencies.audit.technicalDispositions[0]!, advisoryId: "GHSA-5555-6666-7777" }); }],
+  ["duplicate advisory root", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.roots.push(structuredClone(d.dependencies.audit.roots[0]!)); }],
+  ["duplicate disposition", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions.push(structuredClone(d.dependencies.audit.technicalDispositions[0]!)); }],
+  ["fabricated manual review label", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_review")!.classification = "manually_validated"; }],
+  ["missing independent-review attribution", (d: ReleaseEvidenceDossier) => { delete d.evidence.find(e => e.id === "evidence_advisory_review")!.dependencyProof; }],
+  ["same-session self approval", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_review")!.dependencyProof!.sessionId = d.dependencies.audit.technicalDispositions[0]!.authorSessionId; }],
+  ["arbitrary inspected reference", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.technicalDispositions[0]!.sourceRefs = ["evidence_gate"]; }],
+  ["wrong evidence role", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_review")!.dependencyProof!.role = "source_analysis"; }],
+  ["simulated boundary substitute", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_boundary")!.boundary = "synthetic"; }],
+  ["reused audit inventory", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.origin = "reused"; }],
+  ["wrong audit inventory hash", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof!.claimHash = "7".repeat(64); }],
+  ["hidden root by zero count", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.advisories = 0; }],
+  ["legacy v1 human-label bypass", (d: ReleaseEvidenceDossier) => { Object.assign(d, { schemaVersion: "kerbsflow.release-evidence/v1" }); }],
+  ["unavailable audit with manual label", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.status = "unavailable"; d.dependencies.audit.advisories = null; d.evidence.find(e => e.id === "evidence_advisory_review")!.classification = "manually_validated"; }],
+] as const) {
+  test(`technical advisory disposition rejects ${name}`, () => {
+    const dossier = withSyntheticTechnicalExclusion(syntheticReleaseDossier());
+    mutate(dossier);
+    assert.throws(() => parseReleaseEvidenceDossier(dossier), ContractValidationError);
+  });
+}
+
+test("nonzero audit accepts bound independently reviewed exclusion without human observations", () => {
+  const dossier = withSyntheticTechnicalExclusion(syntheticReleaseDossier());
+  assert.equal(dossier.evidence.some(e => e.classification === "manually_validated"), false);
+  const accepted = parseReleaseEvidenceDossier(dossier);
+  assert.equal(accepted.dependencies.audit.advisories, 1);
+  assert.deepEqual(accepted.dependencies.audit.technicalDispositions, dossier.dependencies.audit.technicalDispositions);
+  assert.ok(Object.isFrozen(accepted.dependencies.audit.technicalDispositions[0]!.assumptions));
+  assert.ok(Object.isFrozen(accepted.evidence.find(e => e.dependencyProof)?.dependencyProof));
+  dossier.dependencies.audit.roots[0]!.versions[0] = "9.9.9";
+  assert.deepEqual(accepted.dependencies.audit.roots[0]!.versions, ["1.2.3"]);
 });

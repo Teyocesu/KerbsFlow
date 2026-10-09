@@ -422,6 +422,14 @@ The result is an executor claim. KerbsFlow independently derives authoritative c
 
 No class may be upgraded merely because an executor says it ran a check. Executor-reported checks remain claims until command/artifact evidence is independently attributable.
 
+#### Dependency advisory authority
+
+An installed affected package is not represented as patched. A nonzero audit can be nonblocking when every reported root advisory has an independently accepted technical exclusion: exact package/installed versions and vulnerable entry point, enforced supported-host exclusion, source analysis, executable boundary evidence, explicit runtime assumptions and no material contradiction. These are `inspected` and `automatically_tested` facts; personal human inspection is not required. `manually_validated` keeps its original meaning and cannot be assigned to AI review, automated checks or user delegation.
+
+The trusted-host release dossier v2 carries only the affected roots, not a duplicate dependency graph. Its audit inventory and each technical claim are hash-bound to the exact candidate/fingerprint, lockfile, launch profile, host and adapter identities. Each claim names its author session and resolves separate source-analysis, boundary-verification and independent-review evidence roles. The reviewer session must differ from the author; the review must explicitly support the same claim. Supporting evidence must be actual, candidate-attributed and correctly classified; the audit inventory is fresh automatic evidence. Missing/extra/duplicate roots or dispositions, wrong attribution, stale bindings, inferred/simulated/manual substitutes and contradictory or uncertain claim evidence fail closed. All applicable roots must be extracted from the complete unsuppressed audit by trusted host composition; parser validation checks the supplied structure and hash linkage, not external artifact truth or reviewer identity authentication. Independent review must inspect those artifacts and provenance.
+
+Reachable, incompletely investigated, contradicted or materially uncertain findings and unavailable audits remain blocking. A human residual-risk acceptance, if separately permitted by an explicit policy, is a distinct scoped human decision with its own evidence; v2 implements no residual-risk waiver route, and a `manually_validated` label alone cannot bypass these checks. Human release-readiness acceptance is another distinct decision at `HUMAN_RELEASE_GATE`, after all release evidence passes, and performs no release side effect. AC1–AC15, paired X1–X13, canonical receipts, size/sanitization bounds and final human choices remain required. Historical v1 bundles remain immutable historical records; new acceptance requires v2.
+
 ### 9.2 Progressive validation
 
 - **Focused:** smallest check protecting the changed behavior/invariant after each attempt.

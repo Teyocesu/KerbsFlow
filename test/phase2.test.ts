@@ -1,4 +1,4 @@
-import { syntheticReleaseDossier } from "./release-evidence-helpers.js";
+import { syntheticReleaseDossier, withSyntheticTechnicalExclusion } from "./release-evidence-helpers.js";
 import type { Phase2DriveControls } from "../src/phase2.js";
 import { VerificationSandbox } from "../src/verification-sandbox.js";
 import test from "node:test";
@@ -1598,3 +1598,41 @@ for (const status of ["untracked", "modified", "staged", "post-full"] as const) 
 function syntheticFullCheck(): NonNullable<Phase2LoopRequest["fullCheck"]> {
   return { level: "full", commandId: "release-dossier-full", name: "synthetic full content", executable: process.execPath, args: ["check.mjs"], timeoutMs: 5000, proof: { kind: "stdout_line", expected: "KERBSFLOW_CHECK_PASSED" } };
 }
+
+test("Core accepts reviewed technical exclusion and atomically rejects unsupported advisory evidence", async () => {
+  const fixture = integratedLoopFixture("committed");
+  try {
+    const result = await fixture.run({ fullCheck: syntheticFullCheck(), releaseEvidence: candidate => {
+      const valid = withSyntheticTechnicalExclusion(syntheticReleaseDossier(candidate, { branch: git(fixture.repository.root, ["branch", "--show-current"]), codexVersion: fixture.adapter.probe().adapterVersion }));
+      const core = codexCore(fixture.store, fixture.adapter, fixture.ids);
+      const model = fixture.store.readModel(fixture.runId)!;
+      const before = fixture.store.listArtifactRecords(fixture.runId, 100);
+      const variants = [
+        (d: typeof valid) => { d.dependencies.audit.technicalDispositions = []; },
+        (d: typeof valid) => { d.evidence.find(e => e.id === "evidence_advisory_review")!.dependencyProof!.sessionId = d.dependencies.audit.technicalDispositions[0]!.authorSessionId; },
+        (d: typeof valid) => { d.evidence.find(e => e.id === "evidence_advisory_boundary")!.dependencyProof!.conclusion = "contradicted"; },
+        (d: typeof valid) => { d.evidence.find(e => e.id === "evidence_advisory_review")!.classification = "manually_validated"; },
+      ];
+      for (const [index, mutate] of variants.entries()) {
+        const invalid = structuredClone(valid);
+        mutate(invalid);
+        assert.throws(() => core.completeTrustedFullValidation(fixture.runId, model.run.stateVersion, `technical:invalid:${index}`, model.latestValidation!.bundle.validationId, invalid));
+        assert.equal(fixture.store.getRun(fixture.runId)!.state, "FINAL_VERIFY");
+        assert.equal(fixture.store.getRun(fixture.runId)!.stateVersion, model.run.stateVersion);
+        assert.equal(fixture.store.readModel(fixture.runId)!.currentGate, undefined);
+        assert.deepEqual(fixture.store.listArtifactRecords(fixture.runId, 100), before);
+      }
+      return valid;
+    } });
+    assert.equal(result.verdict, "HUMAN_GATE");
+    const model = fixture.store.readModel(fixture.runId)!;
+    assert.equal(model.run.state, "HUMAN_RELEASE_GATE");
+    const bundle = fixture.store.getReleaseBundle(model.currentGate!.gate.gateId)!;
+    const payload = bundle.bundle as { releaseEvidence: { dependencies: { audit: { advisories: number } }; evidence: { classification: string }[] } };
+    assert.equal(payload.releaseEvidence.dependencies.audit.advisories, 1);
+    assert.equal(payload.releaseEvidence.evidence.some(e => e.classification === "manually_validated"), false);
+    assert.equal(model.currentGate!.gate.status, "open");
+    assert.deepEqual(model.currentGate!.gate.options.map(o => o.id), ["accept_readiness", "request_corrections", "cancel_readiness"]);
+    assert.equal(git(fixture.repository.root, ["status", "--porcelain"]), "");
+  } finally { fixture.close(); }
+});

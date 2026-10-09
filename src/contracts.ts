@@ -338,8 +338,32 @@ export interface ReleaseEvidenceCheck {
   evidenceRefs: string[];
 }
 
+export interface ReleaseAdvisoryRoot {
+  advisoryId: string;
+  packageName: string;
+  versions: string[];
+  entryPoint: string;
+}
+
+export interface ReleaseDependencyProof {
+  role: "audit_inventory" | "source_analysis" | "boundary_verification" | "independent_review";
+  claimHash: string;
+  sessionId: string;
+  conclusion: "supported" | "contradicted" | "uncertain";
+}
+
+export interface ReleaseTechnicalDisposition {
+  advisoryId: string;
+  packageName: string;
+  assumptions: string[];
+  authorSessionId: string;
+  sourceRefs: string[];
+  verificationRefs: string[];
+  reviewRef: string;
+}
+
 export interface ReleaseEvidenceDossier {
-  schemaVersion: "kerbsflow.release-evidence/v1";
+  schemaVersion: "kerbsflow.release-evidence/v2";
   candidate: ReleaseEvidenceCandidate & {
     sourceBaseline: string; branch: string; clean: true;
     hashes: { source: string; contracts: string; profile: string; migrations: string; package: string; lock: string };
@@ -347,7 +371,7 @@ export interface ReleaseEvidenceDossier {
   host: { platform: "darwin"; macOSVersion: string; macOSBuild: string; arch: string; node: string; npm: string; typescript: string; nodeTypes: string; sqlite: string; git: string };
   support: { macOS: "official"; linux: "unsupported_preview"; windows: "unsupported"; license: "Apache-2.0"; copyright: "Teyocesu 2026"; licenseNotice: ReleaseEvidenceCheck };
   adapters: { adapter: "codex" | "opencode"; version: string; provider: string; model: string; identityHash: string; capabilityHash: string; workload: "os_enforced" | "tool_policy_only"; readiness: "tested" | "unavailable" | "not_tested"; summary: string; evidenceRefs: string[] }[];
-  evidence: { id: string; classification: EvidenceClassification; boundary: "actual" | "synthetic" | "physical"; origin: "fresh" | "reused"; candidateHead: string; hash: string; summary: string }[];
+  evidence: { id: string; classification: EvidenceClassification; boundary: "actual" | "synthetic" | "physical"; origin: "fresh" | "reused"; candidateHead: string; hash: string; summary: string; dependencyProof?: ReleaseDependencyProof }[];
   acceptance: { id: string; outcome: "PASS"; summary: string; evidenceRefs: string[]; limitations: string[] }[];
   deterministicGate: ReleaseEvidenceCheck & {
     candidateHead: string;
@@ -358,7 +382,7 @@ export interface ReleaseEvidenceDossier {
   };
   scenarios: { id: string; adapter: "codex" | "opencode"; outcome: "PASS"; classification: EvidenceClassification; boundary: "actual" | "synthetic" | "physical"; evidenceRefs: string[]; limitations: string[] }[];
   dependencies: ReleaseEvidenceCheck & {
-    audit: { status: "complete" | "unavailable"; advisories: number | null; evidenceRefs: string[]; riskDispositionRefs: string[] };
+    audit: { status: "complete" | "unavailable"; advisories: number | null; evidenceRefs: string[]; riskDispositionRefs: string[]; roots: ReleaseAdvisoryRoot[]; technicalDispositions: ReleaseTechnicalDisposition[] };
     licenses: ReleaseEvidenceCheck; provenance: ReleaseEvidenceCheck; packageSurface: ReleaseEvidenceCheck;
   };
   secrets: { scan: ReleaseEvidenceCheck; provenanceInspection: ReleaseEvidenceCheck };
@@ -366,6 +390,27 @@ export interface ReleaseEvidenceDossier {
   liveProvider: { status: "not_tested" | "tested" | "unavailable"; reason: string; evidenceRefs: string[] };
   limitations: string[];
   prohibitedActions: string[];
+}
+
+export function releaseDependencyContextHash(dossier: Pick<ReleaseEvidenceDossier, "candidate" | "host" | "adapters">): string {
+  const { candidate: c, host: h } = dossier;
+  return createHash("sha256").update(JSON.stringify([
+    "kerbsflow.dependency-context/v1", c.headOid, c.baseOid, c.fingerprint, c.hashes.lock, c.hashes.profile,
+    h.platform, h.macOSVersion, h.macOSBuild, h.arch, h.node, h.npm, h.typescript, h.nodeTypes, h.sqlite, h.git,
+    [...dossier.adapters].sort((a, b) => a.adapter.localeCompare(b.adapter)).map(a => [a.adapter, a.version, a.provider, a.model, a.identityHash, a.capabilityHash, a.workload]),
+  ])).digest("hex");
+}
+
+export function releaseAdvisoryInventoryHash(contextHash: string, advisories: number, roots: readonly ReleaseAdvisoryRoot[]): string {
+  return createHash("sha256").update(JSON.stringify(["kerbsflow.advisory-inventory/v1", contextHash, advisories,
+    [...roots].sort((a, b) => a.advisoryId.localeCompare(b.advisoryId) || a.packageName.localeCompare(b.packageName)).map(r => [r.advisoryId, r.packageName, [...r.versions].sort(), r.entryPoint]),
+  ])).digest("hex");
+}
+
+export function releaseTechnicalClaimHash(contextHash: string, root: ReleaseAdvisoryRoot, disposition: Pick<ReleaseTechnicalDisposition, "assumptions" | "authorSessionId">): string {
+  return createHash("sha256").update(JSON.stringify(["kerbsflow.technical-exclusion/v1", contextHash,
+    root.advisoryId, root.packageName, [...root.versions].sort(), root.entryPoint, [...disposition.assumptions].sort(), disposition.authorSessionId,
+  ])).digest("hex");
 }
 
 export const RELEASE_EVIDENCE_MAX_BYTES = 96 * 1024;
@@ -411,8 +456,14 @@ export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDoss
   const candidate: ReleaseEvidenceDossier["candidate"] = { headOid: hash(c.headOid, 40), baseOid: hash(c.baseOid, 40), fingerprint: hash(c.fingerprint), sourceBaseline: hash(c.sourceBaseline, 40), branch: text(c.branch, 256), clean: true,
     hashes: { source: hash(h.source), contracts: hash(h.contracts), profile: hash(h.profile), migrations: hash(h.migrations), package: hash(h.package), lock: hash(h.lock) } };
   const evidence = list(d.evidence, 256, v => {
-    const e = object(v, ["id", "classification", "boundary", "origin", "candidateHead", "hash", "summary"]);
-    const item = { id: id(e.id), classification: parseEvidenceClass(e.classification, "releaseEvidence.classification"), boundary: choice(e.boundary, ["actual", "synthetic", "physical"]), origin: choice(e.origin, ["fresh", "reused"]), candidateHead: hash(e.candidateHead, 40), hash: hash(e.hash), summary: text(e.summary) };
+    const hasProof = isRecord(v) && Object.hasOwn(v, "dependencyProof");
+    const e = object(v, ["id", "classification", "boundary", "origin", "candidateHead", "hash", "summary", ...(hasProof ? ["dependencyProof"] : [])]);
+    let dependencyProof: ReleaseDependencyProof | undefined;
+    if (hasProof) {
+      const p = object(e.dependencyProof, ["role", "claimHash", "sessionId", "conclusion"]);
+      dependencyProof = { role: choice(p.role, ["audit_inventory", "source_analysis", "boundary_verification", "independent_review"]), claimHash: hash(p.claimHash), sessionId: text(p.sessionId, 128), conclusion: choice(p.conclusion, ["supported", "contradicted", "uncertain"]) };
+    }
+    const item = { id: id(e.id), classification: parseEvidenceClass(e.classification, "releaseEvidence.classification"), boundary: choice(e.boundary, ["actual", "synthetic", "physical"]), origin: choice(e.origin, ["fresh", "reused"]), candidateHead: hash(e.candidateHead, 40), hash: hash(e.hash), summary: text(e.summary), ...(dependencyProof === undefined ? {} : { dependencyProof }) };
     if (item.origin === "fresh" && item.candidateHead !== candidate.headOid) return fail();
     return item;
   }, 1);
@@ -479,11 +530,59 @@ export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDoss
   unique(scenarios.map(x => `${x.id}:${x.adapter}`));
   scenarios.sort((a, b) => Number(a.id.slice(1)) - Number(b.id.slice(1)) || a.adapter.localeCompare(b.adapter));
   const dep = object(d.dependencies, ["outcome", "summary", "evidenceRefs", "audit", "licenses", "provenance", "packageSurface"]);
-  const au = object(dep.audit, ["status", "advisories", "evidenceRefs", "riskDispositionRefs"]);
-  const audit: ReleaseEvidenceDossier["dependencies"]["audit"] = { status: choice(au.status, ["complete", "unavailable"]), advisories: au.advisories === null ? null : count(au.advisories), evidenceRefs: refs(au.evidenceRefs), riskDispositionRefs: refs(au.riskDispositionRefs, 0) };
-  if ((audit.status === "unavailable" && audit.advisories !== null) || (audit.status === "complete" && audit.advisories === null)
-    || ((audit.status === "unavailable" || audit.advisories !== 0) && !audit.riskDispositionRefs.some(ref => byId.get(ref)!.classification === "manually_validated"))) return fail();
-  if (audit.status === "complete") provenRefs(audit.evidenceRefs);
+  const au = object(dep.audit, ["status", "advisories", "evidenceRefs", "riskDispositionRefs", "roots", "technicalDispositions"]);
+  const roots = list(au.roots, 32, v => {
+    const r = object(v, ["advisoryId", "packageName", "versions", "entryPoint"]);
+    const advisoryId = text(r.advisoryId, 80);
+    const packageName = text(r.packageName, 214);
+    if (!/^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/u.test(advisoryId) || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/u.test(packageName)) return fail();
+    const versions = unique(list(r.versions, 32, v => {
+      const version = text(v, 128);
+      if (!/^\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?(?:\+[A-Za-z0-9.-]+)?$/u.test(version)) return fail();
+      return version;
+    }, 1)).sort();
+    return { advisoryId, packageName, versions, entryPoint: text(r.entryPoint) };
+  });
+  const rootKey = (r: Pick<ReleaseAdvisoryRoot, "advisoryId" | "packageName">): string => `${r.advisoryId}:${r.packageName}`;
+  unique(roots.map(rootKey));
+  roots.sort((a, b) => rootKey(a).localeCompare(rootKey(b)));
+  const technicalDispositions = list(au.technicalDispositions, 32, v => {
+    const t = object(v, ["advisoryId", "packageName", "assumptions", "authorSessionId", "sourceRefs", "verificationRefs", "reviewRef"]);
+    return { advisoryId: text(t.advisoryId, 80), packageName: text(t.packageName, 214), assumptions: unique(list(t.assumptions, 16, v => text(v), 1)).sort(), authorSessionId: text(t.authorSessionId, 128), sourceRefs: refs(t.sourceRefs), verificationRefs: refs(t.verificationRefs), reviewRef: refs([t.reviewRef])[0]! };
+  });
+  unique(technicalDispositions.map(rootKey));
+  technicalDispositions.sort((a, b) => rootKey(a).localeCompare(rootKey(b)));
+  const audit: ReleaseEvidenceDossier["dependencies"]["audit"] = { status: choice(au.status, ["complete", "unavailable"]), advisories: au.advisories === null ? null : count(au.advisories), evidenceRefs: provenRefs(au.evidenceRefs), riskDispositionRefs: refs(au.riskDispositionRefs, 0), roots, technicalDispositions };
+  if (audit.status !== "complete" || audit.advisories === null || (audit.advisories === 0) !== (roots.length === 0)
+    || roots.length !== technicalDispositions.length) return fail();
+  const contextHash = releaseDependencyContextHash({ candidate, host, adapters });
+  const expectedProofs = new Set<string>();
+  const requireProof = (ref: string, claimHash: string, role: ReleaseDependencyProof["role"], classification: EvidenceClassification): ReleaseDependencyProof => {
+    const e = byId.get(ref)!;
+    const p = e.dependencyProof;
+    if (e.classification !== classification || e.boundary !== "actual" || e.candidateHead !== candidate.headOid
+      || p === undefined || p.role !== role || p.claimHash !== claimHash || p.conclusion !== "supported") return fail();
+    expectedProofs.add(ref);
+    return p;
+  };
+  if (roots.length > 0) {
+    const inventoryHash = releaseAdvisoryInventoryHash(contextHash, audit.advisories, roots);
+    for (const ref of audit.evidenceRefs) {
+      requireProof(ref, inventoryHash, "audit_inventory", "automatically_tested");
+      if (byId.get(ref)!.origin !== "fresh") return fail();
+    }
+  }
+  for (const t of technicalDispositions) {
+    const root = roots.find(r => rootKey(r) === rootKey(t));
+    if (root === undefined) return fail();
+    const claimHash = releaseTechnicalClaimHash(contextHash, root, t);
+    for (const ref of t.sourceRefs) requireProof(ref, claimHash, "source_analysis", "inspected");
+    for (const ref of t.verificationRefs) requireProof(ref, claimHash, "boundary_verification", "automatically_tested");
+    const reviewer = requireProof(t.reviewRef, claimHash, "independent_review", "inspected");
+    if (reviewer.sessionId === t.authorSessionId) return fail();
+  }
+  if (JSON.stringify([...audit.riskDispositionRefs].sort()) !== JSON.stringify(unique(technicalDispositions.map(t => t.reviewRef)).sort())
+    || evidence.some(e => e.dependencyProof !== undefined && (!expectedProofs.has(e.id) || e.dependencyProof.conclusion !== "supported"))) return fail();
   const secret = object(d.secrets, ["scan", "provenanceInspection"]);
   const review = object(d.reviewHistory, ["broad", "remediation", "postFix", "knownBlockers"]);
   const live = object(d.liveProvider, ["status", "reason", "evidenceRefs"]);
@@ -491,7 +590,7 @@ export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDoss
   if (RELEASE_REQUIRED_LIMITATIONS.some(note => !limitations.includes(note))) return fail();
   const prohibitedActions = unique(list(d.prohibitedActions, 8, v => choice(v, RELEASE_PROHIBITED_ACTIONS), 8)).sort();
   const parsed: ReleaseEvidenceDossier = {
-    schemaVersion: choice(d.schemaVersion, ["kerbsflow.release-evidence/v1"]), candidate, host, support, adapters, evidence, acceptance, deterministicGate, scenarios,
+    schemaVersion: choice(d.schemaVersion, ["kerbsflow.release-evidence/v2"]), candidate, host, support, adapters, evidence, acceptance, deterministicGate, scenarios,
     dependencies: { outcome: pass(dep.outcome), summary: text(dep.summary), evidenceRefs: provenRefs(dep.evidenceRefs), audit, licenses: check(dep.licenses), provenance: check(dep.provenance), packageSurface: check(dep.packageSurface) },
     secrets: { scan: check(secret.scan), provenanceInspection: check(secret.provenanceInspection) },
     reviewHistory: { broad: check(review.broad), remediation: check(review.remediation), postFix: check(review.postFix), knownBlockers: zero(review.knownBlockers) },
