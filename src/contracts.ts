@@ -565,12 +565,10 @@ export function parseReleaseEvidenceDossier(value: unknown): ReleaseEvidenceDoss
     expectedProofs.add(ref);
     return p;
   };
-  if (roots.length > 0) {
-    const inventoryHash = releaseAdvisoryInventoryHash(contextHash, audit.advisories, roots);
-    for (const ref of audit.evidenceRefs) {
-      requireProof(ref, inventoryHash, "audit_inventory", "automatically_tested");
-      if (byId.get(ref)!.origin !== "fresh") return fail();
-    }
+  const inventoryHash = releaseAdvisoryInventoryHash(contextHash, audit.advisories, roots);
+  for (const ref of audit.evidenceRefs) {
+    requireProof(ref, inventoryHash, "audit_inventory", "automatically_tested");
+    if (byId.get(ref)!.origin !== "fresh") return fail();
   }
   for (const t of technicalDispositions) {
     const root = roots.find(r => rootKey(r) === rootKey(t));

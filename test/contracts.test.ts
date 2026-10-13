@@ -1,5 +1,5 @@
 import { syntheticReleaseDossier, withSyntheticTechnicalExclusion } from "./release-evidence-helpers.js";
-import { parseReleaseEvidenceDossier, type ReleaseEvidenceDossier } from "../src/contracts.js";
+import { parseReleaseEvidenceDossier, releaseAdvisoryInventoryHash, releaseDependencyContextHash, type ReleaseEvidenceDossier } from "../src/contracts.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 
@@ -157,6 +157,17 @@ for (const [name, mutate] of [
   ["no complete suite command", (d: ReleaseEvidenceDossier) => { d.deterministicGate.commands.pop(); }],
   ["reused final gate", (d: ReleaseEvidenceDossier) => { d.evidence[0]!.origin = "reused"; }],
   ["unavailable audit without decision", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.status = "unavailable"; d.dependencies.audit.advisories = null; }],
+  ["zero audit without inventory refs", (d: ReleaseEvidenceDossier) => { d.dependencies.audit.evidenceRefs = []; }],
+  ["zero audit with inspected inventory", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.classification = "inspected"; }],
+  ["zero audit with manual inventory", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.classification = "manually_validated"; }],
+  ["zero audit with synthetic inventory boundary", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.boundary = "synthetic"; }],
+  ["zero audit with reused inventory", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.origin = "reused"; }],
+  ["zero audit with stale inventory candidate", (d: ReleaseEvidenceDossier) => { Object.assign(d.evidence.find(e => e.id === "evidence_advisory_inventory")!, { origin: "reused", candidateHead: "7".repeat(40) }); }],
+  ["zero audit with wrong inventory hash", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof!.claimHash = "7".repeat(64); }],
+  ["zero audit with wrong inventory role", (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof!.role = "source_analysis"; }],
+  ...(["contradicted", "uncertain"] as const).map(conclusion =>
+    [`zero audit with ${conclusion} inventory`, (d: ReleaseEvidenceDossier) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof!.conclusion = conclusion; }] as const),
+  ["zero audit without inventory proof metadata", (d: ReleaseEvidenceDossier) => { delete d.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof; }],
   ["untested evidence promoted by a tested section", (d: ReleaseEvidenceDossier) => {
     d.evidence.push({ ...d.evidence[0]!, id: "evidence_untested", classification: "not_tested" });
     d.liveProvider = { status: "tested", reason: "fixture claim", evidenceRefs: ["evidence_untested"] };
@@ -190,6 +201,11 @@ test("release dossier is copied and frozen; optional live inference remains expl
   assert.ok(Object.isFrozen(accepted));
   assert.ok(Object.isFrozen(accepted.acceptance[0]!.evidenceRefs));
   assert.ok(Object.isFrozen(accepted.deterministicGate.boundaries));
+  assert.equal(accepted.dependencies.audit.advisories, 0);
+  assert.deepEqual(accepted.dependencies.audit.roots, []);
+  const inventory = accepted.evidence.find(e => e.id === accepted.dependencies.audit.evidenceRefs[0])!;
+  assert.equal(inventory.dependencyProof!.claimHash, releaseAdvisoryInventoryHash(releaseDependencyContextHash(accepted), 0, []));
+  assert.ok(Object.isFrozen(inventory.dependencyProof));
 });
 
 test("release dossier accepts direct fresh npm-test attribution and ordinary colon text", () => {

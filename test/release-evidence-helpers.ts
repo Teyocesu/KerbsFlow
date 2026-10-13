@@ -6,7 +6,7 @@ export function syntheticReleaseDossier(candidate: ReleaseEvidenceCandidate = { 
   const digest = createHash("sha256").update("synthetic release fixture").digest("hex");
   const refs = ["evidence_gate"];
   const check = (summary: string) => ({ outcome: "PASS" as const, summary: `Synthetic ${summary}`, evidenceRefs: [...refs] });
-  return {
+  const dossier: ReleaseEvidenceDossier = {
     schemaVersion: "kerbsflow.release-evidence/v2",
     candidate: { ...candidate, sourceBaseline: candidate.baseOid, branch: options.branch ?? "master", clean: true, hashes: { source: digest, contracts: digest, profile: options.profileHash ?? digest, migrations: digest, package: digest, lock: digest } },
     host: { platform: "darwin", macOSVersion: "15.3.2", macOSBuild: "24D81", arch: process.arch, node: process.versions.node, npm: "11.12.1", typescript: "5.9.3", nodeTypes: "24.13.6", sqlite: process.versions.sqlite!, git: "2.39.5" },
@@ -23,13 +23,15 @@ export function syntheticReleaseDossier(candidate: ReleaseEvidenceCandidate = { 
     acceptance: Array.from({ length: 15 }, (_, i) => ({ id: `AC${i + 1}`, outcome: "PASS", summary: `Synthetic AC${i + 1} attribution`, evidenceRefs: i === 14 ? [...refs, "evidence_npm_test"] : [...refs], limitations: ["Provider inference is synthetic"] })),
     deterministicGate: { ...check("deterministic gate"), evidenceRefs: [...refs, "evidence_typecheck", "evidence_npm_test"], candidateHead: candidate.headOid, commands: ["npm run typecheck", "npm test"].map(command => ({ command, exitCode: 0, outputHash: digest, evidenceRefs: [command === "npm test" ? "evidence_npm_test" : "evidence_typecheck"] })), suites: { discovered: 27, executed: 27, failures: 0, cancellations: 0, skips: 0, todos: 0, inventoryHash: digest }, boundaries: { sandbox: check("sandbox"), processes: check("process trees"), worktrees: check("worktrees"), migrations: check("migration checksums and rollback"), recovery: check("owner recovery") }, integrity: check("candidate integrity") },
     scenarios: ["codex", "opencode"].flatMap(adapter => Array.from({ length: 13 }, (_, i) => ({ id: `X${i + 1}`, adapter: adapter as "codex" | "opencode", outcome: "PASS" as const, classification: "simulated" as const, boundary: "synthetic" as const, evidenceRefs: ["evidence_provider"], limitations: ["Synthetic provider and dossier; not a final 7D result"] }))),
-    dependencies: { ...check("dependency review"), audit: { status: "complete", advisories: 0, evidenceRefs: [...refs], riskDispositionRefs: [], roots: [], technicalDispositions: [] }, licenses: check("dependency licenses and required notices"), provenance: check("integrity and install hooks"), packageSurface: check("package dry-run surface") },
+    dependencies: { ...check("dependency review"), audit: { status: "complete", advisories: 0, evidenceRefs: ["evidence_advisory_inventory"], riskDispositionRefs: [], roots: [], technicalDispositions: [] }, licenses: check("dependency licenses and required notices"), provenance: check("integrity and install hooks"), packageSurface: check("package dry-run surface") },
     secrets: { scan: check("deliberate secret scan"), provenanceInspection: check("fixture and public artifact provenance") },
     reviewHistory: { broad: check("broad independent review"), remediation: check("consolidated remediation"), postFix: check("post-fix independent reviews"), knownBlockers: 0 },
     liveProvider: { status: "not_tested", reason: "not opted in", evidenceRefs: [] },
     limitations: [...RELEASE_REQUIRED_LIMITATIONS, "Live provider NOT TESTED — not opted in"],
     prohibitedActions: [...RELEASE_PROHIBITED_ACTIONS],
   };
+  dossier.evidence.push({ id: "evidence_advisory_inventory", classification: "automatically_tested", boundary: "actual", origin: "fresh", candidateHead: candidate.headOid, hash: createHash("sha256").update("synthetic inventory artifact").digest("hex"), summary: "Synthetic inventory proof metadata only", dependencyProof: { role: "audit_inventory", claimHash: releaseAdvisoryInventoryHash(releaseDependencyContextHash(dossier), 0, []), sessionId: "synthetic-author-session", conclusion: "supported" } });
+  return dossier;
 }
 
 // Synthetic proof metadata exercises parser/Core linkage, never actual advisory or reviewer authority.
@@ -40,17 +42,16 @@ export function withSyntheticTechnicalExclusion(dossier: ReleaseEvidenceDossier)
   audit.advisories = 1;
   audit.roots = [root];
   audit.technicalDispositions = [disposition];
-  audit.evidenceRefs = ["evidence_advisory_inventory"];
   audit.riskDispositionRefs = [disposition.reviewRef];
   const contextHash = releaseDependencyContextHash(dossier);
   const claimHash = releaseTechnicalClaimHash(contextHash, root, disposition);
+  dossier.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof!.claimHash = releaseAdvisoryInventoryHash(contextHash, 1, audit.roots);
   for (const [name, role, classification] of [
-    ["inventory", "audit_inventory", "automatically_tested"],
     ["source", "source_analysis", "inspected"],
     ["boundary", "boundary_verification", "automatically_tested"],
     ["review", "independent_review", "inspected"],
   ] as const) {
-    const dependencyProof: ReleaseDependencyProof = { role, claimHash: role === "audit_inventory" ? releaseAdvisoryInventoryHash(contextHash, 1, audit.roots) : claimHash, sessionId: role === "independent_review" ? "synthetic-independent-session" : disposition.authorSessionId, conclusion: "supported" };
+    const dependencyProof: ReleaseDependencyProof = { role, claimHash, sessionId: role === "independent_review" ? "synthetic-independent-session" : disposition.authorSessionId, conclusion: "supported" };
     dossier.evidence.push({ id: `evidence_advisory_${name}`, classification, boundary: "actual", origin: "fresh", candidateHead: dossier.candidate.headOid, hash: createHash("sha256").update(`synthetic ${name} artifact`).digest("hex"), summary: `Synthetic ${name} proof metadata only`, dependencyProof });
   }
   return dossier;

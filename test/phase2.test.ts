@@ -4,7 +4,7 @@ import { VerificationSandbox } from "../src/verification-sandbox.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -1471,6 +1471,9 @@ test("Core rejects release evidence forgery without persisting a release artifac
       const core = codexCore(fixture.store, fixture.adapter, fixture.ids);
       const model = fixture.store.readModel(fixture.runId)!;
       const before = fixture.store.listArtifactRecords(fixture.runId, 100);
+      const artifactFiles = readdirSync(join(fixture.runtime, "artifacts"), { recursive: true }).sort();
+      const authority = fixture.store.getPhaseValidationAuthority(model.latestValidation!.bundle.validationId);
+      assert.ok(authority);
       const variants: unknown[] = [undefined];
       for (const mutate of [
         (d: typeof valid) => { d.candidate.headOid = "3".repeat(40); d.deterministicGate.candidateHead = d.candidate.headOid; for (const item of d.evidence) item.candidateHead = d.candidate.headOid; },
@@ -1489,6 +1492,8 @@ test("Core rejects release evidence forgery without persisting a release artifac
         (d: typeof valid) => { d.acceptance[0]!.evidenceRefs = []; },
         (d: typeof valid) => { d.acceptance[0]!.evidenceRefs = ["evidence_absent"]; },
         (d: typeof valid) => { d.evidence = Array.from({ length: 200 }, (_, i) => ({ ...d.evidence[0]!, id: `evidence_${i}`, summary: "x".repeat(1000) })); },
+        (d: typeof valid) => { delete d.evidence.find(e => e.id === "evidence_advisory_inventory")!.dependencyProof; },
+        (d: typeof valid) => { d.evidence.find(e => e.id === "evidence_advisory_inventory")!.classification = "manually_validated"; },
       ]) {
         const invalid = structuredClone(valid); mutate(invalid); variants.push(invalid);
       }
@@ -1496,14 +1501,23 @@ test("Core rejects release evidence forgery without persisting a release artifac
         assert.throws(() => core.completeTrustedFullValidation(fixture.runId, model.run.stateVersion, `release:negative:${rejections}`, model.latestValidation!.bundle.validationId, invalid));
         assert.equal(fixture.store.getRun(fixture.runId)!.state, "FINAL_VERIFY");
         assert.equal(fixture.store.getRun(fixture.runId)!.stateVersion, model.run.stateVersion);
+        assert.equal(fixture.store.readModel(fixture.runId)!.currentGate, undefined);
+        assert.deepEqual(fixture.store.getValidation(model.latestValidation!.bundle.validationId), model.latestValidation);
+        assert.deepEqual(fixture.store.getPhaseValidationAuthority(model.latestValidation!.bundle.validationId), authority);
+        const database = new DatabaseSync(fixture.store.databasePath, { readOnly: true });
+        try {
+          assert.equal(database.prepare("SELECT count(*) AS n FROM release_bundles").get()!.n, 0);
+          assert.equal(database.prepare("SELECT count(*) AS n FROM human_gates").get()!.n, 0);
+        } finally { database.close(); }
         assert.deepEqual(fixture.store.listArtifactRecords(fixture.runId, 100), before);
+        assert.deepEqual(readdirSync(join(fixture.runtime, "artifacts"), { recursive: true }).sort(), artifactFiles);
         assert.equal(readFileSync(fixture.store.databasePath).includes(Buffer.from("sk-syntheticdossiercredential")), false);
         assert.equal(readFileSync(fixture.store.databasePath).includes(Buffer.from("log:/Users/fixture/private-review/raw.log")), false);
         rejections++;
       }
       return valid;
     } });
-    assert.equal(rejections, 17);
+    assert.equal(rejections, 19);
     assert.equal(fixture.store.getRun(fixture.runId)!.state, "HUMAN_RELEASE_GATE");
   } finally { fixture.close(); }
 });
